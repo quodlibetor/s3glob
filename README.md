@@ -17,6 +17,26 @@ s3glob      "my-bucket/a*/something/1*/other/*"
 
 Output is in the same format as `aws s3 ls`.
 
+### Installation
+
+#### Install prebuilt binaries via shell script
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/quodlibetor/s3glob/releases/latest/download/s3glob-installer.sh | sh
+```
+
+#### Install prebuilt binaries via powershell script
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/quodlibetor/s3glob/releases/latest/download/s3glob-installer.ps1 | iex"
+```
+
+#### Install prebuilt binaries via Homebrew
+
+```bash
+brew install quodlibetor/tap/s3glob
+```
+
 ### Syntax
 
 Glob syntax supported:
@@ -31,6 +51,12 @@ Glob syntax supported:
   (but cannot contain `{..}` patterns).
 
 ### Algorithm and performance implications
+
+tl;dr:
+
+- the later the first glob character appears the fewer objects need to be scanned
+- the number of directories which match the first glob determines the
+  parallelism
 
 `s3glob` will search for the first glob character and use the string up to that
 point as the prefix to search.
