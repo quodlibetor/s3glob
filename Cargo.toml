@@ -8,6 +8,10 @@ repository = "https://github.com/quodlibetor/s3glob"
 homepage = "https://github.com/quodlibetor/s3glob"
 readme = "README.md"
 description = "A fast aws s3 ls that supports glob patterns"
+publish = false
+
+[package.metadata.dist]
+dist = true
 
 [package.metadata.wix]
 upgrade-guid = "52B953CD-E011-4E0F-B58F-C28AE9AD5A91"

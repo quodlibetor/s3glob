@@ -80,3 +80,12 @@ recommend actively trying to choose a prefix that will generate lots of tasks.
 ## Copying
 
 All code is available under the MIT or Apache 2.0 license, at your option.
+
+
+## Development
+
+### Performing a release
+
+Ensure git-cliff and cargo-release are both installed and run `cargo release [patch|minor]`.
+
+If things look good, run again with `--execute`.
