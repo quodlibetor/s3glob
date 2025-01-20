@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
 use clap::Parser;
 use globset::{Glob, GlobMatcher};
-use humansize::{SizeFormatter, DECIMAL};
+use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::runtime::Runtime;
@@ -17,6 +18,21 @@ use tokio::sync::Mutex;
 struct Opts {
     #[clap(short, long, default_value = "us-west-2")]
     region: String,
+
+    /// Format string for output
+    ///
+    /// This is a string that will be formatted for each object.
+    ///
+    /// The format string can use the following variables:
+    /// - `{key}`: the key of the object
+    /// - `{size_bytes}`: the size of the object in bytes, with no suffix
+    /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
+    /// - `{last_modified}`: the last modified date of the object, RFC3339 format
+    ///
+    /// For example, the default format looks like this, but with some padding:
+    ///     {last_modified} {size_human} {key}
+    #[clap(short, long)]
+    format: Option<String>,
 
     /// S3 delimiter to use when listing objects
     ///
@@ -98,6 +114,12 @@ async fn run() -> Result<()> {
         .find(['*', '?', '[', '{'])
         .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
 
+    let user_format = if let Some(user_fmt) = opts.format {
+        Some(compile_format(&user_fmt)?)
+    } else {
+        None
+    };
+
     // List directories for the prefix at the first glob character
     //
     // TODO: apply sections of the glob as prefixes until we get to the last one
@@ -173,19 +195,97 @@ async fn run() -> Result<()> {
     eprintln!();
     let mut objects = matching_objects.lock().await;
     objects.sort_by(|a, b| a.key.cmp(&b.key));
+    let decimal = decimal_format();
     for obj in objects.iter() {
-        println!(
-            "{:>10} {:>6}    {}",
-            obj.last_modified
-                .as_ref()
-                .map(|dt| dt.to_string())
-                .unwrap_or_default(),
-            SizeFormatter::new(obj.size.unwrap_or(0) as u64, DECIMAL),
-            obj.key.as_ref().unwrap_or(&String::new()),
-        );
+        if let Some(user_fmt) = &user_format {
+            print_user(obj, user_fmt);
+        } else {
+            print_default(obj, decimal);
+        }
     }
 
     Ok(())
+}
+
+fn decimal_format() -> FormatSizeOptions {
+    FormatSizeOptions::from(DECIMAL)
+        .decimal_places(1)
+        .space_after_value(false)
+}
+
+#[derive(Debug)]
+enum FormatToken {
+    Literal(String),
+    Variable(fn(&Object) -> String),
+}
+
+fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
+    let mut char_iter = format.chars();
+    let mut tokens = Vec::new();
+    let mut current_literal = String::new();
+    while let Some(char) = char_iter.next() {
+        if char == '{' {
+            if !current_literal.is_empty() {
+                tokens.push(FormatToken::Literal(current_literal.clone()));
+                current_literal.clear();
+            }
+            let mut var = String::new();
+            for c in char_iter.by_ref() {
+                if c == '}' {
+                    break;
+                }
+                var.push(c);
+            }
+            match var.as_str() {
+                "key" => tokens.push(FormatToken::Variable(|obj| {
+                    obj.key.as_ref().unwrap().to_string()
+                })),
+                "size_bytes" => tokens.push(FormatToken::Variable(|obj| {
+                    obj.size.unwrap_or(0).to_string()
+                })),
+                "size_human" => tokens.push(FormatToken::Variable(|obj| {
+                    SizeFormatter::new(obj.size.unwrap_or(0) as u64, decimal_format()).to_string()
+                })),
+                "last_modified" => tokens.push(FormatToken::Variable(|obj| {
+                    obj.last_modified.as_ref().unwrap().to_string()
+                })),
+                _ => return Err(anyhow::anyhow!("unknown variable: {}", var)),
+            }
+        } else {
+            current_literal.push(char);
+        }
+    }
+    if !current_literal.is_empty() {
+        tokens.push(FormatToken::Literal(current_literal.clone()));
+    }
+    Ok(tokens)
+}
+
+fn print_default(obj: &Object, format: FormatSizeOptions) {
+    println!(
+        "{:>10} {:>6}    {}",
+        obj.last_modified
+            .as_ref()
+            .map(|dt| dt.to_string())
+            .unwrap_or_default(),
+        SizeFormatter::new(obj.size.unwrap_or(0) as u64, format),
+        obj.key.as_ref().unwrap_or(&String::new()),
+    );
+}
+
+fn print_user(obj: &Object, tokens: &[FormatToken]) {
+    println!("{}", format_user(obj, tokens));
+}
+
+fn format_user(obj: &Object, tokens: &[FormatToken]) -> String {
+    let mut result = String::new();
+    for token in tokens {
+        match token {
+            FormatToken::Literal(lit) => result.push_str(lit),
+            FormatToken::Variable(var) => result.push_str(&var(obj)),
+        }
+    }
+    result
 }
 
 fn add_atomic(atomic: &AtomicUsize, value: usize) -> usize {
@@ -223,4 +323,30 @@ async fn list_matching_objects(
     }
 
     Ok((matching_objects, seen_objects))
+}
+
+#[cfg(test)]
+mod tests {
+    use aws_sdk_s3::types::Object;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case("Size: {size_bytes}, Name: {key}", "Size: 1234, Name: test/file.txt")]
+    #[case("s: {size_human}\t{key}", "s: 1.2kB\ttest/file.txt")]
+    fn test_compile_format(#[case] format: &str, #[case] expected: &str) {
+        let fmt = compile_format(format).unwrap();
+        assert_eq!(fmt.len(), 4);
+
+        let object = Object::builder().key("test/file.txt").size(1234).build();
+
+        let result = format_user(&object, &fmt);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_format_invalid_variable() {
+        assert!(compile_format("{invalid_var}").is_err());
+    }
 }

@@ -64,7 +64,7 @@ async fn test_s3glob_pattern_matching(
 
     let uri = format!("s3://{}/{}", bucket, glob);
 
-    let mut cmd = run_s3glob(port, &uri)?;
+    let mut cmd = run_s3glob(port, &[uri.as_str()])?;
     let mut res = cmd.assert().success();
 
     for object in &test_objects {
@@ -77,6 +77,52 @@ async fn test_s3glob_pattern_matching(
 
     Ok(())
 }
+
+#[rstest]
+#[case("{key}", "test/file.txt")]
+#[case("{size_bytes}", "1234")]
+#[case("{size_human}", "1.2kB")]
+#[case("{key} ({size_human})", "test/file.txt (1.2kB)")]
+#[case(
+    "Size: {size_bytes} bytes, Name: {key}",
+    "Size: 1234 bytes, Name: test/file.txt"
+)]
+#[case(
+    "File: {key}\nSize: {size_human}\nModified: {last_modified}",
+    "File: test/file.txt\nSize: 1.2kB\nModified: "
+)]
+#[tokio::test]
+async fn test_format_patterns(
+    #[case] format: &str,
+    #[case] expected: &'static str,
+) -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "format-test";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let key = "test/file.txt";
+    create_object_with_size(&client, bucket, key, 1234).await?;
+
+    let objects = client.list_objects_v2().bucket(bucket).send().await?;
+    for obj in objects.contents() {
+        println!(
+            "created obj: {:?} size: {:?}",
+            obj.key().unwrap(),
+            obj.size()
+        );
+    }
+
+    let pattern = format!("s3://{}/*/file.txt", bucket);
+
+    let mut cmd = run_s3glob(port, &["--format", format, pattern.as_str()])?;
+    cmd.assert().success().stdout(contains(expected));
+    Ok(())
+}
+
+//
+// Helpers
+//
 
 async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
     let minio = testcontainers_modules::minio::MinIO::default();
@@ -102,27 +148,35 @@ async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
 }
 
 async fn create_object(client: &Client, bucket: &str, key: &str) -> anyhow::Result<()> {
+    create_object_with_size(client, bucket, key, 0).await?;
+    Ok(())
+}
+
+async fn create_object_with_size(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    size: usize,
+) -> anyhow::Result<()> {
+    let body = vec![b'a'; size];
     client
         .put_object()
         .bucket(bucket)
         .key(key.to_string())
-        .body(ByteStream::from_static(b""))
+        .body(ByteStream::from(body))
         .send()
         .await?;
 
     Ok(())
 }
 
-fn run_s3glob(port: u16, pattern: &str) -> anyhow::Result<Command> {
+fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
     let mut command = Command::cargo_bin("s3glob")?;
     command
         .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
-        .args([
-            //"--region=us-east-1",
-            pattern,
-        ]);
+        .args(args);
 
     Ok(command)
 }
