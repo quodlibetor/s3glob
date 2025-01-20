@@ -120,6 +120,47 @@ async fn test_format_patterns(
     Ok(())
 }
 
+#[rstest]
+#[case("prefix/2024/file.txt", &["prefix/2024/file.txt"])]
+#[case("prefix/2024/file*.txt", &[
+    "prefix/2024/file1.txt",
+    "prefix/2024/file2.txt",
+])]
+#[tokio::test]
+async fn test_patterns_in_file_not_path_component(
+    #[case] glob: &str,
+    #[case] expected: &[&str],
+) -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let test_objects = vec![
+        "prefix/2024/file1.txt",
+        "prefix/2024/file2.txt",
+        "prefix/2024/other.txt",
+        "other/path/file.txt",
+    ];
+    for key in &test_objects {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let uri = format!("s3://{}/{}", bucket, glob);
+    let mut cmd = run_s3glob(port, &[uri.as_str()])?;
+    let mut res = cmd.assert().success();
+
+    for object in &test_objects {
+        if expected.contains(object) {
+            res = res.stdout(contains(*object));
+        } else {
+            res = res.stdout(contains(*object).not());
+        }
+    }
+
+    Ok(())
+}
+
 //
 // Helpers
 //

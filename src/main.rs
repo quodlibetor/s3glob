@@ -137,7 +137,7 @@ async fn run() -> Result<()> {
     let mut paginator = client
         .list_objects_v2()
         .bucket(&bucket)
-        .prefix(prefix)
+        .prefix(&prefix)
         .delimiter(opts.delimiter)
         .into_paginator()
         .send();
@@ -147,6 +147,12 @@ async fn run() -> Result<()> {
         if let Some(common_prefixes) = page.common_prefixes {
             prefixes.extend(common_prefixes.into_iter().filter_map(|p| p.prefix));
         }
+    }
+
+    // If there are no common prefixes, then the prefix itself is the only
+    // matching prefix.
+    if prefixes.is_empty() {
+        prefixes.push(prefix);
     }
 
     // Process directories concurrently
