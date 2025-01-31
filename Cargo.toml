@@ -32,9 +32,10 @@ regex = "1.10"
 tokio = { version = "1.0", features = ["full"] }
 
 [dev-dependencies]
+assert_fs = { version = "1.1.2", features = ["color"] }
 assert_cmd = "2.0"
 predicates = "3.1"
-rstest = "0.23"
+rstest = "0.24"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["minio"] }
 

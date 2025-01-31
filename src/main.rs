@@ -1,12 +1,14 @@
+use std::io::Write as _;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use globset::{Glob, GlobMatcher};
 use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
 use num_format::{Locale, ToFormattedString};
@@ -14,25 +16,65 @@ use regex::Regex;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// List objects matching the pattern
+    #[clap(name = "ls")]
+    List {
+        /// Glob pattern to match objects against
+        ///
+        /// The pattern can either be an s3 uri or a <bucket>/<glob> without the
+        /// s3://
+        ///
+        /// Example:
+        ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
+        ///     my-bucket/my_prefix/2024-12-*/something_else/*
+        pattern: String,
+
+        /// Format string for output
+        ///
+        /// This is a string that will be formatted for each object.
+        ///
+        /// The format string can use the following variables:
+        /// - `{key}`: the key of the object
+        /// - `{size_bytes}`: the size of the object in bytes, with no suffix
+        /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
+        /// - `{last_modified}`: the last modified date of the object, RFC3339 format
+        ///
+        /// For example, the default format looks like this, but with some padding:
+        ///     {last_modified} {size_human} {key}
+        #[clap(short, long)]
+        format: Option<String>,
+    },
+
+    /// Download objects matching the pattern
+    #[clap(name = "dl")]
+    Download {
+        /// Glob pattern to match objects against
+        ///
+        /// The pattern can either be an s3 uri or a <bucket>/<glob> without the
+        /// s3://
+        ///
+        /// Example:
+        ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
+        ///     my-bucket/my_prefix/2024-12-*/something_else/*
+        pattern: String,
+
+        /// The destination directory to download the objects to
+        ///
+        /// The full key name will be reproduced in the directory, so multiple
+        /// folders may be created.
+        dest: String,
+    },
+}
+
 #[derive(Debug, Parser)]
 struct Opts {
-    #[clap(short, long, default_value = "us-west-2")]
-    region: String,
+    #[clap(subcommand)]
+    command: Command,
 
-    /// Format string for output
-    ///
-    /// This is a string that will be formatted for each object.
-    ///
-    /// The format string can use the following variables:
-    /// - `{key}`: the key of the object
-    /// - `{size_bytes}`: the size of the object in bytes, with no suffix
-    /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
-    /// - `{last_modified}`: the last modified date of the object, RFC3339 format
-    ///
-    /// For example, the default format looks like this, but with some padding:
-    ///     {last_modified} {size_human} {key}
-    #[clap(short, long)]
-    format: Option<String>,
+    #[clap(short, long, default_value = "us-west-2", global = true)]
+    region: String,
 
     /// S3 delimiter to use when listing objects
     ///
@@ -49,18 +91,8 @@ struct Opts {
     ///
     /// and then will list all the objects in these prefixes, filtering them
     /// with the remainder of the pattern.
-    #[clap(short, long, default_value = "/")]
+    #[clap(short, long, default_value = "/", global = true)]
     delimiter: String,
-
-    /// Glob pattern to match objects against
-    ///
-    /// The pattern can either be an s3 uri or a <bucket>/<glob> without the
-    /// s3://
-    ///
-    /// Example:
-    ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
-    ///     my-bucket/my_prefix/2024-12-*/something_else/*
-    pattern: String,
 }
 
 fn main() {
@@ -97,8 +129,11 @@ async fn run() -> Result<()> {
     let client = Client::new(&config);
 
     let s3re = Regex::new(r"^(?:s3://)?([^/]+)/(.*)").unwrap();
-    let pat = opts.pattern.clone();
-    let matches = s3re.captures(&pat);
+
+    let pat = match &opts.command {
+        Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
+    };
+    let matches = s3re.captures(pat);
     let (bucket, raw_pattern) = if let Some(m) = matches {
         (
             m.get(1).unwrap().as_str().to_owned(),
@@ -113,12 +148,6 @@ async fn run() -> Result<()> {
     let prefix = raw_pattern
         .find(['*', '?', '[', '{'])
         .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
-
-    let user_format = if let Some(user_fmt) = opts.format {
-        Some(compile_format(&user_fmt)?)
-    } else {
-        None
-    };
 
     // List directories for the prefix at the first glob character
     //
@@ -199,14 +228,72 @@ async fn run() -> Result<()> {
     }
 
     eprintln!();
-    let mut objects = matching_objects.lock().await;
-    objects.sort_by(|a, b| a.key.cmp(&b.key));
-    let decimal = decimal_format();
-    for obj in objects.iter() {
-        if let Some(user_fmt) = &user_format {
-            print_user(obj, user_fmt);
-        } else {
-            print_default(obj, decimal);
+
+    match opts.command {
+        Command::List { format, .. } => {
+            let user_format = if let Some(user_fmt) = format {
+                Some(compile_format(&user_fmt)?)
+            } else {
+                None
+            };
+            let mut objects = matching_objects.lock().await;
+            objects.sort_by(|a, b| a.key.cmp(&b.key));
+            let decimal = decimal_format();
+            for obj in objects.iter() {
+                if let Some(user_fmt) = &user_format {
+                    print_user(obj, user_fmt);
+                } else {
+                    print_default(obj, decimal);
+                }
+            }
+        }
+        Command::Download { dest, .. } => {
+            let objects = matching_objects.lock().await;
+            let obj_count = objects.len();
+            let base_path = Path::new(&dest);
+            let mut total_bytes = 0_usize;
+            for (i, obj) in objects.iter().enumerate() {
+                let key = obj.key.as_ref().unwrap();
+                let path = base_path.join(key);
+                let dir = path.parent().unwrap();
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("Creating directory: {}", dir.display()))?;
+                let mut obj = client.get_object().bucket(&bucket).key(key).send().await?;
+                let temp_path = path.with_extension(&format!(".s3glob-tmp-{}", i));
+                let mut file = std::fs::File::create(&temp_path)?;
+                while let Some(bytes) = obj
+                    .body
+                    .try_next()
+                    .await
+                    .context("failed to read from S3 download stream")?
+                {
+                    file.write_all(&bytes).with_context(|| {
+                        format!("failed to write to file: {}", &temp_path.display())
+                    })?;
+                    total_bytes += bytes.len();
+                    eprint!(
+                        "\rdownloaded {}/{} objects, {}",
+                        i,
+                        obj_count,
+                        SizeFormatter::new(total_bytes as u64, decimal_format())
+                    );
+                }
+                std::fs::rename(&temp_path, &path).with_context(|| {
+                    format!(
+                        "failed to rename file: {} -> {}",
+                        &temp_path.display(),
+                        &path.display()
+                    )
+                })?;
+
+                eprint!(
+                    "\rdownloaded {}/{} objects, {}",
+                    i + 1,
+                    obj_count,
+                    SizeFormatter::new(total_bytes as u64, decimal_format())
+                );
+            }
+            eprintln!();
         }
     }
 
