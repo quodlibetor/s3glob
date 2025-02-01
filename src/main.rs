@@ -37,6 +37,7 @@ enum Command {
         ///
         /// The format string can use the following variables:
         /// - `{key}`: the key of the object
+        /// - `{uri}`: the s3 uri of the object, e.g. s3://my-bucket/my-object.txt
         /// - `{size_bytes}`: the size of the object in bytes, with no suffix
         /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
         /// - `{last_modified}`: the last modified date of the object, RFC3339 format
@@ -241,7 +242,7 @@ async fn run() -> Result<()> {
             let decimal = decimal_format();
             for obj in objects.iter() {
                 if let Some(user_fmt) = &user_format {
-                    print_user(obj, user_fmt);
+                    print_user(&bucket, obj, user_fmt);
                 } else {
                     print_default(obj, decimal);
                 }
@@ -309,7 +310,7 @@ fn decimal_format() -> FormatSizeOptions {
 #[derive(Debug)]
 enum FormatToken {
     Literal(String),
-    Variable(fn(&Object) -> String),
+    Variable(fn(&str, &Object) -> String),
 }
 
 fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
@@ -330,16 +331,19 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
                 var.push(c);
             }
             match var.as_str() {
-                "key" => tokens.push(FormatToken::Variable(|obj| {
+                "key" => tokens.push(FormatToken::Variable(|_, obj| {
                     obj.key.as_ref().unwrap().to_string()
                 })),
-                "size_bytes" => tokens.push(FormatToken::Variable(|obj| {
+                "uri" => tokens.push(FormatToken::Variable(|bucket, obj| {
+                    format!("s3://{}/{}", bucket, obj.key.as_ref().unwrap())
+                })),
+                "size_bytes" => tokens.push(FormatToken::Variable(|_, obj| {
                     obj.size.unwrap_or(0).to_string()
                 })),
-                "size_human" => tokens.push(FormatToken::Variable(|obj| {
+                "size_human" => tokens.push(FormatToken::Variable(|_, obj| {
                     SizeFormatter::new(obj.size.unwrap_or(0) as u64, decimal_format()).to_string()
                 })),
-                "last_modified" => tokens.push(FormatToken::Variable(|obj| {
+                "last_modified" => tokens.push(FormatToken::Variable(|_, obj| {
                     obj.last_modified.as_ref().unwrap().to_string()
                 })),
                 _ => return Err(anyhow::anyhow!("unknown variable: {}", var)),
@@ -366,16 +370,16 @@ fn print_default(obj: &Object, format: FormatSizeOptions) {
     );
 }
 
-fn print_user(obj: &Object, tokens: &[FormatToken]) {
-    println!("{}", format_user(obj, tokens));
+fn print_user(bucket: &str, obj: &Object, tokens: &[FormatToken]) {
+    println!("{}", format_user(bucket, obj, tokens));
 }
 
-fn format_user(obj: &Object, tokens: &[FormatToken]) -> String {
+fn format_user(bucket: &str, obj: &Object, tokens: &[FormatToken]) -> String {
     let mut result = String::new();
     for token in tokens {
         match token {
             FormatToken::Literal(lit) => result.push_str(lit),
-            FormatToken::Variable(var) => result.push_str(&var(obj)),
+            FormatToken::Variable(var) => result.push_str(&var(bucket, obj)),
         }
     }
     result
@@ -428,13 +432,14 @@ mod tests {
     #[rstest]
     #[case("Size: {size_bytes}, Name: {key}", "Size: 1234, Name: test/file.txt")]
     #[case("s: {size_human}\t{key}", "s: 1.2kB\ttest/file.txt")]
+    #[case("uri: {uri}", "uri: s3://bkt/test/file.txt")]
+    #[trace]
     fn test_compile_format(#[case] format: &str, #[case] expected: &str) {
         let fmt = compile_format(format).unwrap();
-        assert_eq!(fmt.len(), 4);
 
         let object = Object::builder().key("test/file.txt").size(1234).build();
 
-        let result = format_user(&object, &fmt);
+        let result = format_user("bkt", &object, &fmt);
         assert_eq!(result, expected);
     }
 
