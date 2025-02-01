@@ -47,40 +47,44 @@ Glob syntax supported:
 - `?` matches any single character.
 - `[abc]`/`[!abc]` matches any single character in/not in the set.
 - `[a-z]`/`[!a-z]` matches any single character in/not in the range.
-- `{a,b,c}` matches any of the comma-separated options, including nested globs
-  (but cannot contain `{..}` patterns).
+- `{a,b,c}` matches any of the comma-separated options (but nested globs are not
+  supported).
 
 ### Algorithm and performance implications
 
-tl;dr:
+AWS S3 allows us to enumerate objects within a prefix, but it does not natively
+allow any filtering. `s3glob` works around this by enumerating prefixes and
+matching them recursively against the provided glob pattern.
 
-- the later the first glob character appears the fewer objects need to be scanned
-- the number of directories which match the first glob determines the
-  parallelism
+I have observed s3glob to be able to list hundreds of thousands of objects in a
+couple of seconds from within an ec2 instance.
 
-`s3glob` will search for the first glob character and use the string up to that
-point as the prefix to search.
+It has a few tricks that it uses to minimize the number of objects that need to
+listed, but all of those tricks end at the first recursive glob: `**`.
 
-Parallelism is at the level of the number of objects discovered in that prefix,
-within the given delimiter (specified by the `-d` option, defaulting to `/`).
+What this means in general is that, if you have a keyspace that looks like:
 
-As an example, let's walk through the pattern `s3://mycompany-importantdata/project/2024-*/anything/*/data*.csv`
+```
+2000_01_01-2024_12_31/a-z/0-999/OBJECT_ID.txt
+```
 
-1. `s3glob` will search for the first glob character, which is `*`, and discover the prefix `project/2024-`
-2. An API request is made to list all the prefixes in `project/2024-` up to the delimeter `/`
-   If there are 366 path elements like `2024-01-01` through `2024-12-31` then
-   there will be 366 parallel tasks spawned.
-3. Each of those tasks will do a full bucket scan for _its_ prefix, e.g. there
-   will be one task for `project/2024-01-01` and one for `project/2024-01-02` and
-   so on.
+where each `-` represents the values in between, then you can roughly determine
+how many objects S3Glob will need to list by multiplying the number of
+values in each range. Adding a filter can reduce that number.
 
-I haven't noticed performance degradation up to 1000s of parallel tasks, so I
-recommend actively trying to choose a prefix that will generate lots of tasks.
+Some example approximate numbers:
+
+| Pattern | Approximate number of objects | Reason |
+|---------|--------------------------------|--------|
+| `s3glob ls 2000_01_01/a/*/OBJECT_ID.txt` | 1,000 | 0-999 = 1000 |
+| `s3glob ls 2000_01_01/[abc]/*/OBJECT_ID.txt` | 3,000 | (a + b + c) * 0-999 = 3 * 1000 |
+| `s3glob ls 2000_01_01/*/*/OBJECT_ID.txt` | 26,000 | a-z * 0-999 = 26 * 1000 |
+| `s3glob ls 2000_01_01/[!xyz]/*/OBJECT_ID.txt` | 23,026 | (list all of a-z) = 26 => (filter out x,y,z) => 23 * 1,000 = 23,000 |
+| `s3glob ls 2000_01_*/*/*/OBJECT_ID.txt` | 806,000 | 01-31 * a-z * 0-999 = 31 * 26 * 1000 |
 
 ## Copying
 
 All code is available under the MIT or Apache 2.0 license, at your option.
-
 
 ## Development
 

@@ -7,8 +7,10 @@ use aws_sdk_s3::Client;
 use predicates::prelude::*;
 use predicates::str::contains;
 use rstest::rstest;
+use testcontainers::core::logs::consumer::LogConsumer;
+use testcontainers::core::logs::LogFrame;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerAsync;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
 
 #[rstest]
@@ -200,8 +202,14 @@ async fn test_patterns_in_file_not_path_component(
 //
 
 async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
-    let minio = testcontainers_modules::minio::MinIO::default();
-    let node = minio.start().await.expect("can start minio");
+    let minio =
+        testcontainers_modules::minio::MinIO::default().with_log_consumer(LogPrinter::new());
+    let node = match minio.start().await {
+        Ok(node) => node,
+        Err(e) => {
+            panic!("can't start minio: {}", e);
+        }
+    };
     let port = node.get_host_port_ipv4(9000).await.expect("can get port");
 
     let config = aws_sdk_s3::Config::builder()
@@ -251,6 +259,7 @@ fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
         .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .env("S3GLOB_LOG", "s3glob=trace")
         .args(args);
 
     print_s3glob_output(&mut command);
@@ -264,4 +273,67 @@ fn print_s3glob_output(cmd: &mut Command) {
         String::from_utf8(output.stdout).unwrap(),
         String::from_utf8(output.stderr).unwrap()
     );
+}
+
+use std::borrow::Cow;
+
+use futures::{future::BoxFuture, FutureExt};
+
+/// A consumer that logs the output of container with the [`log`] crate.
+///
+/// By default, both standard out and standard error will both be emitted at INFO level.
+#[derive(Debug)]
+pub struct LogPrinter {
+    prefix: Option<String>,
+}
+
+impl LogPrinter {
+    /// Creates a new instance of the logging consumer.
+    pub fn new() -> Self {
+        Self { prefix: None }
+    }
+
+    /// Sets a prefix to be added to each log message (space will be added between prefix and message).
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    fn format_message<'a>(&self, message: &'a str) -> Cow<'a, str> {
+        let message = message.trim_end_matches(['\n', '\r']);
+
+        if let Some(prefix) = &self.prefix {
+            Cow::Owned(format!("{} {}", prefix, message))
+        } else {
+            Cow::Borrowed(message)
+        }
+    }
+}
+
+impl Default for LogPrinter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogConsumer for LogPrinter {
+    fn accept<'a>(&'a self, record: &'a LogFrame) -> BoxFuture<'a, ()> {
+        async move {
+            match record {
+                LogFrame::StdOut(bytes) => {
+                    println!(
+                        "minio> {}",
+                        self.format_message(&String::from_utf8_lossy(bytes))
+                    );
+                }
+                LogFrame::StdErr(bytes) => {
+                    eprintln!(
+                        "minio> {}",
+                        self.format_message(&String::from_utf8_lossy(bytes))
+                    );
+                }
+            }
+        }
+        .boxed()
+    }
 }
