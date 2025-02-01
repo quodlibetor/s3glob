@@ -16,6 +16,8 @@ use regex::Regex;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 
+mod patterns;
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// List objects matching the pattern
@@ -93,7 +95,7 @@ struct Opts {
     /// and then will list all the objects in these prefixes, filtering them
     /// with the remainder of the pattern.
     #[clap(short, long, default_value = "/", global = true)]
-    delimiter: String,
+    delimiter: char,
 }
 
 fn main() {
