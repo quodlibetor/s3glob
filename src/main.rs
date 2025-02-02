@@ -15,6 +15,7 @@ use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
+use tracing::{debug, error};
 
 mod patterns;
 
@@ -99,10 +100,12 @@ struct Opts {
 }
 
 fn main() {
+    setup_logging(None);
+
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
         if let Err(err) = run().await {
-            eprintln!("ERROR: {}", err);
+            error!("Failed to run: {}", err);
             let mut err = err.source();
             let mut count = 0;
             while let Some(e) = err {
@@ -122,6 +125,7 @@ fn main() {
 
 async fn run() -> Result<()> {
     let opts = Opts::parse();
+    debug!(?opts, "parsed options");
 
     // parse possible s3 uri using s3 crate api
     let region = Region::new(opts.region);
@@ -422,6 +426,24 @@ async fn list_matching_objects(
     }
 
     Ok((matching_objects, seen_objects))
+}
+
+pub(crate) fn setup_logging(extra_filter: Option<&str>) {
+    let env_filter = if let Some(extra_filter) = extra_filter {
+        tracing_subscriber::EnvFilter::from_default_env()
+            .add_directive(extra_filter.parse().unwrap())
+    } else {
+        tracing_subscriber::EnvFilter::from_default_env()
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_target(false) // Don't show target
+        .with_thread_ids(false) // Don't show thread IDs
+        .with_thread_names(false) // Don't show thread names
+        .with_file(true) // Show file and line numbers
+        .with_line_number(true)
+        .with_ansi(true) // Enable colors
+        .init();
 }
 
 #[cfg(test)]
