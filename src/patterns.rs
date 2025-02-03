@@ -675,53 +675,208 @@ mod tests {
     }
 
     #[test]
-    fn test_find_prefixes_complex_pattern() -> Result<()> {
-        setup_logging(Some("s3glob=debug"));
-        let scanner = Scanner::parse("foo/{bar,baz}*jook/qux*{alpha,beta}/**".to_string(), "/")?;
+    fn test_find_prefixes_alternation_then_any() -> Result<()> {
+        let scanner = Scanner::parse("literal/{foo,bar}*/baz".to_string(), "/")?;
         println!("scanner_parts for {}:\n{:#?}", scanner.raw, scanner.parts);
 
-        // Verify scanner parts
-        assert_scanner_part!(&scanner.parts[0], Literal("foo/"));
+        assert_scanner_part!(&scanner.parts[0], Literal("literal/"));
         assert_scanner_part!(
             &scanner.parts[1],
-            Alternation(vec!["bar".to_string(), "baz".to_string()])
+            Alternation(vec!["foo".to_string(), "bar".to_string()])
         );
         assert_scanner_part!(&scanner.parts[2], Any("*"));
-        assert_scanner_part!(&scanner.parts[3], Literal("jook/qux"));
-        assert_scanner_part!(&scanner.parts[4], Any("*"));
-        assert_scanner_part!(
-            &scanner.parts[5],
-            Alternation(vec!["alpha".to_string(), "beta".to_string()])
-        );
-        assert_scanner_part!(&scanner.parts[6], Literal("/"));
-        assert_scanner_part!(&scanner.parts[7], Recursive);
+        assert_scanner_part!(&scanner.parts[3], Literal("/baz"));
 
         let mut engine = MockS3Engine::new(vec![
-            "foo/bar-jook/".to_string(),
-            "foo/bar-something-jook/".to_string(),
-            "foo/baz-jook/".to_string(),
-            "foo/other-jook/".to_string(), // Should be filtered out
-            "foo/bar-jook/qux-1-alpha/".to_string(),
-            "foo/bar-jook/qux-2-beta/stuff/".to_string(),
-            "foo/baz-jook/qux-3-alpha/nested/path".to_string(),
-            "foo/baz-jook/qux-4-beta/".to_string(),
-            "foo/baz-jook/not-qux-alpha/".to_string(), // Should be filtered out
+            "literal/foo/baz".to_string(),
+            "literal/foo-extra/baz".to_string(),
+            "literal/bar-stuff/baz".to_string(),
+            "literal/other/baz".to_string(), // Should be filtered out
         ]);
 
         let prefixes = scanner.find_prefixes(&mut engine)?;
-        engine.assert_calls(&[
-            ("foo/bar", "/"),
-            ("foo/baz", "/"),
-            // ("foo/bar-jook", "/"),
-            // ("foo/bar-something-jook", "/"),
-            // ("foo/bar-jook", "/"),
-            // ("foo/bar-jook", "/"),
-            // ("foo/baz-jook", "/"),
-            // ("foo/baz-jook", "/"),
-            // ("foo/baz-jook", "/"),
-            // ("foo/baz-jook", "/"),
+        engine.assert_calls(&[("literal/foo", "/"), ("literal/bar", "/")]);
+        assert!(
+            prefixes
+                == vec![
+                    "literal/foo/baz",
+                    "literal/foo-extra/baz",
+                    "literal/bar-stuff/baz"
+                ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_prefixes_alternation_any_literal() -> Result<()> {
+        let scanner = Scanner::parse("literal/{foo,bar}*quux/baz".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Literal("literal/"));
+        assert_scanner_part!(
+            &scanner.parts[1],
+            Alternation(vec!["foo".to_string(), "bar".to_string()])
+        );
+        assert_scanner_part!(&scanner.parts[2], Any("*"));
+        assert_scanner_part!(&scanner.parts[3], Literal("quux/baz"));
+
+        let mut engine = MockS3Engine::new(vec![
+            "literal/foo-quux/baz".to_string(),
+            "literal/foo-something-bar/baz".to_string(),
+            "literal/bar-quux/baz".to_string(),
+            "literal/other-quux/baz".to_string(), // Should be filtered out
         ]);
-        assert!(prefixes == vec!["foo/bar-jook/", "foo/baz-jook/"]);
+
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("literal/foo", "/"), ("literal/bar", "/")]);
+        assert!(
+            prefixes
+                == vec![
+                    "literal/foo-quux/baz",
+                    "literal/foo-something-bar/baz",
+                    "literal/bar-quux/baz"
+                ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_prefixes_any_then_alternation() -> Result<()> {
+        let scanner = Scanner::parse("literal/*{foo,bar}/baz".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Literal("literal/"));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(
+            &scanner.parts[2],
+            Alternation(vec!["foo".to_string(), "bar".to_string()])
+        );
+        assert_scanner_part!(&scanner.parts[3], Literal("/baz"));
+
+        let mut engine = MockS3Engine::new(vec![
+            "literal/something-foo/baz".to_string(),
+            "literal/other-bar/baz".to_string(),
+            "literal/not-match/baz".to_string(), // Should be filtered out
+        ]);
+
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("literal/", "/")]);
+        assert!(prefixes == vec!["literal/something-foo/baz", "literal/other-bar/baz"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_prefixes_literal_any_alternation() -> Result<()> {
+        let scanner = Scanner::parse("literal/quux*{foo,bar}/baz".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Literal("literal/quux"));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(
+            &scanner.parts[2],
+            Alternation(vec!["foo".to_string(), "bar".to_string()])
+        );
+        assert_scanner_part!(&scanner.parts[3], Literal("/baz"));
+
+        let mut engine = MockS3Engine::new(vec![
+            "literal/quux-foo/baz".to_string(),
+            "literal/quux-something-bar/baz".to_string(),
+            "literal/quux-other/baz".to_string(), // Should be filtered out
+        ]);
+
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("literal/quux", "/")]);
+        assert!(prefixes == vec!["literal/quux-foo/baz", "literal/quux-something-bar/baz"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_prefixes_any_after_last_delimiter() -> Result<()> {
+        let scanner = Scanner::parse("literal/baz*.rs".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Literal("literal/baz"));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(&scanner.parts[2], Literal(".rs"));
+
+        let mut engine = MockS3Engine::new(vec![
+            "literal/baz.rs".to_string(),
+            "literal/baz-extra.rs".to_string(),
+            "literal/bazinga.rs".to_string(),
+            "literal/other.rs".to_string(), // Should be filtered out
+        ]);
+
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("literal/baz", "/")]);
+        assert!(
+            prefixes
+                == vec![
+                    "literal/baz.rs",
+                    "literal/baz-extra.rs",
+                    "literal/bazinga.rs"
+                ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_prefixes_any_and_character_class() -> Result<()> {
+        let scanner = Scanner::parse("literal/baz*[ab].rs".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Literal("literal/baz"));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(
+            &scanner.parts[2],
+            Alternation(vec!["a".to_string(), "b".to_string()])
+        );
+        assert_scanner_part!(&scanner.parts[3], Literal(".rs"));
+
+        let mut engine = MockS3Engine::new(vec![
+            "literal/baz-a.rs".to_string(),
+            "literal/baz-extra-b.rs".to_string(),
+            "literal/baz-c.rs".to_string(), // Should be filtered out
+        ]);
+
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("literal/baz", "/")]);
+        assert!(prefixes == vec!["literal/baz-a.rs", "literal/baz-extra-b.rs"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_prefixes_empty_alternative() -> Result<()> {
+        let scanner = Scanner::parse("src/{,tmp}/file".to_string(), "/")?;
+        let mut engine = MockS3Engine::new(vec![
+            "src/file".to_string(),
+            "src/tmp/file".to_string(),
+            "src/other/file".to_string(), // Should be filtered out
+        ]);
+
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        assert!(prefixes == vec!["src/file", "src/tmp/file"]);
+        let e: &[(&str, &str)] = &[];
+        engine.assert_calls(e);
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_prefixes_alternation_with_delimiter() -> Result<()> {
+        let scanner = Scanner::parse("src/{foo/bar,baz}/test".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Literal("src/"));
+        assert_scanner_part!(
+            &scanner.parts[1],
+            Alternation(vec!["foo/bar".to_string(), "baz".to_string()])
+        );
+        assert_scanner_part!(&scanner.parts[2], Literal("/test"));
+
+        let mut engine = MockS3Engine::new(vec![
+            "src/foo/bar/test".to_string(),
+            "src/baz/test".to_string(),
+            "src/foo/test".to_string(),     // Should be filtered out
+            "src/foo/baz/test".to_string(), // Should be filtered out
+        ]);
+
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        assert!(prefixes == vec!["src/foo/bar/test", "src/baz/test"]);
+        let e: &[(&str, &str)] = &[]; // No API calls needed since alternation is static
+        engine.assert_calls(e);
         Ok(())
     }
 
