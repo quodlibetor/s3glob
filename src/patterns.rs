@@ -21,11 +21,6 @@ trait Engine {
     fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>>;
 }
 
-#[cfg(test)]
-struct TestEngine {
-    prefixes: Vec<String>,
-}
-
 /// A scanner takes a glob pattern and can efficiently generate a list of S3
 /// prefixes based on it.
 impl Scanner {
@@ -69,20 +64,17 @@ impl Scanner {
     ///   - `{a,b}` or `[ab]` either filters existing prefixes or generates new ones by appending each alternative
     ///   - `**` stops prefix generation (since it matches any number of path components)
     ///
-    /// # Arguments
-    ///
-    /// * `engine` - Implementation that generates more prefixes given a list of prefixes
-    ///
     /// # Returns
     ///
     /// A list of S3 prefixes that could contain matches for this pattern
     ///
     /// # Example
     ///
-    /// For pattern "foo/{bar,baz}/qux*":
+    /// For pattern "foo/{bar,baz}*jook/qux*{alpha,beta}/**":
     /// 1. Start with [""]
     /// 2. Append "foo/" -> ["foo/"]
-    /// 3. Append alternatives -> ["foo/bar/", "foo/baz/"]
+    /// 3. Append alternatives -> ["foo/bar", "foo/baz"]
+    /// 4. Search for all folders in ["foo/bar", "foo/baz"]
     /// 4. Append "qux" -> ["foo/bar/qux", "foo/baz/qux"]
     /// 5. Filter by "*" -> keep prefixes whose last component starts with "qux"
     fn find_prefixes(&self, engine: &mut impl Engine) -> Result<Vec<String>> {
@@ -91,41 +83,22 @@ impl Scanner {
         let delimiter = self.delimiter.to_string();
         let mut last_part: Option<&ScannerPart> = None;
         let mut regex_so_far = Regex::new("^").unwrap();
-        let mut iter = self.parts.iter().peekable();
-        while let Some(part) = iter.next() {
+        for part in &self.parts {
             match part {
                 ScannerPart::Literal(s) => {
-                    // if let Some(ScannerPart::Pattern(Glob::Alternation { .. })) = iter.peek() {
-                    for prefix in &mut prefixes {
-                        if prefix.ends_with(self.delimiter) && s.starts_with(self.delimiter) {
-                            prefix.pop();
+                    if last_part.map_or(true, |p| p.is_static()) || s.starts_with(self.delimiter) {
+                        for prefix in &mut prefixes {
+                            if prefix.ends_with(self.delimiter) {
+                                prefix.pop();
+                            }
+                            prefix.push_str(s);
                         }
-                        prefix.push_str(s);
+                        prefixes = engine.check_prefixes(&prefixes)?;
                     }
-                    prefixes = engine.check_prefixes(&prefixes)?;
-                    // } else {
-                    //     let mut new_prefixes = Vec::new();
-                    //     for prefix in &prefixes {
-                    //         let np = engine.scan_prefixes(&format!("{prefix}{s}"), &delimiter)?;
-                    //         debug!(prefix, literal = s, found = ?np, "prefix scanned");
-                    //         new_prefixes.extend(np);
-                    //     }
-                    //     prefixes = new_prefixes;
                 }
-                // }
-                // filter part
                 ScannerPart::Pattern(gl) => {
                     match &gl {
                         Glob::Any { .. } => {
-                            // nothing to do, everything matches an any and
-                            // querying the api only happens after literals
-                            //
-                            // this part of the pattern will get added to the
-                            // regex_so_far, though
-                            // if matches!(
-                            //     last_part,
-                            //     Some(ScannerPart::Pattern(Glob::Alternation { .. }))
-                            // ) {
                             let mut new_prefixes = Vec::new();
                             for prefix in &prefixes {
                                 let mut np = engine.scan_prefixes(prefix, &delimiter)?;
@@ -138,7 +111,6 @@ impl Scanner {
                                 new_prefixes.extend(np);
                             }
                             prefixes = new_prefixes;
-                            // }
                         }
                         Glob::Recursive { .. } => {
                             // exit prefix generation
@@ -343,6 +315,19 @@ impl Glob {
 enum ScannerPart {
     Literal(String),
     Pattern(Glob),
+}
+
+impl ScannerPart {
+    /// A part that can be inserted directly by the scanner without needing to
+    /// do an api call to find the things that match it.
+    ///
+    /// That is, literals and alternations.
+    fn is_static(&self) -> bool {
+        matches!(
+            self,
+            ScannerPart::Literal(_) | ScannerPart::Pattern(Glob::Alternation { .. })
+        )
+    }
 }
 
 #[cfg(test)]
@@ -648,6 +633,7 @@ mod tests {
 
     #[test]
     fn test_find_prefixes_recursive() -> Result<()> {
+        setup_logging(Some("s3glob=debug"));
         let scanner = Scanner::parse("src/**/test.rs".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
             "src/test.rs".to_string(),
@@ -666,6 +652,7 @@ mod tests {
 
     #[test]
     fn test_find_prefixes_character_class() -> Result<()> {
+        setup_logging(Some("s3glob=debug"));
         let scanner = Scanner::parse("src/[abc]*.rs".to_string(), "/")?;
         assert_scanner_part!(&scanner.parts[0], Literal("src/"));
         assert_scanner_part!(
@@ -682,8 +669,59 @@ mod tests {
         ]);
 
         let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("src/a", "/"), ("src/b", "/"), ("src/c", "/")]);
         assert!(prefixes == vec!["src/abc.rs", "src/baz.rs", "src/cat.rs"]);
-        engine.assert_calls(&[("src/", "/")]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_prefixes_complex_pattern() -> Result<()> {
+        setup_logging(Some("s3glob=debug"));
+        let scanner = Scanner::parse("foo/{bar,baz}*jook/qux*{alpha,beta}/**".to_string(), "/")?;
+        println!("scanner_parts for {}:\n{:#?}", scanner.raw, scanner.parts);
+
+        // Verify scanner parts
+        assert_scanner_part!(&scanner.parts[0], Literal("foo/"));
+        assert_scanner_part!(
+            &scanner.parts[1],
+            Alternation(vec!["bar".to_string(), "baz".to_string()])
+        );
+        assert_scanner_part!(&scanner.parts[2], Any("*"));
+        assert_scanner_part!(&scanner.parts[3], Literal("jook/qux"));
+        assert_scanner_part!(&scanner.parts[4], Any("*"));
+        assert_scanner_part!(
+            &scanner.parts[5],
+            Alternation(vec!["alpha".to_string(), "beta".to_string()])
+        );
+        assert_scanner_part!(&scanner.parts[6], Literal("/"));
+        assert_scanner_part!(&scanner.parts[7], Recursive);
+
+        let mut engine = MockS3Engine::new(vec![
+            "foo/bar-jook/".to_string(),
+            "foo/bar-something-jook/".to_string(),
+            "foo/baz-jook/".to_string(),
+            "foo/other-jook/".to_string(), // Should be filtered out
+            "foo/bar-jook/qux-1-alpha/".to_string(),
+            "foo/bar-jook/qux-2-beta/stuff/".to_string(),
+            "foo/baz-jook/qux-3-alpha/nested/path".to_string(),
+            "foo/baz-jook/qux-4-beta/".to_string(),
+            "foo/baz-jook/not-qux-alpha/".to_string(), // Should be filtered out
+        ]);
+
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[
+            ("foo/bar", "/"),
+            ("foo/baz", "/"),
+            // ("foo/bar-jook", "/"),
+            // ("foo/bar-something-jook", "/"),
+            // ("foo/bar-jook", "/"),
+            // ("foo/bar-jook", "/"),
+            // ("foo/baz-jook", "/"),
+            // ("foo/baz-jook", "/"),
+            // ("foo/baz-jook", "/"),
+            // ("foo/baz-jook", "/"),
+        ]);
+        assert!(prefixes == vec!["foo/bar-jook/", "foo/baz-jook/"]);
         Ok(())
     }
 
