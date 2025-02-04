@@ -16,16 +16,18 @@ use tracing::{debug, trace};
 /// Note that the compiled regexes are designed to match against an _entire_ path segment
 #[derive(Debug)]
 enum Glob {
-    /// A single `*` or `?`
-    Any { raw: String, re: Regex },
+    /// A single `*` or `?`, or a negated character class
+    Any {
+        raw: String,
+        alternatives: Option<Vec<String>>,
+    },
     /// A literal string or group of alternatives, like `foo` or `{foo,bar}` or `[abc]`
     Choice {
         raw_len: usize,
         allowed: Vec<String>,
-        re: Regex,
     },
     /// A recursive glob, always `**`
-    Recursive { re: Regex },
+    Recursive,
 }
 
 impl Glob {
@@ -45,6 +47,29 @@ impl Glob {
 
     fn is_any(&self) -> bool {
         matches!(self, Glob::Any { .. })
+    }
+
+    fn re_string(&self, delimiter: &str) -> String {
+        match self {
+            Glob::Any { raw, alternatives } => match (&**raw, alternatives) {
+                (_, Some(alts)) => {
+                    let chars = alts.join("");
+                    format!("[^{}]", chars)
+                }
+                ("?", _) => ".".to_string(),
+                ("*", _) => format!("[^{delimiter}]*"),
+                (_, _) => panic!("invalid any pattern: {raw}"),
+            },
+            Glob::Choice { allowed, .. } => {
+                let re_alts = allowed.iter().map(|a| regex::escape(a)).join("|");
+                format!("({})", re_alts)
+            }
+            Glob::Recursive { .. } => ".*".to_string(),
+        }
+    }
+
+    fn re(&self, delimiter: &str) -> Regex {
+        Regex::new(&self.re_string(delimiter)).unwrap()
     }
 
     /// Create the combination of two glob patterns
@@ -94,11 +119,9 @@ impl Scanner {
                         parts.push(Glob::Choice {
                             raw_len: next_part.len(),
                             allowed: vec![next_part.clone()],
-                            re: Regex::new(&regex::escape(&next_part)).unwrap(),
                         });
                     }
-                    let gl =
-                        parse_pattern(delimiter, &remaining[idx..]).context("Parsing pattern")?;
+                    let gl = parse_pattern(&remaining[idx..]).context("Parsing pattern")?;
                     remaining = &remaining[idx + gl.pattern_len()..];
                     parts.push(gl);
                 }
@@ -106,7 +129,6 @@ impl Scanner {
                     parts.push(Glob::Choice {
                         raw_len: remaining.len(),
                         allowed: vec![remaining.to_string()],
-                        re: Regex::new(&regex::escape(remaining)).unwrap(),
                     });
                     break;
                 }
@@ -266,39 +288,34 @@ impl Scanner {
             }
 
             // clean up state-tracking
-            regex_so_far = match part {
-                Glob::Choice { re, .. } => {
-                    Regex::new(&format!("{}{}", regex_so_far.as_str(), re.as_str())).unwrap()
-                }
-                Glob::Any { re, .. } | Glob::Recursive { re, .. } => {
-                    Regex::new(&format!("{}{}", regex_so_far.as_str(), re.as_str())).unwrap()
-                }
-            };
+            regex_so_far = Regex::new(&format!(
+                "{}{}",
+                regex_so_far.as_str(),
+                part.re_string(&self.delimiter.to_string())
+            ))
+            .unwrap();
         }
         Ok(prefixes)
     }
 }
 
 /// Convert a single pattern into something useful for searching
-fn parse_pattern(delimiter: &str, raw: &str) -> Result<Glob> {
+fn parse_pattern(raw: &str) -> Result<Glob> {
     let mut iter = raw.chars().peekable();
     let mut raw_len = 1;
     Ok(match iter.next().expect("next char must exist") {
         // any patterns
         '?' => Glob::Any {
             raw: "?".to_string(),
-            re: Regex::new(".").unwrap(),
+            alternatives: None,
         },
         '*' => {
             if matches!(iter.peek(), Some('*')) {
-                Glob::Recursive {
-                    re: Regex::new(".*").unwrap(),
-                }
+                Glob::Recursive
             } else {
                 Glob::Any {
                     raw: "*".to_string(),
-                    // TODO: is it correct for this to be anchored to start and end?
-                    re: Regex::new(&format!("[^{delimiter}]*")).unwrap(),
+                    alternatives: None,
                 }
             }
         }
@@ -325,11 +342,9 @@ fn parse_pattern(delimiter: &str, raw: &str) -> Result<Glob> {
             if !ended {
                 bail!("Alternation has no closing brace (missing '}}'): {}", raw);
             }
-            let re_alts = alternatives.iter().map(|a| regex::escape(a)).join("|");
             Glob::Choice {
                 raw_len,
                 allowed: alternatives,
-                re: Regex::new(&format!("({})", re_alts)).unwrap(),
             }
         }
         '[' => {
@@ -355,15 +370,16 @@ fn parse_pattern(delimiter: &str, raw: &str) -> Result<Glob> {
             if !ended {
                 bail!("Alternation has no closing bracket (missing ']'): {}", raw);
             }
-            let re = if is_negated {
-                Regex::new(&format!("[^{}]", alternatives.join(""))).unwrap()
+            if is_negated {
+                Glob::Any {
+                    raw: raw[..raw_len].to_string(),
+                    alternatives: Some(alternatives),
+                }
             } else {
-                Regex::new(&raw[..raw_len]).unwrap()
-            };
-            Glob::Choice {
-                raw_len,
-                allowed: alternatives,
-                re,
+                Glob::Choice {
+                    raw_len,
+                    allowed: alternatives,
+                }
             }
         }
         // not a pattern
@@ -458,8 +474,8 @@ mod tests {
         assert_scanner_part!(
             &scanner.parts[0],
             Choice(vec!["test]file", "testafile"]),
-            &["]", "a", "testafile"],
-            !&["b", ""]
+            &["test]file", "testafile"],
+            !&["test-file", "b", ""]
         );
 
         Ok(())
@@ -467,14 +483,10 @@ mod tests {
 
     #[test]
     fn test_parse_negated_character_class() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("test[!a]file".to_string(), "/")?;
 
-        assert_scanner_part!(
-            &scanner.parts[0],
-            Choice(vec!["a"]),
-            &["b", "z", "]"],
-            !&["a", ""]
-        );
+        assert_scanner_part!(&scanner.parts[1], Any("[!a]"), &["/", "B"], !&["a"]);
 
         Ok(())
     }
@@ -485,7 +497,7 @@ mod tests {
 
         assert_scanner_part!(
             &scanner.parts[1],
-            Choice(vec!["]"]),
+            Any("[!]]"),
             &["a", "b", "["],
             !&["]", ""]
         );
@@ -496,12 +508,11 @@ mod tests {
     #[test]
     fn test_parse_choice_after_any() -> Result<()> {
         let scanner = Scanner::parse("literal/*{foo,bar}/baz".to_string(), "/")?;
-        check!(scanner.parts.len() == 4);
 
         assert_scanner_part!(&scanner.parts[0], OneChoice("literal/"));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
-        assert_scanner_part!(&scanner.parts[2], Choice(vec!["foo", "bar"]));
-        assert_scanner_part!(&scanner.parts[3], OneChoice("/baz"));
+        assert_scanner_part!(&scanner.parts[2], Choice(vec!["foo/baz", "bar/baz"]));
+        check!(scanner.parts.len() == 3);
 
         Ok(())
     }
@@ -510,12 +521,11 @@ mod tests {
     fn test_parse_literal_after_any_with_delimiter() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("literal/*foo/baz".to_string(), "/")?;
-        check!(scanner.parts.len() == 4);
+        check!(scanner.parts.len() == 3);
 
         assert_scanner_part!(&scanner.parts[0], OneChoice("literal/"));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
-        assert_scanner_part!(&scanner.parts[2], OneChoice("foo"));
-        assert_scanner_part!(&scanner.parts[3], OneChoice("/baz"));
+        assert_scanner_part!(&scanner.parts[2], Choice(vec!["foo/baz"]));
 
         Ok(())
     }
@@ -946,9 +956,9 @@ mod tests {
 
         ($part:expr, Any($expected:expr), $expected_matches:expr, !$expected_does_not_match:expr) => {
             match $part {
-                Glob::Any { raw, re } => {
+                Glob::Any { raw, .. } => {
                     assert!(*raw == $expected);
-                    assert_scanner_part!(@test_matches, re, $expected_matches, !$expected_does_not_match);
+                    assert_scanner_part!(@test_matches, $part.re("/"), $expected_matches, !$expected_does_not_match);
                 }
                 other => panic!("Expected Any({:?}), got {:?}", $expected, other),
             }
@@ -958,12 +968,22 @@ mod tests {
             let ednm: &[&str] = &[];
             assert_scanner_part!($part, Any($expected), em, !ednm);
         }};
+
+        ($part:expr, NegatedAny($expected:expr), $expected_matches:expr, !$expected_does_not_match:expr) => {
+            match $part {
+                Glob::Any { raw } => {
+                    assert!(*raw == $expected);
+                    assert_scanner_part!(@test_matches, $part.re("/"), $expected_matches, !$expected_does_not_match);
+                }
+                other => panic!("Expected Any({:?}), got {:?}", $expected, other),
+            }
+        };
         ($part:expr, Recursive, $expected_matches:expr) => {
             match $part {
-                Glob::Recursive { re } => {
+                Glob::Recursive => {
+                    let re = $part.re("/");
                     for m in $expected_matches {
-                        eprintln!("matching {m:?} against {}", re.as_str());
-                        check!(re.is_match(m));
+                        check!(re.is_match(m), "matching {m:?} against {}", $part.re_string("/"));
                     }
                 }
                 other => panic!("Expected Recursive, got {:?}", other),
@@ -985,9 +1005,9 @@ mod tests {
         };
         ($part:expr, Choice($expected:expr), $expected_matches:expr, !$expected_does_not_match:expr) => {
             match $part {
-                Glob::Choice { allowed, re, .. } => {
+                Glob::Choice { allowed, .. } => {
                     check!(*allowed == $expected);
-                    assert_scanner_part!(@test_matches, re, $expected_matches, !$expected_does_not_match);
+                    assert_scanner_part!(@test_matches, $part.re("/"), $expected_matches, !$expected_does_not_match);
                 }
                 other => panic!("Expected Choice({:?}), got {:?}", $expected, other),
             }
