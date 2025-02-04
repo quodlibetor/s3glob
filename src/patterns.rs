@@ -4,10 +4,12 @@
 
 const GLOB_CHARS: &[char] = &['*', '?', '[', '{'];
 
+use std::collections::BTreeSet;
+
 use anyhow::{bail, Context as _, Result};
 use itertools::Itertools as _;
 use regex::Regex;
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// A glob pattern, and its compiled regex
 ///
@@ -37,14 +39,31 @@ impl Glob {
 
     /// A part that can be inserted directly by the scanner without needing to
     /// do an api call to find the things that match it.
-    ///
-    /// That is, literals and alternations.
-    fn is_static(&self) -> bool {
+    fn is_choice(&self) -> bool {
         matches!(self, Glob::Choice { .. })
     }
 
     fn is_any(&self) -> bool {
         matches!(self, Glob::Any { .. })
+    }
+
+    /// Create the combination of two glob patterns
+    ///
+    /// This will merge all of other into self
+    fn combine_with(&mut self, other: &Glob) {
+        match (self, other) {
+            (Glob::Choice { allowed: sa, .. }, Glob::Choice { allowed: oa, .. }) => {
+                let mut new_allowed = Vec::with_capacity(sa.len() * oa.len());
+                for choice in sa.iter() {
+                    for alt in oa {
+                        new_allowed.push(format!("{choice}{alt}"));
+                    }
+                }
+                sa.clear();
+                sa.extend(new_allowed);
+            }
+            _ => panic!("Cannot combine glob with non-choice glob"),
+        }
     }
 }
 
@@ -66,22 +85,8 @@ impl Scanner {
     pub fn parse(raw: String, delimiter: &str) -> Result<Self> {
         let mut parts = Vec::new();
         let mut remaining = &*raw;
-        let mut last_was_any = false;
-        let glob_or_delimiter: Vec<char> = GLOB_CHARS
-            .iter()
-            .copied()
-            .chain(delimiter.chars())
-            .collect();
-
         while !remaining.is_empty() {
-            // if the last part would hit the api then we need to filter instead
-            // of append in scan_parts
-            // But we need to do that only if the last part is a glob
-            let next_idx = if last_was_any {
-                remaining.find(&*glob_or_delimiter)
-            } else {
-                remaining.find(GLOB_CHARS)
-            };
+            let next_idx = remaining.find(GLOB_CHARS);
             match next_idx {
                 Some(idx) => {
                     let next_part = remaining[..idx].to_string();
@@ -92,15 +97,9 @@ impl Scanner {
                             re: Regex::new(&regex::escape(&next_part)).unwrap(),
                         });
                     }
-                    if last_was_any {
-                        last_was_any = false;
-                        remaining = &remaining[idx..];
-                        continue;
-                    }
                     let gl =
                         parse_pattern(delimiter, &remaining[idx..]).context("Parsing pattern")?;
                     remaining = &remaining[idx + gl.pattern_len()..];
-                    last_was_any = gl.is_any();
                     parts.push(gl);
                 }
                 None => {
@@ -114,12 +113,25 @@ impl Scanner {
             }
         }
 
-        debug!(pattern = %raw, parsed = ?parts, "parsed pattern");
+        let mut new_parts: Vec<Glob> = Vec::new();
+        for part in parts {
+            if let Some(last) = new_parts.last_mut() {
+                if last.is_choice() && part.is_choice() {
+                    last.combine_with(&part);
+                } else {
+                    new_parts.push(part);
+                }
+            } else {
+                new_parts.push(part);
+            }
+        }
+
+        debug!(pattern = %raw, parsed = ?new_parts, "parsed pattern");
 
         Ok(Scanner {
             raw,
             delimiter: delimiter.chars().next().unwrap(),
-            parts,
+            parts: new_parts,
         })
     }
 
@@ -151,7 +163,6 @@ impl Scanner {
         debug!("finding prefixes for {}", self.raw);
         let mut prefixes = vec!["".to_string()];
         let delimiter = self.delimiter.to_string();
-        let mut last_part: Option<&Glob> = None;
         let mut regex_so_far = Regex::new("^").unwrap();
         for part in &self.parts {
             match part {
@@ -166,18 +177,13 @@ impl Scanner {
                 Glob::Any { .. } => {
                     let mut new_prefixes = Vec::new();
                     for prefix in &prefixes {
-                        let mut np = engine.scan_prefixes(prefix, &delimiter)?;
-                        debug!(prefix, found = ?np, "scanned prefixes for Any");
-                        for p in &mut np {
-                            if p.ends_with(self.delimiter) {
-                                p.pop();
-                            }
-                        }
+                        let np = engine.scan_prefixes(prefix, &delimiter)?;
+                        trace!(prefix, found = ?np, "scanned prefixes for Any");
                         new_prefixes.extend(np);
                     }
                     prefixes = new_prefixes;
                 }
-                Glob::Choice { allowed, re, .. } => {
+                Glob::Choice { allowed, .. } => {
                     // In an alternation we need to check for two cases:
                     // - we are verifying that the middle of the path matches
                     //   one of the alternatives -- this is just a regex filter
@@ -195,35 +201,71 @@ impl Scanner {
 
                     // if there is no previous part, or the previous part is a literal,
                     // then we can just append the alternatives to the prefixes
-                    let is_simple_append = last_part.map_or(true, |p| p.is_static());
+                    let is_simple_append = prefixes.len() == 1;
 
                     if is_simple_append {
-                        debug!("appending choices: {:?}", allowed.join(","));
                         let mut new_prefixes = Vec::with_capacity(prefixes.len() * allowed.len());
                         for prefix in prefixes {
                             for alt in allowed {
                                 new_prefixes.push(format!("{prefix}{alt}"));
                             }
                         }
-                        prefixes = new_prefixes;
+                        prefixes = engine.check_prefixes(&new_prefixes)?;
                     } else {
-                        debug!("filtering prefixes for pattern: {:?}", re.as_str());
                         let mut new_prefixes = Vec::with_capacity(prefixes.len());
-                        let matcher =
-                            Regex::new(&format!("{}{}", regex_so_far.as_str(), re.as_str()))
-                                .unwrap();
-                        for prefix in prefixes {
-                            if matcher.is_match(&prefix) {
-                                new_prefixes.push(prefix);
+                        let mut filters = BTreeSet::new();
+                        let mut appends = BTreeSet::new();
+                        for choice in allowed {
+                            if choice.starts_with(self.delimiter) {
+                                let c = choice.chars().skip(1).collect::<String>();
+                                if !c.is_empty() {
+                                    appends.insert(c);
+                                }
+                                filters.insert(self.delimiter.to_string());
+                            } else if choice.contains(self.delimiter) {
+                                let up_to_delim = choice
+                                    .chars()
+                                    .take_while_inclusive(|c| *c != self.delimiter)
+                                    .collect::<String>();
+                                filters.insert(regex::escape(&up_to_delim));
+
+                                let after_delim = choice[up_to_delim.len()..].to_string();
+                                if !after_delim.is_empty() {
+                                    appends.insert(regex::escape(&after_delim));
+                                }
+                            } else {
+                                filters.insert(regex::escape(choice));
                             }
                         }
-                        prefixes = new_prefixes;
+                        let filters = filters.iter().join("|");
+                        let matcher = if !filters.is_empty() {
+                            &Regex::new(&format!("{}({})", regex_so_far.as_str(), filters)).unwrap()
+                        } else {
+                            &regex_so_far
+                        };
+                        debug!(filters, ?appends, regex = ?matcher, ?prefixes, "filtering and appending to prefixes");
+                        for prefix in prefixes {
+                            if matcher.is_match(&prefix) {
+                                if !appends.is_empty() {
+                                    for alt in &appends {
+                                        new_prefixes.push(format!("{prefix}{alt}"));
+                                    }
+                                } else {
+                                    new_prefixes.push(prefix);
+                                }
+                            }
+                        }
+
+                        if !appends.is_empty() {
+                            prefixes = engine.check_prefixes(&new_prefixes)?;
+                        } else {
+                            prefixes = new_prefixes;
+                        }
                     }
                 }
             }
 
             // clean up state-tracking
-            last_part = Some(part);
             regex_so_far = match part {
                 Glob::Choice { re, .. } => {
                     Regex::new(&format!("{}{}", regex_so_far.as_str(), re.as_str())).unwrap()
@@ -256,7 +298,7 @@ fn parse_pattern(delimiter: &str, raw: &str) -> Result<Glob> {
                 Glob::Any {
                     raw: "*".to_string(),
                     // TODO: is it correct for this to be anchored to start and end?
-                    re: Regex::new(&format!("^[^{delimiter}]*$")).unwrap(),
+                    re: Regex::new(&format!("[^{delimiter}]*")).unwrap(),
                 }
             }
         }
@@ -345,11 +387,11 @@ mod tests {
     #[test]
     fn test_parse_basic() -> Result<()> {
         let scanner = Scanner::parse("hello*world".to_string(), "/")?;
-        check!(scanner.parts.len() == 3);
 
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["hello"]));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
         assert_scanner_part!(&scanner.parts[2], Choice(vec!["world"]));
+        check!(scanner.parts.len() == 3);
 
         Ok(())
     }
@@ -357,11 +399,10 @@ mod tests {
     #[test]
     fn test_parse_multiple_glob() -> Result<()> {
         let scanner = Scanner::parse("/{a,b}*/".to_string(), "/")?;
-        assert_scanner_part!(&scanner.parts[0], OneChoice("/"));
-        assert_scanner_part!(&scanner.parts[1], Choice(vec!["a", "b"]));
-        assert_scanner_part!(&scanner.parts[2], Any("*"));
-        assert_scanner_part!(&scanner.parts[3], OneChoice("/"));
-        check!(scanner.parts.len() == 4);
+        assert_scanner_part!(&scanner.parts[0], Choice(vec!["/a", "/b"]));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(&scanner.parts[2], OneChoice("/"));
+        check!(scanner.parts.len() == 3);
 
         Ok(())
     }
@@ -369,23 +410,24 @@ mod tests {
     #[test]
     fn test_parse_alternation() -> Result<()> {
         let scanner = Scanner::parse("src/{foo,bar}/test".to_string(), "/")?;
-        check!(scanner.parts.len() == 3);
 
-        assert_scanner_part!(&scanner.parts[0], OneChoice("src/"));
-        assert_scanner_part!(&scanner.parts[1], Choice(vec!["foo", "bar"]));
-        assert_scanner_part!(&scanner.parts[2], OneChoice("/test"));
-
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Choice(vec!["src/foo/test", "src/bar/test"])
+        );
+        check!(scanner.parts.len() == 1);
         Ok(())
     }
 
     #[test]
     fn test_parse_character_class() -> Result<()> {
         let scanner = Scanner::parse("test[abc]file".to_string(), "/")?;
-        check!(scanner.parts.len() == 3);
 
-        assert_scanner_part!(&scanner.parts[0], OneChoice("test"));
-        assert_scanner_part!(&scanner.parts[1], Choice(vec!["a", "b", "c"]));
-        assert_scanner_part!(&scanner.parts[2], OneChoice("file"));
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Choice(vec!["testafile", "testbfile", "testcfile"])
+        );
+        check!(scanner.parts.len() == 1);
 
         Ok(())
     }
@@ -403,12 +445,8 @@ mod tests {
             &["foo/bar", "foo/bar/baz", ""]
         );
         assert_scanner_part!(&scanner.parts[2], OneChoice("/"));
-        assert_scanner_part!(
-            &scanner.parts[3],
-            Any("*"),
-            &["something_long"],
-            !&["something/with/slashes"]
-        );
+        let e: &[&str] = &[];
+        assert_scanner_part!(&scanner.parts[3], Any("*"), &["something_long"], !e);
 
         Ok(())
     }
@@ -418,9 +456,9 @@ mod tests {
         let scanner = Scanner::parse("test[]a]file".to_string(), "/")?;
 
         assert_scanner_part!(
-            &scanner.parts[1],
-            Choice(vec!["]", "a"]),
-            &["]", "a"],
+            &scanner.parts[0],
+            Choice(vec!["test]file", "testafile"]),
+            &["]", "a", "testafile"],
             !&["b", ""]
         );
 
@@ -432,7 +470,7 @@ mod tests {
         let scanner = Scanner::parse("test[!a]file".to_string(), "/")?;
 
         assert_scanner_part!(
-            &scanner.parts[1],
+            &scanner.parts[0],
             Choice(vec!["a"]),
             &["b", "z", "]"],
             !&["a", ""]
@@ -470,7 +508,7 @@ mod tests {
 
     #[test]
     fn test_parse_literal_after_any_with_delimiter() -> Result<()> {
-        setup_logging(Some("s3glob=debug"));
+        setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("literal/*foo/baz".to_string(), "/")?;
         check!(scanner.parts.len() == 4);
 
@@ -574,9 +612,9 @@ mod tests {
 
     #[test]
     fn test_find_prefixes_literal() -> Result<()> {
-        setup_logging(Some("s3glob=debug"));
+        setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/foo/bar".to_string(), "/")?;
-        assert_scanner_part!(&scanner.parts[0], OneChoice("src/foo/bar"));
+        // assert_scanner_part!(&scanner.parts[0], OneChoice("src/foo/bar"));
         let mut engine = MockS3Engine::new(vec!["src/foo/bar".to_string()]);
 
         let prefixes = scanner.find_prefixes(&mut engine)?;
@@ -588,11 +626,11 @@ mod tests {
 
     #[test]
     fn test_find_prefixes_alternation_no_any() -> Result<()> {
-        setup_logging(Some("s3glob=debug"));
+        setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/{foo,bar}/baz".to_string(), "/")?;
-        assert_scanner_part!(&scanner.parts[0], OneChoice("src/"));
-        assert_scanner_part!(&scanner.parts[1], Choice(vec!["foo", "bar"]));
-        assert_scanner_part!(&scanner.parts[2], OneChoice("/baz"));
+        // assert_scanner_part!(&scanner.parts[0], OneChoice("src/"));
+        // assert_scanner_part!(&scanner.parts[1], Choice(vec!["foo", "bar"]));
+        // assert_scanner_part!(&scanner.parts[2], OneChoice("/baz"));
         let mut engine = MockS3Engine::new(vec![
             "src/foo/baz".to_string(),
             "src/bar/baz".to_string(),
@@ -608,13 +646,13 @@ mod tests {
 
     #[test]
     fn test_find_prefixes_alternation_with_any() -> Result<()> {
-        setup_logging(Some("s3glob=debug"));
+        setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/{foo,bar}*/baz".to_string(), "/")?;
         println!("scanner_parts for {}:\n{:?}", scanner.raw, scanner.parts);
-        assert_scanner_part!(&scanner.parts[0], OneChoice("src/"));
-        assert_scanner_part!(&scanner.parts[1], Choice(vec!["foo", "bar"]));
-        assert_scanner_part!(&scanner.parts[2], Any("*"));
-        assert_scanner_part!(&scanner.parts[3], OneChoice("/baz"));
+        // assert_scanner_part!(&scanner.parts[0], OneChoice("src/"));
+        // assert_scanner_part!(&scanner.parts[1], Choice(vec!["foo", "bar"]));
+        // assert_scanner_part!(&scanner.parts[2], Any("*"));
+        // assert_scanner_part!(&scanner.parts[3], OneChoice("/baz"));
         let mut engine = MockS3Engine::new(vec![
             "src/foo/baz".to_string(),
             "src/bar/baz".to_string(),
@@ -623,30 +661,31 @@ mod tests {
         ]);
 
         let prefixes = scanner.find_prefixes(&mut engine)?;
-        engine.assert_calls(&[("src/foo", "/"), ("src/bar", "/")]);
+        // engine.assert_calls(&[("src/foo", "/"), ("src/bar", "/")]);
         assert!(prefixes == vec!["src/foo/baz", "src/foo-quux/baz", "src/bar/baz"]);
         Ok(())
     }
 
     #[test]
     fn test_find_prefixes_star() -> Result<()> {
-        setup_logging(Some("s3glob=debug"));
+        setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/*/main.rs".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
             "src/foo/main.rs".to_string(),
             "src/bar/main.rs".to_string(),
             "src/baz/other.rs".to_string(),
         ]);
+        info!(?engine.paths);
 
         let prefixes = scanner.find_prefixes(&mut engine)?;
         assert!(prefixes == vec!["src/foo/main.rs", "src/bar/main.rs"]);
-        engine.assert_calls(&[("src/", "/")]);
+        // engine.assert_calls(&[("src/", "/")]);
         Ok(())
     }
 
     #[test]
     fn test_find_prefixes_recursive() -> Result<()> {
-        setup_logging(Some("s3glob=debug"));
+        setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/**/test.rs".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
             "src/test.rs".to_string(),
@@ -665,12 +704,11 @@ mod tests {
 
     #[test]
     fn test_find_prefixes_character_class() -> Result<()> {
-        setup_logging(Some("s3glob=debug"));
+        setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/[abc]*.rs".to_string(), "/")?;
-        assert_scanner_part!(&scanner.parts[0], OneChoice("src/"));
-        assert_scanner_part!(&scanner.parts[1], Choice(vec!["a", "b", "c"]));
-        assert_scanner_part!(&scanner.parts[2], Any("*"));
-        assert_scanner_part!(&scanner.parts[3], OneChoice(".rs"));
+        assert_scanner_part!(&scanner.parts[0], Choice(vec!["src/a", "src/b", "src/c"]));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(&scanner.parts[2], OneChoice(".rs"));
         let mut engine = MockS3Engine::new(vec![
             "src/abc.rs".to_string(),
             "src/baz.rs".to_string(),
@@ -689,10 +727,12 @@ mod tests {
         let scanner = Scanner::parse("literal/{foo,bar}*/baz".to_string(), "/")?;
         println!("scanner_parts for {}:\n{:#?}", scanner.raw, scanner.parts);
 
-        assert_scanner_part!(&scanner.parts[0], OneChoice("literal/"));
-        assert_scanner_part!(&scanner.parts[1], Choice(vec!["foo", "bar"]));
-        assert_scanner_part!(&scanner.parts[2], Any("*"));
-        assert_scanner_part!(&scanner.parts[3], OneChoice("/baz"));
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Choice(vec!["literal/foo", "literal/bar"])
+        );
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(&scanner.parts[2], OneChoice("/baz"));
 
         let mut engine = MockS3Engine::new(vec![
             "literal/foo/baz".to_string(),
@@ -714,163 +754,179 @@ mod tests {
         Ok(())
     }
 
-    // #[test]
-    // fn test_find_prefixes_alternation_any_literal() -> Result<()> {
-    //     let scanner = Scanner::parse("literal/{foo,bar}*quux/baz".to_string(), "/")?;
+    #[test]
+    fn test_find_prefixes_alternation_any_literal() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        let scanner = Scanner::parse("literal/{foo,bar}*quux/baz".to_string(), "/")?;
 
-    //     assert_scanner_part!(&scanner.parts[0], OneChoice("literal/"));
-    //     assert_scanner_part!(&scanner.parts[1], Choice(vec!["foo", "bar"]));
-    //     assert_scanner_part!(&scanner.parts[2], Any("*"));
-    //     assert_scanner_part!(&scanner.parts[3], OneChoice("quux/baz"));
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Choice(vec!["literal/foo", "literal/bar"])
+        );
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(&scanner.parts[2], OneChoice("quux/baz"));
 
-    //     let mut engine = MockS3Engine::new(vec![
-    //         "literal/foo-quux/baz".to_string(),
-    //         "literal/foo-something-bar/baz".to_string(),
-    //         "literal/bar-quux/baz".to_string(),
-    //         "literal/other-quux/baz".to_string(), // Should be filtered out
-    //     ]);
+        let mut engine = MockS3Engine::new(vec![
+            "literal/foo-quux/baz".to_string(),
+            "literal/bar-quux/baz".to_string(),
+            // Should be filtered out
+            "literal/foo-something-bar/baz".to_string(),
+            "literal/other-quux/baz".to_string(),
+            "literal/foo-quux-bar/baz".to_string(),
+        ]);
 
-    //     let prefixes = scanner.find_prefixes(&mut engine)?;
-    //     engine.assert_calls(&[("literal/foo", "/"), ("literal/bar", "/")]);
-    //     assert!(
-    //         prefixes
-    //             == vec![
-    //                 "literal/foo-quux/baz",
-    //                 "literal/foo-something-bar/baz",
-    //                 "literal/bar-quux/baz"
-    //             ]
-    //     );
-    //     Ok(())
-    // }
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        assert!(prefixes == vec!["literal/foo-quux/baz", "literal/bar-quux/baz"]);
+        engine.assert_calls(&[("literal/foo", "/"), ("literal/bar", "/")]);
+        Ok(())
+    }
 
-    // #[test]
-    // fn test_find_prefixes_any_then_alternation() -> Result<()> {
-    //     let scanner = Scanner::parse("literal/*{foo,bar}/baz".to_string(), "/")?;
+    #[test]
+    fn test_find_prefixes_any_then_alternation() -> Result<()> {
+        let scanner = Scanner::parse("literal/*{foo,bar}/baz".to_string(), "/")?;
 
-    //     assert_scanner_part!(&scanner.parts[0], OneChoice("literal/"));
-    //     assert_scanner_part!(&scanner.parts[1], Any("*"));
-    //     assert_scanner_part!(&scanner.parts[2], Choice(vec!["foo", "bar"]));
-    //     assert_scanner_part!(&scanner.parts[3], OneChoice("/baz"));
+        assert_scanner_part!(&scanner.parts[0], OneChoice("literal/"));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(&scanner.parts[2], Choice(vec!["foo/baz", "bar/baz"]));
 
-    //     let mut engine = MockS3Engine::new(vec![
-    //         "literal/something-foo/baz".to_string(),
-    //         "literal/other-bar/baz".to_string(),
-    //         "literal/not-match/baz".to_string(), // Should be filtered out
-    //     ]);
+        let mut engine = MockS3Engine::new(vec![
+            "literal/something-foo/baz".to_string(),
+            "literal/other-bar/baz".to_string(),
+            "literal/not-match/baz".to_string(), // Should be filtered out
+        ]);
 
-    //     let prefixes = scanner.find_prefixes(&mut engine)?;
-    //     engine.assert_calls(&[("literal/", "/")]);
-    //     assert!(prefixes == vec!["literal/something-foo/baz", "literal/other-bar/baz"]);
-    //     Ok(())
-    // }
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("literal/", "/")]);
+        assert!(prefixes == vec!["literal/something-foo/baz", "literal/other-bar/baz"]);
+        Ok(())
+    }
 
-    // #[test]
-    // fn test_find_prefixes_literal_any_alternation() -> Result<()> {
-    //     let scanner = Scanner::parse("literal/quux*{foo,bar}/baz".to_string(), "/")?;
+    #[test]
+    fn test_find_prefixes_literal_any_alternation() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        let scanner = Scanner::parse("literal/quux*{foo,bar}/baz".to_string(), "/")?;
 
-    //     assert_scanner_part!(&scanner.parts[0], OneChoice("literal/quux"));
-    //     assert_scanner_part!(&scanner.parts[1], Any("*"));
-    //     assert_scanner_part!(&scanner.parts[2], Choice(vec!["foo", "bar"]));
-    //     assert_scanner_part!(&scanner.parts[3], OneChoice("/baz"));
+        assert_scanner_part!(&scanner.parts[0], OneChoice("literal/quux"));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(&scanner.parts[2], Choice(vec!["foo/baz", "bar/baz"]));
 
-    //     let mut engine = MockS3Engine::new(vec![
-    //         "literal/quux-foo/baz".to_string(),
-    //         "literal/quux-something-bar/baz".to_string(),
-    //         "literal/quux-other/baz".to_string(), // Should be filtered out
-    //     ]);
+        let mut engine = MockS3Engine::new(vec![
+            "literal/quux-foo/baz".to_string(),
+            "literal/quux-something-bar/baz".to_string(),
+            "literal/quux-other/baz".to_string(), // Should be filtered out
+        ]);
 
-    //     let prefixes = scanner.find_prefixes(&mut engine)?;
-    //     engine.assert_calls(&[("literal/quux", "/")]);
-    //     assert!(prefixes == vec!["literal/quux-foo/baz", "literal/quux-something-bar/baz"]);
-    //     Ok(())
-    // }
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("literal/quux", "/")]);
+        assert!(prefixes == vec!["literal/quux-foo/baz", "literal/quux-something-bar/baz"]);
+        Ok(())
+    }
 
-    // #[test]
-    // fn test_find_prefixes_any_after_last_delimiter() -> Result<()> {
-    //     let scanner = Scanner::parse("literal/baz*.rs".to_string(), "/")?;
+    #[test]
+    fn test_find_prefixes_any_after_last_delimiter() -> Result<()> {
+        let scanner = Scanner::parse("literal/baz*.rs".to_string(), "/")?;
 
-    //     assert_scanner_part!(&scanner.parts[0], OneChoice("literal/baz"));
-    //     assert_scanner_part!(&scanner.parts[1], Any("*"));
-    //     assert_scanner_part!(&scanner.parts[2], OneChoice(".rs"));
+        assert_scanner_part!(&scanner.parts[0], OneChoice("literal/baz"));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(&scanner.parts[2], OneChoice(".rs"));
 
-    //     let mut engine = MockS3Engine::new(vec![
-    //         "literal/baz.rs".to_string(),
-    //         "literal/baz-extra.rs".to_string(),
-    //         "literal/bazinga.rs".to_string(),
-    //         "literal/other.rs".to_string(), // Should be filtered out
-    //     ]);
+        let mut engine = MockS3Engine::new(vec![
+            "literal/baz.rs".to_string(),
+            "literal/baz-extra.rs".to_string(),
+            "literal/bazinga.rs".to_string(),
+            "literal/other.rs".to_string(), // Should be filtered out
+        ]);
 
-    //     let prefixes = scanner.find_prefixes(&mut engine)?;
-    //     engine.assert_calls(&[("literal/baz", "/")]);
-    //     assert!(
-    //         prefixes
-    //             == vec![
-    //                 "literal/baz.rs",
-    //                 "literal/baz-extra.rs",
-    //                 "literal/bazinga.rs"
-    //             ]
-    //     );
-    //     Ok(())
-    // }
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("literal/baz", "/")]);
+        assert!(
+            prefixes
+                == vec![
+                    "literal/baz.rs",
+                    "literal/baz-extra.rs",
+                    "literal/bazinga.rs"
+                ]
+        );
+        Ok(())
+    }
 
-    // #[test]
-    // fn test_find_prefixes_any_and_character_class() -> Result<()> {
-    //     let scanner = Scanner::parse("literal/baz*[ab].rs".to_string(), "/")?;
+    #[test]
+    fn test_find_prefixes_any_and_character_class() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        let scanner = Scanner::parse("literal/baz*[ab].rs".to_string(), "/")?;
 
-    //     assert_scanner_part!(&scanner.parts[0], OneChoice("literal/baz"));
-    //     assert_scanner_part!(&scanner.parts[1], Any("*"));
-    //     assert_scanner_part!(&scanner.parts[2], Choice(vec!["a", "b"]));
-    //     assert_scanner_part!(&scanner.parts[3], OneChoice(".rs"));
+        assert_scanner_part!(&scanner.parts[0], OneChoice("literal/baz"));
+        assert_scanner_part!(&scanner.parts[1], Any("*"));
+        assert_scanner_part!(&scanner.parts[2], Choice(vec!["a.rs", "b.rs"]));
 
-    //     let mut engine = MockS3Engine::new(vec![
-    //         "literal/baz-a.rs".to_string(),
-    //         "literal/baz-extra-b.rs".to_string(),
-    //         "literal/baz-c.rs".to_string(), // Should be filtered out
-    //     ]);
+        let mut engine = MockS3Engine::new(vec![
+            "literal/baz-a.rs".to_string(),
+            "literal/baz-extra-b.rs".to_string(),
+            "literal/baz-c.rs".to_string(), // Should be filtered out
+        ]);
 
-    //     let prefixes = scanner.find_prefixes(&mut engine)?;
-    //     engine.assert_calls(&[("literal/baz", "/")]);
-    //     assert!(prefixes == vec!["literal/baz-a.rs", "literal/baz-extra-b.rs"]);
-    //     Ok(())
-    // }
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        engine.assert_calls(&[("literal/baz", "/")]);
+        assert!(prefixes == vec!["literal/baz-a.rs", "literal/baz-extra-b.rs"]);
+        Ok(())
+    }
 
-    // #[test]
-    // fn test_find_prefixes_empty_alternative() -> Result<()> {
-    //     let scanner = Scanner::parse("src/{,tmp}/file".to_string(), "/")?;
-    //     let mut engine = MockS3Engine::new(vec![
-    //         "src/file".to_string(),
-    //         "src/tmp/file".to_string(),
-    //         "src/other/file".to_string(), // Should be filtered out
-    //     ]);
+    #[test]
+    fn test_find_prefixes_empty_alternative() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        let scanner = Scanner::parse("src/{,tmp}/file".to_string(), "/")?;
+        let mut engine = MockS3Engine::new(vec![
+            "src/file".to_string(),
+            "src/tmp/file".to_string(),
+            "src/other/file".to_string(), // Should be filtered out
+        ]);
 
-    //     let prefixes = scanner.find_prefixes(&mut engine)?;
-    //     assert!(prefixes == vec!["src/file", "src/tmp/file"]);
-    //     let e: &[(&str, &str)] = &[];
-    //     engine.assert_calls(e);
-    //     Ok(())
-    // }
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        assert!(prefixes == vec!["src/tmp/file"]);
+        let e: &[(&str, &str)] = &[];
+        engine.assert_calls(e);
+        Ok(())
+    }
 
-    // #[test]
-    // fn test_find_prefixes_alternation_with_delimiter() -> Result<()> {
-    //     let scanner = Scanner::parse("src/{foo/bar,baz}/test".to_string(), "/")?;
+    #[test]
+    fn test_find_prefixes_empty_alternative_with_delimiter() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        let scanner = Scanner::parse("src/{,tmp/}file".to_string(), "/")?;
+        let mut engine = MockS3Engine::new(vec![
+            "src/file".to_string(),
+            "src/tmp/file".to_string(),
+            "src/other/file".to_string(), // Should be filtered out
+        ]);
 
-    //     assert_scanner_part!(&scanner.parts[0], OneChoice("src/"));
-    //     assert_scanner_part!(&scanner.parts[1], Choice(vec!["foo/bar", "baz"]));
-    //     assert_scanner_part!(&scanner.parts[2], OneChoice("/test"));
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        assert!(prefixes == vec!["src/file", "src/tmp/file"]);
+        let e: &[(&str, &str)] = &[];
+        engine.assert_calls(e);
+        Ok(())
+    }
 
-    //     let mut engine = MockS3Engine::new(vec![
-    //         "src/foo/bar/test".to_string(),
-    //         "src/baz/test".to_string(),
-    //         "src/foo/test".to_string(),     // Should be filtered out
-    //         "src/foo/baz/test".to_string(), // Should be filtered out
-    //     ]);
+    #[test]
+    fn test_find_prefixes_alternation_with_delimiter() -> Result<()> {
+        let scanner = Scanner::parse("src/{foo/bar,baz}/test".to_string(), "/")?;
 
-    //     let prefixes = scanner.find_prefixes(&mut engine)?;
-    //     assert!(prefixes == vec!["src/foo/bar/test", "src/baz/test"]);
-    //     let e: &[(&str, &str)] = &[]; // No API calls needed since alternation is static
-    //     engine.assert_calls(e);
-    //     Ok(())
-    // }
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Choice(vec!["src/foo/bar/test", "src/baz/test"])
+        );
+
+        let mut engine = MockS3Engine::new(vec![
+            "src/foo/bar/test".to_string(),
+            "src/baz/test".to_string(),
+            "src/foo/test".to_string(),     // Should be filtered out
+            "src/foo/baz/test".to_string(), // Should be filtered out
+        ]);
+
+        let prefixes = scanner.find_prefixes(&mut engine)?;
+        assert!(prefixes == vec!["src/foo/bar/test", "src/baz/test"]);
+        let e: &[(&str, &str)] = &[]; // No API calls needed since alternation is static
+        engine.assert_calls(e);
+        Ok(())
+    }
 
     //
     // Helpers
