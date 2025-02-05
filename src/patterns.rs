@@ -17,25 +17,27 @@ use tracing::{debug, trace};
 #[derive(Debug)]
 enum Glob {
     /// A single `*` or `?`, or a negated character class
-    Any {
-        raw: String,
-        alternatives: Option<Vec<String>>,
-    },
+    Any { raw: String, not: Option<Vec<char>> },
     /// A literal string or group of alternatives, like `foo` or `{foo,bar}` or `[abc]`
-    Choice {
-        raw_len: usize,
-        allowed: Vec<String>,
-    },
+    Choice { raw: String, allowed: Vec<String> },
     /// A recursive glob, always `**`
     Recursive,
 }
 
 impl Glob {
+    fn pattern(&self) -> &str {
+        match self {
+            Glob::Any { raw, .. } => raw,
+            Glob::Recursive { .. } => "**",
+            Glob::Choice { raw, .. } => raw,
+        }
+    }
+
     fn pattern_len(&self) -> usize {
         match self {
             Glob::Any { raw, .. } => raw.len(),
             Glob::Recursive { .. } => 2,
-            Glob::Choice { raw_len, .. } => *raw_len,
+            Glob::Choice { raw, .. } => raw.len(),
         }
     }
 
@@ -45,15 +47,24 @@ impl Glob {
         matches!(self, Glob::Choice { .. })
     }
 
+    /// True if this is a `*`, `?`, or `[abc]`
     fn is_any(&self) -> bool {
         matches!(self, Glob::Any { .. })
     }
 
+    /// True if this is a negated character class `[!abc]`
+    fn is_negated(&self) -> bool {
+        matches!(self, Glob::Any { not: Some(_), .. })
+    }
+
     fn re_string(&self, delimiter: &str) -> String {
         match self {
-            Glob::Any { raw, alternatives } => match (&**raw, alternatives) {
+            Glob::Any {
+                raw,
+                not: alternatives,
+            } => match (&**raw, alternatives) {
                 (_, Some(alts)) => {
-                    let chars = alts.join("");
+                    let chars = alts.iter().collect::<String>();
                     format!("[^{}]", chars)
                 }
                 ("?", _) => ".".to_string(),
@@ -117,7 +128,7 @@ impl Scanner {
                     let next_part = remaining[..idx].to_string();
                     if !next_part.is_empty() {
                         parts.push(Glob::Choice {
-                            raw_len: next_part.len(),
+                            raw: next_part.clone(),
                             allowed: vec![next_part.clone()],
                         });
                     }
@@ -127,7 +138,7 @@ impl Scanner {
                 }
                 None => {
                     parts.push(Glob::Choice {
-                        raw_len: remaining.len(),
+                        raw: remaining.to_string(),
                         allowed: vec![remaining.to_string()],
                     });
                     break;
@@ -185,8 +196,10 @@ impl Scanner {
         debug!("finding prefixes for {}", self.raw);
         let mut prefixes = vec!["".to_string()];
         let delimiter = self.delimiter.to_string();
-        let mut regex_so_far = Regex::new("^").unwrap();
+        let mut regex_so_far = "^".to_string();
+        let mut last_part = None;
         for part in &self.parts {
+            debug!(new_part = %part.pattern(), %regex_so_far, "scanning for part");
             match part {
                 Glob::Recursive { .. } => {
                     debug!("found recursive glob, stopping prefix generation");
@@ -197,13 +210,23 @@ impl Scanner {
                 // engine to scan for prefixes, everything else is either a
                 // literal append or a regex filter
                 Glob::Any { .. } => {
-                    let mut new_prefixes = Vec::new();
-                    for prefix in &prefixes {
-                        let np = engine.scan_prefixes(prefix, &delimiter)?;
-                        trace!(prefix, found = ?np, "scanned prefixes for Any");
-                        new_prefixes.extend(np);
+                    if matches!(last_part, Some(&Glob::Any { .. })) {
+                        // if the previous part was an Any then we need to filter instead of extend
+                        let matcher = Regex::new(&format!(
+                            "{regex_so_far}{}",
+                            part.re_string(&self.delimiter.to_string())
+                        ))
+                        .unwrap();
+                        prefixes.retain(|p| matcher.is_match(p));
+                    } else {
+                        let mut new_prefixes = Vec::new();
+                        for prefix in &prefixes {
+                            let np = engine.scan_prefixes(prefix, &delimiter)?;
+                            trace!(prefix, found = ?np, "scanned prefixes for Any");
+                            new_prefixes.extend(np);
+                        }
+                        prefixes = new_prefixes;
                     }
-                    prefixes = new_prefixes;
                 }
                 Glob::Choice { allowed, .. } => {
                     // In an alternation we need to check for two cases:
@@ -234,7 +257,7 @@ impl Scanner {
                         }
                         prefixes = engine.check_prefixes(&new_prefixes)?;
                     } else {
-                        let mut new_prefixes = Vec::with_capacity(prefixes.len());
+                        // Build up the filters and appends
                         let mut filters = BTreeSet::new();
                         let mut appends = BTreeSet::new();
                         for choice in allowed {
@@ -261,22 +284,37 @@ impl Scanner {
                         }
                         let filters = filters.iter().join("|");
                         let matcher = if !filters.is_empty() {
-                            &Regex::new(&format!("{}({})", regex_so_far.as_str(), filters)).unwrap()
+                            Regex::new(&format!("{}({})", regex_so_far.as_str(), filters)).unwrap()
                         } else {
-                            &regex_so_far
+                            Regex::new(&regex_so_far).unwrap()
                         };
-                        trace!(filters, ?appends, regex = ?matcher, ?prefixes, "filtering and appending to prefixes");
-                        for prefix in prefixes {
-                            if matcher.is_match(&prefix) {
-                                if !appends.is_empty() {
-                                    for alt in &appends {
-                                        new_prefixes.push(format!("{prefix}{alt}"));
-                                    }
-                                } else {
-                                    new_prefixes.push(prefix);
+                        trace!(filters, ?appends, regex = ?matcher.as_str(), ?prefixes, "filtering and appending to prefixes");
+
+                        let new_prefixes = if filters.is_empty() {
+                            let mut new_prefixes =
+                                Vec::with_capacity(prefixes.len() * appends.len());
+                            for prefix in prefixes {
+                                for alt in &appends {
+                                    new_prefixes.push(format!("{prefix}{alt}"));
                                 }
                             }
-                        }
+                            new_prefixes
+                        } else {
+                            let mut new_prefixes = Vec::with_capacity(prefixes.len());
+                            for prefix in prefixes {
+                                if matcher.is_match(&prefix) {
+                                    if !appends.is_empty() {
+                                        for alt in &appends {
+                                            new_prefixes.push(format!("{prefix}{alt}"));
+                                        }
+                                    } else {
+                                        new_prefixes.push(prefix);
+                                    }
+                                }
+                            }
+                            trace!(prefixes = ?new_prefixes, "filtered and appended prefixes");
+                            new_prefixes
+                        };
 
                         if !appends.is_empty() {
                             prefixes = engine.check_prefixes(&new_prefixes)?;
@@ -288,12 +326,12 @@ impl Scanner {
             }
 
             // clean up state-tracking
-            regex_so_far = Regex::new(&format!(
+            regex_so_far = format!(
                 "{}{}",
                 regex_so_far.as_str(),
                 part.re_string(&self.delimiter.to_string())
-            ))
-            .unwrap();
+            );
+            last_part = Some(part);
         }
         Ok(prefixes)
     }
@@ -302,12 +340,12 @@ impl Scanner {
 /// Convert a single pattern into something useful for searching
 fn parse_pattern(raw: &str) -> Result<Glob> {
     let mut iter = raw.chars().peekable();
-    let mut raw_len = 1;
+    let mut raw = String::new();
     Ok(match iter.next().expect("next char must exist") {
         // any patterns
         '?' => Glob::Any {
             raw: "?".to_string(),
-            alternatives: None,
+            not: None,
         },
         '*' => {
             if matches!(iter.peek(), Some('*')) {
@@ -315,17 +353,18 @@ fn parse_pattern(raw: &str) -> Result<Glob> {
             } else {
                 Glob::Any {
                     raw: "*".to_string(),
-                    alternatives: None,
+                    not: None,
                 }
             }
         }
         // alternations
         '{' => {
+            raw.push('{');
             let mut alternatives = Vec::new();
             let mut alt = String::new();
             let mut ended = false;
             for chr in iter.by_ref() {
-                raw_len += 1;
+                raw.push(chr);
                 match chr {
                     ',' => {
                         alternatives.push(alt.clone());
@@ -343,28 +382,29 @@ fn parse_pattern(raw: &str) -> Result<Glob> {
                 bail!("Alternation has no closing brace (missing '}}'): {}", raw);
             }
             Glob::Choice {
-                raw_len,
+                raw,
                 allowed: alternatives,
             }
         }
         '[' => {
-            let mut alternatives = Vec::new();
+            raw.push('[');
+            let mut alts: Vec<char> = Vec::new();
             let mut ended = false;
             let mut is_negated = false;
             for chr in iter {
-                raw_len += 1;
+                raw.push(chr);
                 match chr {
-                    ']' if raw_len == 2 || (is_negated && raw_len == 3) => {
-                        alternatives.push(chr.to_string());
+                    ']' if raw.len() == 2 || (is_negated && raw.len() == 3) => {
+                        alts.push(chr);
                     }
-                    '!' if raw_len == 2 => {
+                    '!' if raw.len() == 2 => {
                         is_negated = true;
                     }
                     ']' => {
                         ended = true;
                         break;
                     }
-                    c => alternatives.push(c.to_string()),
+                    c => alts.push(c),
                 }
             }
             if !ended {
@@ -372,13 +412,13 @@ fn parse_pattern(raw: &str) -> Result<Glob> {
             }
             if is_negated {
                 Glob::Any {
-                    raw: raw[..raw_len].to_string(),
-                    alternatives: Some(alternatives),
+                    raw,
+                    not: Some(alts),
                 }
             } else {
                 Glob::Choice {
-                    raw_len,
-                    allowed: alternatives,
+                    raw,
+                    allowed: alts.iter().map(|c| c.to_string()).collect(),
                 }
             }
         }
@@ -612,7 +652,6 @@ mod tests {
                 // Use ListObjectsV2 with max-keys=1 to efficiently check existence
                 let response = self.scan_prefixes_inner(prefix, "/")?;
 
-                // If there are any objects (or common prefixes), this prefix is valid
                 if !response.is_empty() {
                     valid_prefixes.push(prefix.clone());
                 }
@@ -626,7 +665,6 @@ mod tests {
     fn test_find_prefixes_literal() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/foo/bar".to_string(), "/")?;
-        // assert_scanner_part!(&scanner.parts[0], OneChoice("src/foo/bar"));
         let mut engine = MockS3Engine::new(vec!["src/foo/bar".to_string()]);
 
         let prefixes = scanner.find_prefixes(&mut engine)?;
@@ -640,9 +678,6 @@ mod tests {
     fn test_find_prefixes_alternation_no_any() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/{foo,bar}/baz".to_string(), "/")?;
-        // assert_scanner_part!(&scanner.parts[0], OneChoice("src/"));
-        // assert_scanner_part!(&scanner.parts[1], Choice(vec!["foo", "bar"]));
-        // assert_scanner_part!(&scanner.parts[2], OneChoice("/baz"));
         let mut engine = MockS3Engine::new(vec![
             "src/foo/baz".to_string(),
             "src/bar/baz".to_string(),
@@ -687,7 +722,7 @@ mod tests {
 
         let prefixes = scanner.find_prefixes(&mut engine)?;
         assert!(prefixes == vec!["src/bar/main.rs", "src/foo/main.rs"]);
-        // engine.assert_calls(&[("src/", "/")]);
+        engine.assert_calls(&[("src/", "/")]);
         Ok(())
     }
 
@@ -992,13 +1027,14 @@ mod tests {
     #[test]
     fn test_find_prefixes_multiple_negative_classes() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
-        let scanner = Scanner::parse("[!a]*[!b]*/foo".to_string(), "/")?;
+        let scanner = Scanner::parse("[!a]*[!b]/foo".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
             "c-x/foo".to_string(),
             "d-y/foo".to_string(),
-            "a-x/foo".to_string(), // Should be filtered out (first char is a)
-            "c-b/foo".to_string(), // Should be filtered out (second part starts with b)
-            "a-b/foo".to_string(), // Should be filtered out (both conditions fail)
+            // filtered out
+            "a-b/foo".to_string(), // (both conditions fail)
+            "a-x/foo".to_string(), // (first char is a)
+            "c-b/foo".to_string(), // (second part starts with b)
         ]);
 
         let prefixes = scanner.find_prefixes(&mut engine)?;
@@ -1036,9 +1072,10 @@ mod tests {
         let mut engine = MockS3Engine::new(vec![
             "x-foo-a/baz".to_string(),
             "y-bar-b/baz".to_string(),
-            "x-foo-Z/baz".to_string(), // Should be filtered out (ends with Z)
-            "y-bar-Z/baz".to_string(), // Should be filtered out (ends with Z)
-            "x-baz-a/baz".to_string(), // Should be filtered out (middle not foo/bar)
+            // filtered out
+            "x-foo-Z/baz".to_string(), // (ends with Z)
+            "y-bar-Z/baz".to_string(), // (ends with Z)
+            "x-baz-a/baz".to_string(), // (middle not foo/bar)
         ]);
 
         let prefixes = scanner.find_prefixes(&mut engine)?;
