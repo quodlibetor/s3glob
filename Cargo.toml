@@ -21,6 +21,7 @@ eula = false
 
 [dependencies]
 anyhow = "1.0"
+async-trait = "0.1.86"
 aws-config = "1.0"
 aws-sdk-s3 = "1.0"
 clap = { version = "4.0", features = ["derive"] }

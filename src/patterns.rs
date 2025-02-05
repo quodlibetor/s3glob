@@ -103,16 +103,17 @@ impl Glob {
     }
 }
 
+#[async_trait::async_trait]
+pub trait Engine {
+    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>>;
+    async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>>;
+}
+
 #[derive(Debug)]
 pub struct Scanner {
     raw: String,
     delimiter: char,
     parts: Vec<Glob>,
-}
-
-trait Engine {
-    fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>>;
-    fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>>;
 }
 
 /// A scanner takes a glob pattern and can efficiently generate a list of S3
@@ -192,7 +193,7 @@ impl Scanner {
     /// 4. Search for all folders in ["foo/bar", "foo/baz"]
     /// 4. Append "qux" -> ["foo/bar/qux", "foo/baz/qux"]
     /// 5. Filter by "*" -> keep prefixes whose last component starts with "qux"
-    fn find_prefixes(&self, engine: &mut impl Engine) -> Result<Vec<String>> {
+    pub async fn find_prefixes(&self, engine: &mut impl Engine) -> Result<Vec<String>> {
         debug!("finding prefixes for {}", self.raw);
         let mut prefixes = vec!["".to_string()];
         let delimiter = self.delimiter.to_string();
@@ -222,7 +223,7 @@ impl Scanner {
                     } else {
                         let mut new_prefixes = Vec::new();
                         for prefix in &prefixes {
-                            let np = engine.scan_prefixes(prefix, &delimiter)?;
+                            let np = engine.scan_prefixes(prefix, &delimiter).await?;
                             trace!(prefix, found = ?np, pattern = ?part.pattern(), "scanned prefixes for Any");
                             new_prefixes.extend(np);
                         }
@@ -256,7 +257,7 @@ impl Scanner {
                                 new_prefixes.push(format!("{prefix}{alt}"));
                             }
                         }
-                        prefixes = engine.check_prefixes(&new_prefixes)?;
+                        prefixes = engine.check_prefixes(&new_prefixes).await?;
                     } else {
                         // Build up the filters and appends
                         let mut filters = BTreeSet::new();
@@ -320,7 +321,7 @@ impl Scanner {
                         };
 
                         if !appends.is_empty() {
-                            prefixes = engine.check_prefixes(&new_prefixes)?;
+                            prefixes = engine.check_prefixes(&new_prefixes).await?;
                         } else {
                             prefixes = new_prefixes;
                         }
@@ -439,6 +440,7 @@ mod tests {
     use crate::{assert_scanner_part, setup_logging};
     use assert2::{assert, check};
     use tracing::info;
+
     //
     // parse tests
     //
@@ -642,13 +644,14 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl Engine for MockS3Engine {
-        fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
+        async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
             self.calls.push((prefix.to_string(), delimiter.to_string()));
             self.scan_prefixes_inner(prefix, delimiter)
         }
 
-        fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>> {
+        async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>> {
             let mut valid_prefixes = Vec::new();
 
             for prefix in prefixes {
@@ -664,21 +667,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_find_prefixes_literal() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_literal() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/foo/bar".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec!["src/foo/bar".to_string()]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["src/foo/bar"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_alternation_no_any() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_alternation_no_any() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/{foo,bar}/baz".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -687,15 +690,15 @@ mod tests {
             "src/qux/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["src/foo/baz", "src/bar/baz"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_alternation_with_any() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_alternation_with_any() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/{foo,bar}*/baz".to_string(), "/")?;
         println!("scanner_parts for {}:\n{:?}", scanner.raw, scanner.parts);
@@ -706,14 +709,14 @@ mod tests {
             "src/qux/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         engine.assert_calls(&[("src/foo", "/"), ("src/bar", "/")]);
         assert!(prefixes == vec!["src/foo-quux/baz", "src/foo/baz", "src/bar/baz",]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_star() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_star() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/*/main.rs".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -723,14 +726,14 @@ mod tests {
         ]);
         info!(?engine.paths);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["src/bar/main.rs", "src/foo/main.rs"]);
         engine.assert_calls(&[("src/", "/")]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_recursive() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_recursive() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/**/test.rs".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -740,7 +743,7 @@ mod tests {
             "src/other.rs".to_string(),
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         // Should stop at src/ since ** matches anything after
         assert!(prefixes == vec!["src/"]);
         let e: &[(&str, &str)] = &[];
@@ -748,8 +751,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_character_class() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_character_class() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/[abc]*.rs".to_string(), "/")?;
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["src/a", "src/b", "src/c"]));
@@ -762,14 +765,14 @@ mod tests {
             "src/dog.rs".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         engine.assert_calls(&[("src/a", "/"), ("src/b", "/"), ("src/c", "/")]);
         assert!(prefixes == vec!["src/abc.rs", "src/baz.rs", "src/cat.rs"]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_alternation_then_any() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_alternation_then_any() -> Result<()> {
         let scanner = Scanner::parse("literal/{foo,bar}*/baz".to_string(), "/")?;
         println!("scanner_parts for {}:\n{:#?}", scanner.raw, scanner.parts);
 
@@ -787,7 +790,7 @@ mod tests {
             "literal/other/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         engine.assert_calls(&[("literal/foo", "/"), ("literal/bar", "/")]);
         assert!(
             prefixes
@@ -800,8 +803,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_alternation_any_literal() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_alternation_any_literal() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("literal/{foo,bar}*quux/baz".to_string(), "/")?;
 
@@ -821,14 +824,14 @@ mod tests {
             "literal/foo-quux-bar/baz".to_string(),
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["literal/foo-quux/baz", "literal/bar-quux/baz"]);
         engine.assert_calls(&[("literal/foo", "/"), ("literal/bar", "/")]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_any_then_alternation() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_any_then_alternation() -> Result<()> {
         let scanner = Scanner::parse("literal/*{foo,bar}/baz".to_string(), "/")?;
 
         assert_scanner_part!(&scanner.parts[0], OneChoice("literal/"));
@@ -841,14 +844,14 @@ mod tests {
             "literal/not-match/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         engine.assert_calls(&[("literal/", "/")]);
         assert!(prefixes == vec!["literal/other-bar/baz", "literal/something-foo/baz"]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_literal_any_alternation() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_literal_any_alternation() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("literal/quux*{foo,bar}/baz".to_string(), "/")?;
 
@@ -862,14 +865,14 @@ mod tests {
             "literal/quux-other/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         engine.assert_calls(&[("literal/quux", "/")]);
         assert!(prefixes == vec!["literal/quux-foo/baz", "literal/quux-something-bar/baz"]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_any_after_last_delimiter() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_any_after_last_delimiter() -> Result<()> {
         let scanner = Scanner::parse("literal/baz*.rs".to_string(), "/")?;
 
         assert_scanner_part!(&scanner.parts[0], OneChoice("literal/baz"));
@@ -883,7 +886,7 @@ mod tests {
             "literal/other.rs".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         engine.assert_calls(&[("literal/baz", "/")]);
         assert!(
             prefixes
@@ -896,8 +899,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_any_and_character_class() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_any_and_character_class() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("literal/baz*[ab].rs".to_string(), "/")?;
 
@@ -911,14 +914,14 @@ mod tests {
             "literal/baz-c.rs".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         engine.assert_calls(&[("literal/baz", "/")]);
         assert!(prefixes == vec!["literal/baz-a.rs", "literal/baz-extra-b.rs"]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_empty_alternative() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_empty_alternative() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/{,tmp}/file".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -927,15 +930,15 @@ mod tests {
             "src/other/file".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["src/tmp/file"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_empty_alternative_with_delimiter() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_empty_alternative_with_delimiter() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("src/{,tmp/}file".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -944,15 +947,15 @@ mod tests {
             "src/other/file".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["src/file", "src/tmp/file"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_alternation_with_delimiter() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_alternation_with_delimiter() -> Result<()> {
         let scanner = Scanner::parse("src/{foo/bar,baz}/test".to_string(), "/")?;
 
         assert_scanner_part!(
@@ -967,15 +970,15 @@ mod tests {
             "src/foo/baz/test".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["src/foo/bar/test", "src/baz/test"]);
         let e: &[(&str, &str)] = &[]; // No API calls needed since alternation is static
         engine.assert_calls(e);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_negative_class_start() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_negative_class_start() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("[!a]*/foo".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -985,14 +988,14 @@ mod tests {
             "a/foo".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["b/foo", "c/foo", "xyz/foo"]);
         engine.assert_calls(&[("", "/")]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_negative_class_after_wildcard() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_negative_class_after_wildcard() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("*[!f]oo".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -1002,15 +1005,14 @@ mod tests {
             "something/foo".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["boo", "zoo"]);
         // TODO: this could be improved to only call the engine once
-        // engine.assert_calls(&[("", "/")]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_negative_class_between_alternations() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_negative_class_between_alternations() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("{foo,bar}[!z]*/baz".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -1021,14 +1023,14 @@ mod tests {
             "other/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["foo-abc/baz", "bar-def/baz"]);
         engine.assert_calls(&[("foo", "/"), ("bar", "/")]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_multiple_negative_classes() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_multiple_negative_classes() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("[!a]*[!b]/foo".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -1040,14 +1042,14 @@ mod tests {
             "c-b/foo".to_string(), // (second part starts with b)
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["c-x/foo", "d-y/foo"]);
         engine.assert_calls(&[("", "/")]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_negative_class_with_delimiter() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_negative_class_with_delimiter() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("foo/[!/]/bar".to_string(), "/")?;
         assert_scanner_part!(&scanner.parts[0], OneChoice("foo/"));
@@ -1062,14 +1064,14 @@ mod tests {
             "foo///bar".to_string(),   // Should be filtered out (the excluded char)
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["foo/a/bar", "foo/x/bar"]);
         engine.assert_calls(&[("foo/", "/")]);
         Ok(())
     }
 
-    #[test]
-    fn test_find_prefixes_complex_negative_pattern() -> Result<()> {
+    #[tokio::test]
+    async fn test_find_prefixes_complex_negative_pattern() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
         let scanner = Scanner::parse("*{foo,bar}*[!Z]/baz".to_string(), "/")?;
         let mut engine = MockS3Engine::new(vec![
@@ -1081,10 +1083,9 @@ mod tests {
             "x-baz-a/baz".to_string(), // (middle not foo/bar)
         ]);
 
-        let prefixes = scanner.find_prefixes(&mut engine)?;
+        let prefixes = scanner.find_prefixes(&mut engine).await?;
         assert!(prefixes == vec!["x-foo-a/baz", "y-bar-b/baz"]);
         // TODO: this could be improved to only call the engine once
-        // engine.assert_calls(&[("", "/")]);
         Ok(())
     }
 
