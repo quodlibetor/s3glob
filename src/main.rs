@@ -9,6 +9,7 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
 use clap::{Parser, Subcommand};
+use glob_matcher::{S3Engine, S3GlobMatcher};
 use globset::{Glob, GlobMatcher};
 use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
 use num_format::{Locale, ToFormattedString};
@@ -17,7 +18,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
 use tracing::{debug, error};
 
-mod patterns;
+mod glob_matcher;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -156,6 +157,10 @@ async fn run() -> Result<()> {
         .find(['*', '?', '[', '{'])
         .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
 
+    let mut engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
+    let matcher = S3GlobMatcher::parse(raw_pattern, &opts.delimiter.to_string())?;
+    let mut prefixes = matcher.find_prefixes(&mut engine).await?;
+
     // List directories for the prefix at the first glob character
     //
     // TODO: apply sections of the glob as prefixes until we get to the last one
@@ -168,22 +173,6 @@ async fn run() -> Result<()> {
     //
     // Not doing it right now because s3glob is already finishing in a couple
     // seconds for tens of millions of objects.
-
-    let mut prefixes = Vec::new();
-    let mut paginator = client
-        .list_objects_v2()
-        .bucket(&bucket)
-        .prefix(&prefix)
-        .delimiter(opts.delimiter)
-        .into_paginator()
-        .send();
-
-    while let Some(page) = paginator.next().await {
-        let page = page?;
-        if let Some(common_prefixes) = page.common_prefixes {
-            prefixes.extend(common_prefixes.into_iter().filter_map(|p| p.prefix));
-        }
-    }
 
     // If there are no common prefixes, then the prefix itself is the only
     // matching prefix.
