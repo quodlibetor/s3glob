@@ -1,4 +1,4 @@
-use std::io::Write as _;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -8,7 +8,7 @@ use anyhow::{bail, Context as _, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use glob_matcher::{S3Engine, S3GlobMatcher};
 use globset::{Glob, GlobMatcher};
 use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
@@ -16,7 +16,7 @@ use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 
 mod glob_matcher;
 
@@ -74,6 +74,7 @@ enum Command {
 }
 
 #[derive(Debug, Parser)]
+#[command(version)]
 struct Opts {
     #[clap(subcommand)]
     command: Command,
@@ -98,14 +99,28 @@ struct Opts {
     /// with the remainder of the pattern.
     #[clap(short, long, default_value = "/", global = true)]
     delimiter: char,
+
+    /// How verbose to be, specify multiple times to increase verbosity
+    ///
+    /// - `-v` will show debug logs from s3glob
+    /// - `-vv` will show trace logs from s3glob
+    /// - `-vvv` will show trace logs from s3glob and debug logs from all
+    ///   dependencies
+    ///
+    /// If you want more control you can set the S3GLOB_LOG env var
+    /// using rust-tracing's EnvFilter syntax.
+    #[clap(short, long, global = true, action = ArgAction::Count)]
+    verbose: u8,
 }
 
 fn main() {
-    setup_logging(None);
+    let opts = Opts::parse();
+    setup_logging(log_directive(opts.verbose));
+    debug!(?opts, "parsed options");
 
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
-        if let Err(err) = run().await {
+        if let Err(err) = run(opts).await {
             error!("Failed to run: {}", err);
             let mut err = err.source();
             let mut count = 0;
@@ -124,10 +139,7 @@ fn main() {
     rt.shutdown_timeout(Duration::from_millis(1));
 }
 
-async fn run() -> Result<()> {
-    let opts = Opts::parse();
-    debug!(?opts, "parsed options");
-
+async fn run(opts: Opts) -> Result<()> {
     // parse possible s3 uri using s3 crate api
     let region = Region::new(opts.region);
     let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
@@ -160,6 +172,8 @@ async fn run() -> Result<()> {
     let mut engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
     let matcher = S3GlobMatcher::parse(raw_pattern, &opts.delimiter.to_string())?;
     let mut prefixes = matcher.find_prefixes(&mut engine).await?;
+    debug!(prefixe_count = prefixes.len(), "matcher generated prefixes");
+    trace!(?prefixes, "matcher generated prefixes");
 
     // List directories for the prefix at the first glob character
     //
@@ -177,6 +191,7 @@ async fn run() -> Result<()> {
     // If there are no common prefixes, then the prefix itself is the only
     // matching prefix.
     if prefixes.is_empty() {
+        debug!(?prefix, "no glob_prefixes found, using simple prefix");
         prefixes.push(prefix);
     }
 
@@ -417,21 +432,37 @@ async fn list_matching_objects(
     Ok((matching_objects, seen_objects))
 }
 
-pub(crate) fn setup_logging(extra_filter: Option<&str>) {
-    let env_filter = if let Some(extra_filter) = extra_filter {
-        tracing_subscriber::EnvFilter::from_default_env()
-            .add_directive(extra_filter.parse().unwrap())
+fn log_directive(loglevel: u8) -> Option<&'static str> {
+    match loglevel {
+        0 => None,
+        1 => Some("s3glob=debug"),
+        2 => Some("s3glob=trace"),
+        _ => Some("debug,s3glob=trace"),
+    }
+}
+
+pub(crate) fn setup_logging(directive: Option<&str>) {
+    // get logging directive from S3GLOB_LOG or RUST_LOG, preferring S3GLOB_LOG,
+    // but some folks just expect RUST_LOG to work with rust programs.
+    let mut env_filter = if std::env::var("S3GLOB_LOG").is_ok() {
+        tracing_subscriber::EnvFilter::from_env("S3GLOB_LOG")
     } else {
-        tracing_subscriber::EnvFilter::from_default_env()
+        tracing_subscriber::EnvFilter::from_env("RUST_LOG")
     };
+    if let Some(directive) = directive {
+        env_filter = env_filter.add_directive(directive.parse().unwrap());
+    }
+    let use_ansi = std::io::stderr().is_terminal()
+        || std::env::var("CLICOLOR").map_or(false, |v| ["1", "true"].contains(&v.as_str()))
+        || std::env::var("CLICOLOR_FORCE").map_or(false, |v| ["1", "true"].contains(&v.as_str()));
+
     tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(false) // Don't show target
-        .with_thread_ids(false) // Don't show thread IDs
-        .with_thread_names(false) // Don't show thread names
-        .with_file(true) // Show file and line numbers
+        .with_target(false)
+        .with_file(true)
         .with_line_number(true)
-        .with_ansi(true) // Enable colors
+        .with_ansi(use_ansi)
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
         .init();
 }
 

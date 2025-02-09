@@ -251,6 +251,7 @@ fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
         .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .env("S3GLOB_LOG", "s3glob=trace")
         .args(args);
 
     print_s3glob_output(&mut command);

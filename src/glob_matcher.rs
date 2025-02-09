@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use anyhow::{bail, Context as _, Result};
 use itertools::Itertools as _;
 use regex::Regex;
-use tracing::{debug, trace};
+use tracing::{debug, enabled, trace, Level};
 
 mod engine;
 pub use engine::{Engine, S3Engine};
@@ -104,10 +104,14 @@ impl S3GlobMatcher {
         let mut prefixes = vec!["".to_string()];
         let delimiter = self.delimiter.to_string();
         let mut regex_so_far = "^".to_string();
-        let mut last_part = None;
-        for part in &self.parts {
-            debug!(new_part = %part.pattern(), %regex_so_far, "scanning for part");
-            trace!(?prefixes);
+        let mut prev_part = None;
+        for (i, part) in self.parts.iter().enumerate() {
+            // only included prefixes in trace logs
+            if enabled!(Level::TRACE) {
+                trace!(new_part = %part.pattern(), %regex_so_far, ?prefixes, "scanning for part");
+            } else {
+                debug!(new_part = %part.pattern(), %regex_so_far, "scanning for part");
+            }
             match part {
                 Glob::Recursive { .. } => {
                     debug!("found recursive glob, stopping prefix generation");
@@ -118,22 +122,32 @@ impl S3GlobMatcher {
                 // engine to scan for prefixes, everything else is either a
                 // literal append or a regex filter
                 Glob::Any { .. } => {
-                    if matches!(last_part, Some(&Glob::Any { .. })) {
-                        // if the previous part was an Any then we need to filter instead of extend
+                    // if the previous part was an any then we don't need to scan because it's already done.
+
+                    // Only scan if one of these is true:
+                    // - the previous part is not an Any -- it was already
+                    //   scanned, so we don't need to hit the api again
+                    // - this is the _last_ part and this part is a negated
+                    //   character class -- we can scan and filter to reduce total
+                    //   work for the main object scanner later
+                    if !matches!(prev_part, Some(&Glob::Any { .. }))
+                        || (i == self.parts.len() - 1 && part.is_negated())
+                    {
+                        let mut new_prefixes = Vec::new();
+                        for prefix in &prefixes {
+                            let np = engine.scan_prefixes(prefix, &delimiter).await?;
+                            trace!(prefix, found = ?np, pattern = ?part.pattern(), "extending prefixes for Any");
+                            new_prefixes.extend(np);
+                        }
+                    }
+                    if part.is_negated() {
+                        // if this part is a negated character class then we should filter
                         let matcher = Regex::new(&format!(
                             "{regex_so_far}{}",
                             part.re_string(&self.delimiter.to_string())
                         ))
                         .unwrap();
                         prefixes.retain(|p| matcher.is_match(p));
-                    } else {
-                        let mut new_prefixes = Vec::new();
-                        for prefix in &prefixes {
-                            let np = engine.scan_prefixes(prefix, &delimiter).await?;
-                            trace!(prefix, found = ?np, pattern = ?part.pattern(), "scanned prefixes for Any");
-                            new_prefixes.extend(np);
-                        }
-                        prefixes = new_prefixes;
                     }
                 }
                 Glob::Choice { allowed, .. } => {
@@ -197,7 +211,7 @@ impl S3GlobMatcher {
                         let append_matcher =
                             Regex::new(&format!("{}{}", regex_so_far, part.re_string(&delimiter)))
                                 .unwrap();
-                        trace!(filters, ?appends, regex = ?filter.as_str(), append_regex = ?append_matcher.as_str(), ?prefixes, "filtering and appending to prefixes");
+                        trace!(filters, ?appends, regex = ?filter.as_str(), append_regex = %append_matcher.as_str(), ?prefixes, "filtering and appending to prefixes");
 
                         let new_prefixes = if filters.is_empty() {
                             let mut new_prefixes =
@@ -241,7 +255,7 @@ impl S3GlobMatcher {
                 regex_so_far.as_str(),
                 part.re_string(&self.delimiter.to_string())
             );
-            last_part = Some(part);
+            prev_part = Some(part);
         }
         Ok(prefixes)
     }
