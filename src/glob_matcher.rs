@@ -108,37 +108,38 @@ impl S3GlobMatcher {
         for (i, part) in self.parts.iter().enumerate() {
             // only included prefixes in trace logs
             if enabled!(Level::TRACE) {
-                trace!(new_part = %part.pattern(), %regex_so_far, ?prefixes, "scanning for part");
+                trace!(new_part = %part.display(), %regex_so_far, ?prefixes, "scanning for part");
             } else {
-                debug!(new_part = %part.pattern(), %regex_so_far, "scanning for part");
+                debug!(new_part = %part.display(), %regex_so_far, "scanning for part");
             }
             match part {
                 Glob::Recursive { .. } => {
+                    // we can also skip the last part if it's not a negated character class
                     debug!("found recursive glob, stopping prefix generation");
-                    // exit prefix generation
                     break;
                 }
                 // Any is the only place where we actually need to hit the
                 // engine to scan for prefixes, everything else is either a
                 // literal append or a regex filter
                 Glob::Any { .. } => {
-                    // if the previous part was an any then we don't need to scan because it's already done.
-
-                    // Only scan if one of these is true:
-                    // - the previous part is not an Any -- it was already
-                    //   scanned, so we don't need to hit the api again
-                    // - this is the _last_ part and this part is a negated
-                    //   character class -- we can scan and filter to reduce total
-                    //   work for the main object scanner later
-                    if !matches!(prev_part, Some(&Glob::Any { .. }))
-                        || (i == self.parts.len() - 1 && part.is_negated())
+                    // never scan if the previous part was an any
+                    //
+                    // if we should maybe scan, then only scan if the last part is
+                    // not negated
+                    let scan_might_help = !matches!(prev_part, Some(&Glob::Any { .. }));
+                    let is_last_part = i == self.parts.len() - 1;
+                    #[allow(clippy::nonminimal_bool)] // simplifying this makes it less clear
+                    if (scan_might_help && !is_last_part)
+                        || (scan_might_help && is_last_part && part.is_negated())
                     {
+                        debug!("scanning for Any");
                         let mut new_prefixes = Vec::new();
                         for prefix in &prefixes {
                             let np = engine.scan_prefixes(prefix, &delimiter).await?;
-                            trace!(prefix, found = ?np, pattern = ?part.pattern(), "extending prefixes for Any");
+                            trace!(%prefix, found = ?np, pattern = %part.display(), "extending prefixes for Any");
                             new_prefixes.extend(np);
                         }
+                        prefixes = new_prefixes;
                     }
                     if part.is_negated() {
                         // if this part is a negated character class then we should filter
@@ -147,6 +148,7 @@ impl S3GlobMatcher {
                             part.re_string(&self.delimiter.to_string())
                         ))
                         .unwrap();
+                        debug!(regex = %matcher.as_str(), "filtering for negated Any");
                         prefixes.retain(|p| matcher.is_match(p));
                     }
                 }
@@ -171,10 +173,11 @@ impl S3GlobMatcher {
                     let is_simple_append = prefixes.len() == 1;
 
                     if is_simple_append {
+                        debug!(allowed = %allowed.join(","), "simple append");
                         let mut new_prefixes = Vec::with_capacity(prefixes.len() * allowed.len());
                         for prefix in prefixes {
                             for alt in allowed {
-                                new_prefixes.push(format!("{prefix}{alt}"));
+                                new_prefixes.push(prefix_join(&prefix, alt));
                             }
                         }
                         prefixes = engine.check_prefixes(&new_prefixes).await?;
@@ -214,22 +217,24 @@ impl S3GlobMatcher {
                         trace!(filters, ?appends, regex = ?filter.as_str(), append_regex = %append_matcher.as_str(), ?prefixes, "filtering and appending to prefixes");
 
                         let new_prefixes = if filters.is_empty() {
+                            debug!("no filters, appending");
                             let mut new_prefixes =
                                 Vec::with_capacity(prefixes.len() * appends.len());
                             for prefix in prefixes {
                                 for alt in &appends {
-                                    new_prefixes.push(format!("{prefix}{alt}"));
+                                    new_prefixes.push(prefix_join(&prefix, &alt));
                                 }
                             }
                             new_prefixes
                         } else {
+                            debug!("filtering and appending");
                             let mut new_prefixes = Vec::with_capacity(prefixes.len());
                             for prefix in prefixes {
                                 if filter.is_match(&prefix) {
                                     // we only need to append if it's not already matched
                                     if !appends.is_empty() && !append_matcher.is_match(&prefix) {
                                         for alt in &appends {
-                                            new_prefixes.push(format!("{prefix}{alt}"));
+                                            new_prefixes.push(prefix_join(&prefix, &alt));
                                         }
                                     } else {
                                         new_prefixes.push(prefix);
@@ -241,8 +246,10 @@ impl S3GlobMatcher {
                         };
 
                         if !appends.is_empty() {
+                            trace!(prefixes = ?new_prefixes, "checking appended prefixes");
                             prefixes = engine.check_prefixes(&new_prefixes).await?;
                         } else {
+                            debug!("no appends, using new prefixes");
                             prefixes = new_prefixes;
                         }
                     }
@@ -261,6 +268,17 @@ impl S3GlobMatcher {
     }
 }
 
+fn prefix_join(prefix: &str, alt: &str) -> String {
+    // minio doesn't support double forward slashes in the path
+    // https://github.com/minio/minio/issues/5874
+    // TODO: make this something the user can configure?
+    if prefix.ends_with('/') && alt.starts_with('/') {
+        format!("{prefix}{}", &alt[1..])
+    } else {
+        format!("{prefix}{alt}")
+    }
+}
+
 /// A single part of a glob pattern
 ///
 /// Note that the compiled regexes are designed to match against an _entire_ path segment
@@ -275,11 +293,11 @@ enum Glob {
 }
 
 impl Glob {
-    fn pattern(&self) -> &str {
+    fn display(&self) -> String {
         match self {
-            Glob::Any { raw, .. } => raw,
-            Glob::Recursive { .. } => "**",
-            Glob::Choice { raw, .. } => raw,
+            Glob::Any { raw, .. } => format!("Any({raw})"),
+            Glob::Recursive { .. } => "Recursive(**)".to_string(),
+            Glob::Choice { raw, .. } => format!("Choice({raw})"),
         }
     }
 
@@ -342,7 +360,7 @@ impl Glob {
                 let mut new_allowed = Vec::with_capacity(sa.len() * oa.len());
                 for choice in sa.iter() {
                     for alt in oa {
-                        new_allowed.push(format!("{choice}{alt}"));
+                        new_allowed.push(prefix_join(choice, alt));
                     }
                 }
                 sa.clear();
@@ -451,7 +469,6 @@ mod tests {
     use tracing::info;
 
     use super::*;
-    use crate::glob_matcher::engine::Engine;
     // assert_scanner_part is defined in this module, but macro_export puts them in the root
     use crate::glob_matcher::engine::MockS3Engine;
     use crate::{assert_scanner_part, setup_logging};
@@ -593,29 +610,6 @@ mod tests {
     //
     // find_prefixes tests
     //
-
-    #[async_trait::async_trait]
-    impl Engine for MockS3Engine {
-        async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
-            self.calls.push((prefix.to_string(), delimiter.to_string()));
-            self.scan_prefixes_inner(prefix, delimiter)
-        }
-
-        async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>> {
-            let mut valid_prefixes = Vec::new();
-
-            for prefix in prefixes {
-                // Use ListObjectsV2 with max-keys=1 to efficiently check existence
-                let response = self.scan_prefixes_inner(prefix, "/")?;
-
-                if !response.is_empty() {
-                    valid_prefixes.push(prefix.clone());
-                }
-            }
-
-            Ok(valid_prefixes)
-        }
-    }
 
     #[tokio::test]
     async fn test_find_prefixes_literal() -> Result<()> {
@@ -881,7 +875,10 @@ mod tests {
         ]);
 
         let prefixes = scanner.find_prefixes(&mut engine).await?;
-        assert!(prefixes == vec!["src/tmp/file"]);
+        // TODO: there is a legitimate case that this should only be
+        // src/tmp/file, but we strip double forward slashes to work around
+        // minio
+        assert!(prefixes == vec!["src/file", "src/tmp/file"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
         Ok(())

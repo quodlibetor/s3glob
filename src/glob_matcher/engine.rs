@@ -1,5 +1,6 @@
 use anyhow::Result;
 use aws_sdk_s3::Client;
+use tracing::debug;
 
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -31,6 +32,7 @@ impl S3Engine {
 #[async_trait::async_trait]
 impl Engine for S3Engine {
     async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
+        debug!(prefix, "scanning for prefixes");
         let mut prefixes = Vec::new();
         let mut paginator = self
             .client
@@ -53,6 +55,7 @@ impl Engine for S3Engine {
     // TODO: convert this to take &mut prefixes so that we don't have to
     // reallocate the vector on each call
     async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>> {
+        debug!(?prefixes, "checking prefixes");
         // use listobjectsv2 with a max_results of 1 to check if each prefix exists
         let mut new_prefixes = Vec::new();
         for prefix in prefixes {
@@ -79,6 +82,36 @@ impl Engine for S3Engine {
 pub(super) struct MockS3Engine {
     pub paths: Vec<String>,
     pub calls: Vec<(String, String)>, // (prefix, delimiter) pairs
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl Engine for MockS3Engine {
+    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
+        self.calls.push((prefix.to_string(), delimiter.to_string()));
+        let found = self.scan_prefixes_inner(prefix, delimiter);
+
+        info!(prefix, ?found, "mocks3 found prefixes");
+
+        found
+    }
+
+    async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>> {
+        let mut valid_prefixes = Vec::new();
+
+        for prefix in prefixes {
+            // Use ListObjectsV2 with max-keys=1 to efficiently check existence
+            let response = self.scan_prefixes_inner(prefix, "/")?;
+
+            if !response.is_empty() {
+                valid_prefixes.push(prefix.clone());
+            }
+        }
+
+        info!(requested = ?prefixes, existing = ?valid_prefixes, "mocks3 checked prefixes for existence");
+
+        Ok(valid_prefixes)
+    }
 }
 
 #[cfg(test)]
@@ -136,7 +169,6 @@ impl MockS3Engine {
             .into_iter()
             .collect();
 
-        info!(prefix, found = ?result, "mocks3 found prefixes  ");
         Ok(result)
     }
 }
