@@ -1,12 +1,16 @@
 use assert_cmd::Command;
+use assert_fs::prelude::*;
+use assert_fs::TempDir;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use predicates::prelude::*;
 use predicates::str::contains;
 use rstest::rstest;
+use testcontainers::core::logs::consumer::LogConsumer;
+use testcontainers::core::logs::LogFrame;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerAsync;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
 
 #[rstest]
@@ -36,8 +40,10 @@ use testcontainers_modules::minio::MinIO;
     "prefix/2024-03/nested/file3.txt",
     "prefix/2024-03/file4.txt",
 ])]
+#[trace]
 #[tokio::test]
 async fn test_s3glob_pattern_matching(
+    #[values("ls", "dl")] command: &str,
     #[case] glob: &str,
     #[case] expected: &[&str],
 ) -> anyhow::Result<()> {
@@ -64,16 +70,31 @@ async fn test_s3glob_pattern_matching(
 
     let uri = format!("s3://{}/{}", bucket, glob);
 
-    let mut cmd = run_s3glob(port, &[uri.as_str()])?;
-    let mut res = cmd.assert().success();
-
-    for object in &test_objects {
-        if expected.contains(object) {
-            res = res.stdout(contains(*object));
-        } else {
-            res = res.stdout(contains(*object).not());
+    if command == "ls" {
+        let mut cmd = run_s3glob(port, &[command, uri.as_str()])?;
+        let mut res = cmd.assert().success();
+        for object in &test_objects {
+            if expected.contains(object) {
+                res = res.stdout(contains(*object));
+            } else {
+                res = res.stdout(contains(*object).not());
+            }
         }
-    }
+    } else {
+        let tempdir = TempDir::new()?;
+        let mut cmd = run_s3glob(
+            port,
+            &[command, uri.as_str(), tempdir.path().to_str().unwrap()],
+        )?;
+        let _ = cmd.assert().success();
+        for object in &test_objects {
+            if expected.contains(object) {
+                tempdir.child(object).assert(predicate::path::exists());
+            } else {
+                tempdir.child(object).assert(predicate::path::missing());
+            }
+        }
+    };
 
     Ok(())
 }
@@ -115,7 +136,7 @@ async fn test_format_patterns(
 
     let pattern = format!("s3://{}/*/file.txt", bucket);
 
-    let mut cmd = run_s3glob(port, &["--format", format, pattern.as_str()])?;
+    let mut cmd = run_s3glob(port, &["ls", "--format", format, pattern.as_str()])?;
     cmd.assert().success().stdout(contains(expected));
     Ok(())
 }
@@ -128,6 +149,7 @@ async fn test_format_patterns(
 ])]
 #[tokio::test]
 async fn test_patterns_in_file_not_path_component(
+    #[values("ls", "dl")] command: &str,
     #[case] glob: &str,
     #[case] expected: &[&str],
 ) -> anyhow::Result<()> {
@@ -146,15 +168,29 @@ async fn test_patterns_in_file_not_path_component(
         create_object(&client, bucket, key).await?;
     }
 
-    let uri = format!("s3://{}/{}", bucket, glob);
-    let mut cmd = run_s3glob(port, &[uri.as_str()])?;
-    let mut res = cmd.assert().success();
+    let needle = format!("s3://{}/{}", bucket, glob);
 
-    for object in &test_objects {
-        if expected.contains(object) {
-            res = res.stdout(contains(*object));
-        } else {
-            res = res.stdout(contains(*object).not());
+    if command == "ls" {
+        let mut cmd = run_s3glob(port, &[command, needle.as_str()])?;
+        let mut res = cmd.assert().success();
+        for object in &test_objects {
+            if expected.contains(object) {
+                res = res.stdout(contains(*object));
+            } else {
+                res = res.stdout(contains(*object).not());
+            }
+        }
+    } else {
+        let tempdir = TempDir::new()?;
+        let out_path = tempdir.path().to_str().unwrap();
+        let mut cmd = run_s3glob(port, &[command, needle.as_str(), out_path])?;
+        let _ = cmd.assert().success();
+        for object in &test_objects {
+            if expected.contains(object) {
+                tempdir.child(object).assert(predicate::path::exists());
+            } else {
+                tempdir.child(object).assert(predicate::path::missing());
+            }
         }
     }
 
@@ -166,8 +202,14 @@ async fn test_patterns_in_file_not_path_component(
 //
 
 async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
-    let minio = testcontainers_modules::minio::MinIO::default();
-    let node = minio.start().await.expect("can start minio");
+    let minio =
+        testcontainers_modules::minio::MinIO::default().with_log_consumer(LogPrinter::new());
+    let node = match minio.start().await {
+        Ok(node) => node,
+        Err(e) => {
+            panic!("can't start minio: {}", e);
+        }
+    };
     let port = node.get_host_port_ipv4(9000).await.expect("can get port");
 
     let config = aws_sdk_s3::Config::builder()
@@ -189,7 +231,7 @@ async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
 }
 
 async fn create_object(client: &Client, bucket: &str, key: &str) -> anyhow::Result<()> {
-    create_object_with_size(client, bucket, key, 0).await?;
+    create_object_with_size(client, bucket, key, 1).await?;
     Ok(())
 }
 
@@ -217,7 +259,81 @@ fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
         .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .env("S3GLOB_LOG", "s3glob=trace")
         .args(args);
 
+    print_s3glob_output(&mut command);
     Ok(command)
+}
+
+fn print_s3glob_output(cmd: &mut Command) {
+    let output = cmd.output().unwrap();
+    println!(
+        "s3glob output:\n{}\n{}",
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap()
+    );
+}
+
+use std::borrow::Cow;
+
+use futures::{future::BoxFuture, FutureExt};
+
+/// A consumer that logs the output of container with the [`log`] crate.
+///
+/// By default, both standard out and standard error will both be emitted at INFO level.
+#[derive(Debug)]
+pub struct LogPrinter {
+    prefix: Option<String>,
+}
+
+impl LogPrinter {
+    /// Creates a new instance of the logging consumer.
+    pub fn new() -> Self {
+        Self { prefix: None }
+    }
+
+    /// Sets a prefix to be added to each log message (space will be added between prefix and message).
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = Some(prefix.into());
+        self
+    }
+
+    fn format_message<'a>(&self, message: &'a str) -> Cow<'a, str> {
+        let message = message.trim_end_matches(['\n', '\r']);
+
+        if let Some(prefix) = &self.prefix {
+            Cow::Owned(format!("{} {}", prefix, message))
+        } else {
+            Cow::Borrowed(message)
+        }
+    }
+}
+
+impl Default for LogPrinter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogConsumer for LogPrinter {
+    fn accept<'a>(&'a self, record: &'a LogFrame) -> BoxFuture<'a, ()> {
+        async move {
+            match record {
+                LogFrame::StdOut(bytes) => {
+                    println!(
+                        "minio> {}",
+                        self.format_message(&String::from_utf8_lossy(bytes))
+                    );
+                }
+                LogFrame::StdErr(bytes) => {
+                    eprintln!(
+                        "minio> {}",
+                        self.format_message(&String::from_utf8_lossy(bytes))
+                    );
+                }
+            }
+        }
+        .boxed()
+    }
 }

@@ -39,8 +39,11 @@ jobs:
         with:
           toolchain: stable
 
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
       - name: Compile tests
-        run: cargo test --verbose --no-run
+        run: cargo nextest run --verbose --no-run
 
       - name: Run tests
-        run: cargo test -- --color=always
+        run: cargo nextest run --no-fail-fast

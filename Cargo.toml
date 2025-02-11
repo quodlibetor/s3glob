@@ -21,20 +21,26 @@ eula = false
 
 [dependencies]
 anyhow = "1.0"
+async-trait = "0.1.86"
 aws-config = "1.0"
 aws-sdk-s3 = "1.0"
 clap = { version = "4.0", features = ["derive"] }
 futures = "0.3"
 globset = "0.4"
 humansize = { version = "2.0.0", features = ["no_alloc"] }
+itertools = "0.14.0"
 num-format = "0.4"
 regex = "1.10"
 tokio = { version = "1.0", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+assert_fs = { version = "1.1.2", features = ["color"] }
 assert_cmd = "2.0"
 predicates = "3.1"
-rstest = "0.23"
+assert2 = "0.3"
+rstest = "0.24"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["minio"] }
 

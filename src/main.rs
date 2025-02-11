@@ -1,38 +1,85 @@
+use std::io::{IsTerminal as _, Write as _};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
-use clap::Parser;
-use globset::{Glob, GlobMatcher};
+use clap::{ArgAction, Parser, Subcommand};
+use glob_matcher::{S3Engine, S3GlobMatcher};
 use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
+use tracing::{debug, error, trace};
+
+mod glob_matcher;
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// List objects matching the pattern
+    #[clap(name = "ls")]
+    List {
+        /// Glob pattern to match objects against
+        ///
+        /// The pattern can either be an s3 uri or a <bucket>/<glob> without the
+        /// s3://
+        ///
+        /// Example:
+        ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
+        ///     my-bucket/my_prefix/2024-12-*/something_else/*
+        pattern: String,
+
+        /// Format string for output
+        ///
+        /// This is a string that will be formatted for each object.
+        ///
+        /// The format string can use the following variables:
+        /// - `{key}`: the key of the object
+        /// - `{uri}`: the s3 uri of the object, e.g. s3://my-bucket/my-object.txt
+        /// - `{size_bytes}`: the size of the object in bytes, with no suffix
+        /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
+        /// - `{last_modified}`: the last modified date of the object, RFC3339 format
+        ///
+        /// For example, the default format looks like this, but with some padding:
+        ///     {last_modified} {size_human} {key}
+        #[clap(short, long)]
+        format: Option<String>,
+    },
+
+    /// Download objects matching the pattern
+    #[clap(name = "dl")]
+    Download {
+        /// Glob pattern to match objects against
+        ///
+        /// The pattern can either be an s3 uri or a <bucket>/<glob> without the
+        /// s3://
+        ///
+        /// Example:
+        ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
+        ///     my-bucket/my_prefix/2024-12-*/something_else/*
+        pattern: String,
+
+        /// The destination directory to download the objects to
+        ///
+        /// The full key name will be reproduced in the directory, so multiple
+        /// folders may be created.
+        dest: String,
+    },
+}
 
 #[derive(Debug, Parser)]
+#[command(version)]
 struct Opts {
-    #[clap(short, long, default_value = "us-west-2")]
-    region: String,
+    #[clap(subcommand)]
+    command: Command,
 
-    /// Format string for output
-    ///
-    /// This is a string that will be formatted for each object.
-    ///
-    /// The format string can use the following variables:
-    /// - `{key}`: the key of the object
-    /// - `{size_bytes}`: the size of the object in bytes, with no suffix
-    /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
-    /// - `{last_modified}`: the last modified date of the object, RFC3339 format
-    ///
-    /// For example, the default format looks like this, but with some padding:
-    ///     {last_modified} {size_human} {key}
-    #[clap(short, long)]
-    format: Option<String>,
+    #[clap(short, long, default_value = "us-west-2", global = true)]
+    region: String,
 
     /// S3 delimiter to use when listing objects
     ///
@@ -49,25 +96,31 @@ struct Opts {
     ///
     /// and then will list all the objects in these prefixes, filtering them
     /// with the remainder of the pattern.
-    #[clap(short, long, default_value = "/")]
-    delimiter: String,
+    #[clap(short, long, default_value = "/", global = true)]
+    delimiter: char,
 
-    /// Glob pattern to match objects against
+    /// How verbose to be, specify multiple times to increase verbosity
     ///
-    /// The pattern can either be an s3 uri or a <bucket>/<glob> without the
-    /// s3://
+    /// - `-v` will show debug logs from s3glob
+    /// - `-vv` will show trace logs from s3glob
+    /// - `-vvv` will show trace logs from s3glob and debug logs from all
+    ///   dependencies
     ///
-    /// Example:
-    ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
-    ///     my-bucket/my_prefix/2024-12-*/something_else/*
-    pattern: String,
+    /// If you want more control you can set the S3GLOB_LOG env var
+    /// using rust-tracing's EnvFilter syntax.
+    #[clap(short, long, global = true, action = ArgAction::Count)]
+    verbose: u8,
 }
 
 fn main() {
+    let opts = Opts::parse();
+    setup_logging(log_directive(opts.verbose));
+    debug!(?opts, "parsed options");
+
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
-        if let Err(err) = run().await {
-            eprintln!("ERROR: {}", err);
+        if let Err(err) = run(opts).await {
+            error!("Failed to run: {}", err);
             let mut err = err.source();
             let mut count = 0;
             while let Some(e) = err {
@@ -85,9 +138,7 @@ fn main() {
     rt.shutdown_timeout(Duration::from_millis(1));
 }
 
-async fn run() -> Result<()> {
-    let opts = Opts::parse();
-
+async fn run(opts: Opts) -> Result<()> {
     // parse possible s3 uri using s3 crate api
     let region = Region::new(opts.region);
     let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
@@ -97,8 +148,11 @@ async fn run() -> Result<()> {
     let client = Client::new(&config);
 
     let s3re = Regex::new(r"^(?:s3://)?([^/]+)/(.*)").unwrap();
-    let pat = opts.pattern.clone();
-    let matches = s3re.captures(&pat);
+
+    let pat = match &opts.command {
+        Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
+    };
+    let matches = s3re.captures(pat);
     let (bucket, raw_pattern) = if let Some(m) = matches {
         (
             m.get(1).unwrap().as_str().to_owned(),
@@ -108,17 +162,16 @@ async fn run() -> Result<()> {
         bail!("pattern must have a <bucket>/<pattern> format, with an optional s3:// prefix");
     };
 
-    let pattern = Glob::new(&raw_pattern)?;
     // Find prefix before first glob character
     let prefix = raw_pattern
         .find(['*', '?', '[', '{'])
         .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
 
-    let user_format = if let Some(user_fmt) = opts.format {
-        Some(compile_format(&user_fmt)?)
-    } else {
-        None
-    };
+    let mut engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
+    let matcher = S3GlobMatcher::parse(raw_pattern, &opts.delimiter.to_string())?;
+    let mut prefixes = matcher.find_prefixes(&mut engine).await?;
+    debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
+    trace!(?prefixes, "matcher generated prefixes");
 
     // List directories for the prefix at the first glob character
     //
@@ -133,25 +186,10 @@ async fn run() -> Result<()> {
     // Not doing it right now because s3glob is already finishing in a couple
     // seconds for tens of millions of objects.
 
-    let mut prefixes = Vec::new();
-    let mut paginator = client
-        .list_objects_v2()
-        .bucket(&bucket)
-        .prefix(&prefix)
-        .delimiter(opts.delimiter)
-        .into_paginator()
-        .send();
-
-    while let Some(page) = paginator.next().await {
-        let page = page?;
-        if let Some(common_prefixes) = page.common_prefixes {
-            prefixes.extend(common_prefixes.into_iter().filter_map(|p| p.prefix));
-        }
-    }
-
     // If there are no common prefixes, then the prefix itself is the only
     // matching prefix.
     if prefixes.is_empty() {
+        debug!(?prefix, "no glob_prefixes found, using simple prefix");
         prefixes.push(prefix);
     }
 
@@ -162,7 +200,6 @@ async fn run() -> Result<()> {
     let total_objects = Arc::new(AtomicUsize::new(0));
     let seen_prefixes = Arc::new(AtomicUsize::new(0));
     let total_prefixes = prefixes.len();
-    let matcher = pattern.compile_matcher();
     for prefix in prefixes {
         let client = client.clone();
         let matching_objects = Arc::clone(&matching_objects);
@@ -199,14 +236,72 @@ async fn run() -> Result<()> {
     }
 
     eprintln!();
-    let mut objects = matching_objects.lock().await;
-    objects.sort_by(|a, b| a.key.cmp(&b.key));
-    let decimal = decimal_format();
-    for obj in objects.iter() {
-        if let Some(user_fmt) = &user_format {
-            print_user(obj, user_fmt);
-        } else {
-            print_default(obj, decimal);
+
+    match opts.command {
+        Command::List { format, .. } => {
+            let user_format = if let Some(user_fmt) = format {
+                Some(compile_format(&user_fmt)?)
+            } else {
+                None
+            };
+            let mut objects = matching_objects.lock().await;
+            objects.sort_by(|a, b| a.key.cmp(&b.key));
+            let decimal = decimal_format();
+            for obj in objects.iter() {
+                if let Some(user_fmt) = &user_format {
+                    print_user(&bucket, obj, user_fmt);
+                } else {
+                    print_default(obj, decimal);
+                }
+            }
+        }
+        Command::Download { dest, .. } => {
+            let objects = matching_objects.lock().await;
+            let obj_count = objects.len();
+            let base_path = Path::new(&dest);
+            let mut total_bytes = 0_usize;
+            for (i, obj) in objects.iter().enumerate() {
+                let key = obj.key.as_ref().unwrap();
+                let path = base_path.join(key);
+                let dir = path.parent().unwrap();
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("Creating directory: {}", dir.display()))?;
+                let mut obj = client.get_object().bucket(&bucket).key(key).send().await?;
+                let temp_path = path.with_extension(format!(".s3glob-tmp-{i}"));
+                let mut file = std::fs::File::create(&temp_path)?;
+                while let Some(bytes) = obj
+                    .body
+                    .try_next()
+                    .await
+                    .context("failed to read from S3 download stream")?
+                {
+                    file.write_all(&bytes).with_context(|| {
+                        format!("failed to write to file: {}", &temp_path.display())
+                    })?;
+                    total_bytes += bytes.len();
+                    eprint!(
+                        "\rdownloaded {}/{} objects, {}",
+                        i,
+                        obj_count,
+                        SizeFormatter::new(total_bytes as u64, decimal_format())
+                    );
+                }
+                std::fs::rename(&temp_path, &path).with_context(|| {
+                    format!(
+                        "failed to rename file: {} -> {}",
+                        &temp_path.display(),
+                        &path.display()
+                    )
+                })?;
+
+                eprint!(
+                    "\rdownloaded {}/{} objects, {}",
+                    i + 1,
+                    obj_count,
+                    SizeFormatter::new(total_bytes as u64, decimal_format())
+                );
+            }
+            eprintln!();
         }
     }
 
@@ -222,7 +317,7 @@ fn decimal_format() -> FormatSizeOptions {
 #[derive(Debug)]
 enum FormatToken {
     Literal(String),
-    Variable(fn(&Object) -> String),
+    Variable(fn(&str, &Object) -> String),
 }
 
 fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
@@ -243,16 +338,19 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
                 var.push(c);
             }
             match var.as_str() {
-                "key" => tokens.push(FormatToken::Variable(|obj| {
+                "key" => tokens.push(FormatToken::Variable(|_, obj| {
                     obj.key.as_ref().unwrap().to_string()
                 })),
-                "size_bytes" => tokens.push(FormatToken::Variable(|obj| {
+                "uri" => tokens.push(FormatToken::Variable(|bucket, obj| {
+                    format!("s3://{}/{}", bucket, obj.key.as_ref().unwrap())
+                })),
+                "size_bytes" => tokens.push(FormatToken::Variable(|_, obj| {
                     obj.size.unwrap_or(0).to_string()
                 })),
-                "size_human" => tokens.push(FormatToken::Variable(|obj| {
+                "size_human" => tokens.push(FormatToken::Variable(|_, obj| {
                     SizeFormatter::new(obj.size.unwrap_or(0) as u64, decimal_format()).to_string()
                 })),
-                "last_modified" => tokens.push(FormatToken::Variable(|obj| {
+                "last_modified" => tokens.push(FormatToken::Variable(|_, obj| {
                     obj.last_modified.as_ref().unwrap().to_string()
                 })),
                 _ => return Err(anyhow::anyhow!("unknown variable: {}", var)),
@@ -279,16 +377,16 @@ fn print_default(obj: &Object, format: FormatSizeOptions) {
     );
 }
 
-fn print_user(obj: &Object, tokens: &[FormatToken]) {
-    println!("{}", format_user(obj, tokens));
+fn print_user(bucket: &str, obj: &Object, tokens: &[FormatToken]) {
+    println!("{}", format_user(bucket, obj, tokens));
 }
 
-fn format_user(obj: &Object, tokens: &[FormatToken]) -> String {
+fn format_user(bucket: &str, obj: &Object, tokens: &[FormatToken]) -> String {
     let mut result = String::new();
     for token in tokens {
         match token {
             FormatToken::Literal(lit) => result.push_str(lit),
-            FormatToken::Variable(var) => result.push_str(&var(obj)),
+            FormatToken::Variable(var) => result.push_str(&var(bucket, obj)),
         }
     }
     result
@@ -303,7 +401,7 @@ async fn list_matching_objects(
     client: &Client,
     bucket: &str,
     prefix: &str,
-    matcher: &GlobMatcher,
+    matcher: &S3GlobMatcher,
 ) -> Result<(Vec<aws_sdk_s3::types::Object>, usize)> {
     let mut matching_objects = Vec::new();
     let mut paginator = client
@@ -331,6 +429,40 @@ async fn list_matching_objects(
     Ok((matching_objects, seen_objects))
 }
 
+fn log_directive(loglevel: u8) -> Option<&'static str> {
+    match loglevel {
+        0 => None,
+        1 => Some("s3glob=debug"),
+        2 => Some("s3glob=trace"),
+        _ => Some("debug,s3glob=trace"),
+    }
+}
+
+pub(crate) fn setup_logging(directive: Option<&str>) {
+    // get logging directive from S3GLOB_LOG or RUST_LOG, preferring S3GLOB_LOG,
+    // but some folks just expect RUST_LOG to work with rust programs.
+    let mut env_filter = if std::env::var("S3GLOB_LOG").is_ok() {
+        tracing_subscriber::EnvFilter::from_env("S3GLOB_LOG")
+    } else {
+        tracing_subscriber::EnvFilter::from_env("RUST_LOG")
+    };
+    if let Some(directive) = directive {
+        env_filter = env_filter.add_directive(directive.parse().unwrap());
+    }
+    let use_ansi = std::io::stderr().is_terminal()
+        || std::env::var("CLICOLOR").is_ok_and(|v| ["1", "true"].contains(&v.as_str()))
+        || std::env::var("CLICOLOR_FORCE").is_ok_and(|v| ["1", "true"].contains(&v.as_str()));
+
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_file(true)
+        .with_line_number(true)
+        .with_ansi(use_ansi)
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
 #[cfg(test)]
 mod tests {
     use aws_sdk_s3::types::Object;
@@ -341,13 +473,14 @@ mod tests {
     #[rstest]
     #[case("Size: {size_bytes}, Name: {key}", "Size: 1234, Name: test/file.txt")]
     #[case("s: {size_human}\t{key}", "s: 1.2kB\ttest/file.txt")]
+    #[case("uri: {uri}", "uri: s3://bkt/test/file.txt")]
+    #[trace]
     fn test_compile_format(#[case] format: &str, #[case] expected: &str) {
         let fmt = compile_format(format).unwrap();
-        assert_eq!(fmt.len(), 4);
 
         let object = Object::builder().key("test/file.txt").size(1234).build();
 
-        let result = format_user(&object, &fmt);
+        let result = format_user("bkt", &object, &fmt);
         assert_eq!(result, expected);
     }
 
