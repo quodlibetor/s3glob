@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.0 - 2025-02-11
+
+### 🚀 Features
+
+- Add support for downloading matches
+- Add {uri} as a list format token
+- Dramatically improve performance for early patterns
+
+### ⚙️ Miscellaneous Tasks
+
+- Recognize more release comments in cliff
+- Use cargo-nextest in CI
+
 ## v0.1.1 - 2025-01-20
 
 ### 🚀 Features
