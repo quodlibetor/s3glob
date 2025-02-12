@@ -122,6 +122,13 @@ struct Opts {
     /// using rust-tracing's EnvFilter syntax.
     #[clap(short, long, global = true, action = ArgAction::Count, verbatim_doc_comment)]
     verbose: u8,
+
+    /// Do not provide your credentials when issuing requests
+    ///
+    /// This is useful for downloading objects from a bucket that is not
+    /// associated with your AWS account, such as a public bucket.
+    #[clap(long, global = true)]
+    no_sign_requests: bool,
 }
 
 fn main() {
@@ -308,10 +315,11 @@ async fn run(opts: Opts) -> Result<()> {
 /// Create a new S3 client with region auto-detection
 async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     let region = RegionProviderChain::first_try(Region::new(opts.region.clone()));
-    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
-        .region(region)
-        .load()
-        .await;
+    let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
+    if opts.no_sign_requests {
+        config = config.no_credentials();
+    }
+    let config = config.load().await;
     let client = Client::new(&config);
 
     let res = client.head_bucket().bucket(bucket).send().await;
@@ -327,10 +335,11 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
 
     let region = Region::new(bucket_region);
 
-    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
-        .region(region)
-        .load()
-        .await;
+    let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
+    if opts.no_sign_requests {
+        config = config.no_credentials();
+    }
+    let config = config.load().await;
     let client = Client::new(&config);
     Ok(client)
 }
