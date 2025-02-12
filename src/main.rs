@@ -32,6 +32,7 @@ enum Command {
         /// Example:
         ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
         ///     my-bucket/my_prefix/2024-12-*/something_else/*
+        #[clap(verbatim_doc_comment)]
         pattern: String,
 
         /// Format string for output
@@ -39,15 +40,17 @@ enum Command {
         /// This is a string that will be formatted for each object.
         ///
         /// The format string can use the following variables:
+        ///
         /// - `{key}`: the key of the object
         /// - `{uri}`: the s3 uri of the object, e.g. s3://my-bucket/my-object.txt
         /// - `{size_bytes}`: the size of the object in bytes, with no suffix
         /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
         /// - `{last_modified}`: the last modified date of the object, RFC3339 format
         ///
-        /// For example, the default format looks like this, but with some padding:
-        ///     {last_modified} {size_human} {key}
-        #[clap(short, long)]
+        /// For example, the default format looks as though you ran s3glob like this:
+        ///
+        ///     s3glob ls -f "{last_modified} {size_human} {key}" "my-bucket/*"
+        #[clap(short, long, verbatim_doc_comment)]
         format: Option<String>,
     },
 
@@ -62,6 +65,7 @@ enum Command {
         /// Example:
         ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
         ///     my-bucket/my_prefix/2024-12-*/something_else/*
+        #[clap(verbatim_doc_comment)]
         pattern: String,
 
         /// The destination directory to download the objects to
@@ -73,12 +77,19 @@ enum Command {
 }
 
 #[derive(Debug, Parser)]
-#[command(version)]
+#[command(version, author, about, max_term_width = 80)]
+/// A fast aws s3 ls and downloader that supports glob patterns
+///
+/// Object discovery is done based on a unixy glob pattern,
+/// See the README for more details:
+/// https://github.com/quodlibetor/s3glob/blob/main/README.md
 struct Opts {
     #[clap(subcommand)]
     command: Command,
 
     /// A region to begin bucket region auto-discovery in
+    ///
+    /// You should be able to ignore this option if you are using AWS S3.
     #[clap(short, long, default_value = "us-east-1", global = true)]
     region: String,
 
@@ -109,7 +120,7 @@ struct Opts {
     ///
     /// If you want more control you can set the S3GLOB_LOG env var
     /// using rust-tracing's EnvFilter syntax.
-    #[clap(short, long, global = true, action = ArgAction::Count)]
+    #[clap(short, long, global = true, action = ArgAction::Count, verbatim_doc_comment)]
     verbose: u8,
 }
 
@@ -165,19 +176,6 @@ async fn run(opts: Opts) -> Result<()> {
     let mut prefixes = matcher.find_prefixes(&mut engine).await?;
     trace!(?prefixes, "matcher generated prefixes");
     debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
-
-    // List directories for the prefix at the first glob character
-    //
-    // TODO: apply sections of the glob as prefixes until we get to the last one
-    // So a*/something/1*/other/*  would find ab ac and then use ab/something/1
-    // and ac/something/1 to find prefixes before other, then just the full
-    // expansion all the prefixes in a{bc}/something/1{23}/other/*
-    //
-    // probably only do that full expansion if the glob is immediately followed
-    // by a delimiter char?
-    //
-    // Not doing it right now because s3glob is already finishing in a couple
-    // seconds for tens of millions of objects.
 
     // If there are no common prefixes, then the prefix itself is the only
     // matching prefix.
