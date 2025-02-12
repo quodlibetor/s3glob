@@ -7,7 +7,7 @@ license = "MIT, APACHE-2.0"
 repository = "https://github.com/quodlibetor/s3glob"
 homepage = "https://github.com/quodlibetor/s3glob"
 readme = "README.md"
-description = "A fast aws s3 ls that supports glob patterns"
+description = "A fast aws s3 ls and downloader that supports glob patterns"
 publish = false
 
 [package.metadata.dist]

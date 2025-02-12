@@ -90,6 +90,7 @@ All code is available under the MIT or Apache 2.0 license, at your option.
 
 ### Performing a release
 
-Ensure git-cliff and cargo-release are both installed and run `cargo release [patch|minor]`.
+Ensure git-cliff and cargo-release are both installed (run `mise install` to get them)
+and run `cargo release [patch|minor]`.
 
 If things look good, run again with `--execute`.

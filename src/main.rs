@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
@@ -78,7 +78,8 @@ struct Opts {
     #[clap(subcommand)]
     command: Command,
 
-    #[clap(short, long, default_value = "us-west-2", global = true)]
+    /// A region to begin bucket region auto-discovery in
+    #[clap(short, long, default_value = "us-east-1", global = true)]
     region: String,
 
     /// S3 delimiter to use when listing objects
@@ -139,19 +140,10 @@ fn main() {
 }
 
 async fn run(opts: Opts) -> Result<()> {
-    // parse possible s3 uri using s3 crate api
-    let region = Region::new(opts.region);
-    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
-        .region(RegionProviderChain::first_try(region))
-        .load()
-        .await;
-    let client = Client::new(&config);
-
-    let s3re = Regex::new(r"^(?:s3://)?([^/]+)/(.*)").unwrap();
-
     let pat = match &opts.command {
         Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
     };
+    let s3re = Regex::new(r"^(?:s3://)?([^/]+)/(.*)").unwrap();
     let matches = s3re.captures(pat);
     let (bucket, raw_pattern) = if let Some(m) = matches {
         (
@@ -162,7 +154,8 @@ async fn run(opts: Opts) -> Result<()> {
         bail!("pattern must have a <bucket>/<pattern> format, with an optional s3:// prefix");
     };
 
-    // Find prefix before first glob character
+    let client = create_s3_client(&opts, &bucket).await?;
+
     let prefix = raw_pattern
         .find(['*', '?', '[', '{'])
         .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
@@ -170,8 +163,8 @@ async fn run(opts: Opts) -> Result<()> {
     let mut engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
     let matcher = S3GlobMatcher::parse(raw_pattern, &opts.delimiter.to_string())?;
     let mut prefixes = matcher.find_prefixes(&mut engine).await?;
-    debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
     trace!(?prefixes, "matcher generated prefixes");
+    debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
 
     // List directories for the prefix at the first glob character
     //
@@ -254,6 +247,12 @@ async fn run(opts: Opts) -> Result<()> {
                     print_default(obj, decimal);
                 }
             }
+            eprintln!(
+                "Found {} matching objects out of {} scanned in {} prefixes",
+                objects.len(),
+                total_objects.load(Ordering::Relaxed),
+                total_prefixes
+            );
         }
         Command::Download { dest, .. } => {
             let objects = matching_objects.lock().await;
@@ -306,6 +305,36 @@ async fn run(opts: Opts) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Create a new S3 client with region auto-detection
+async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
+    let region = RegionProviderChain::first_try(Region::new(opts.region.clone()));
+    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        .region(region)
+        .load()
+        .await;
+    let client = Client::new(&config);
+
+    let res = client.head_bucket().bucket(bucket).send().await;
+
+    let bucket_region = match res {
+        Ok(_) => return Ok(client),
+        Err(err) => err
+            .raw_response()
+            .and_then(|res| res.headers().get("x-amz-bucket-region"))
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("failed to extract bucket region"))?,
+    };
+
+    let region = Region::new(bucket_region);
+
+    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        .region(region)
+        .load()
+        .await;
+    let client = Client::new(&config);
+    Ok(client)
 }
 
 fn decimal_format() -> FormatSizeOptions {
