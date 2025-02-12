@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.1 - 2025-02-12
+
+### 🚀 Features
+
+- Do region auto-discovery for buckets
+- Improve documentation in the README and cli
+- Provide a --no-sign-requests flag for public buckets
+
+### ⚙️ Miscellaneous Tasks
+
+- Add mise config for dev tools
+
 ## v0.2.0 - 2025-02-11
 
 ### 🚀 Features
