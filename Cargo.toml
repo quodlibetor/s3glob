@@ -1,6 +1,6 @@
 [package]
 name = "s3glob"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["Brandon W Maister <quodlibetor@gmail.com>"]
 license = "MIT, APACHE-2.0"
