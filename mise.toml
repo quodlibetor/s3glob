@@ -1,0 +1,13 @@
+[tasks.test]
+run = "cargo nextest run --no-fail-fast"
+
+[tasks.test-unit]
+run = "cargo nextest run --no-fail-fast -E 'not binary(integration)'"
+
+[tasks.test-int]
+run = "cargo nextest run --no-fail-fast -E 'binary(integration)'"
+
+[tools]
+"cargo:cargo-nextest" = "latest"
+"cargo:cargo-release" = "latest"
+git-cliff = "latest"

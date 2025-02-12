@@ -69,7 +69,7 @@
 
         <Package Id='*'
             Keywords='Installer'
-            Description='A fast aws s3 ls that supports glob patterns'
+            Description='A fast aws s3 ls and downloader that supports glob patterns'
             Manufacturer='Brandon W Maister'
             InstallerVersion='450'
             Languages='1033'

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
@@ -32,6 +32,7 @@ enum Command {
         /// Example:
         ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
         ///     my-bucket/my_prefix/2024-12-*/something_else/*
+        #[clap(verbatim_doc_comment)]
         pattern: String,
 
         /// Format string for output
@@ -39,15 +40,17 @@ enum Command {
         /// This is a string that will be formatted for each object.
         ///
         /// The format string can use the following variables:
+        ///
         /// - `{key}`: the key of the object
         /// - `{uri}`: the s3 uri of the object, e.g. s3://my-bucket/my-object.txt
         /// - `{size_bytes}`: the size of the object in bytes, with no suffix
         /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
         /// - `{last_modified}`: the last modified date of the object, RFC3339 format
         ///
-        /// For example, the default format looks like this, but with some padding:
-        ///     {last_modified} {size_human} {key}
-        #[clap(short, long)]
+        /// For example, the default format looks as though you ran s3glob like this:
+        ///
+        ///     s3glob ls -f "{last_modified} {size_human} {key}" "my-bucket/*"
+        #[clap(short, long, verbatim_doc_comment)]
         format: Option<String>,
     },
 
@@ -62,6 +65,7 @@ enum Command {
         /// Example:
         ///     s3://my-bucket/my_prefix/2024-12-*/something_else/*
         ///     my-bucket/my_prefix/2024-12-*/something_else/*
+        #[clap(verbatim_doc_comment)]
         pattern: String,
 
         /// The destination directory to download the objects to
@@ -73,12 +77,20 @@ enum Command {
 }
 
 #[derive(Debug, Parser)]
-#[command(version)]
+#[command(version, author, about, max_term_width = 80)]
+/// A fast aws s3 ls and downloader that supports glob patterns
+///
+/// Object discovery is done based on a unixy glob pattern,
+/// See the README for more details:
+/// https://github.com/quodlibetor/s3glob/blob/main/README.md
 struct Opts {
     #[clap(subcommand)]
     command: Command,
 
-    #[clap(short, long, default_value = "us-west-2", global = true)]
+    /// A region to begin bucket region auto-discovery in
+    ///
+    /// You should be able to ignore this option if you are using AWS S3.
+    #[clap(short, long, default_value = "us-east-1", global = true)]
     region: String,
 
     /// S3 delimiter to use when listing objects
@@ -108,8 +120,15 @@ struct Opts {
     ///
     /// If you want more control you can set the S3GLOB_LOG env var
     /// using rust-tracing's EnvFilter syntax.
-    #[clap(short, long, global = true, action = ArgAction::Count)]
+    #[clap(short, long, global = true, action = ArgAction::Count, verbatim_doc_comment)]
     verbose: u8,
+
+    /// Do not provide your credentials when issuing requests
+    ///
+    /// This is useful for downloading objects from a bucket that is not
+    /// associated with your AWS account, such as a public bucket.
+    #[clap(long, global = true)]
+    no_sign_requests: bool,
 }
 
 fn main() {
@@ -139,19 +158,10 @@ fn main() {
 }
 
 async fn run(opts: Opts) -> Result<()> {
-    // parse possible s3 uri using s3 crate api
-    let region = Region::new(opts.region);
-    let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
-        .region(RegionProviderChain::first_try(region))
-        .load()
-        .await;
-    let client = Client::new(&config);
-
-    let s3re = Regex::new(r"^(?:s3://)?([^/]+)/(.*)").unwrap();
-
     let pat = match &opts.command {
         Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
     };
+    let s3re = Regex::new(r"^(?:s3://)?([^/]+)/(.*)").unwrap();
     let matches = s3re.captures(pat);
     let (bucket, raw_pattern) = if let Some(m) = matches {
         (
@@ -162,7 +172,8 @@ async fn run(opts: Opts) -> Result<()> {
         bail!("pattern must have a <bucket>/<pattern> format, with an optional s3:// prefix");
     };
 
-    // Find prefix before first glob character
+    let client = create_s3_client(&opts, &bucket).await?;
+
     let prefix = raw_pattern
         .find(['*', '?', '[', '{'])
         .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
@@ -170,21 +181,8 @@ async fn run(opts: Opts) -> Result<()> {
     let mut engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
     let matcher = S3GlobMatcher::parse(raw_pattern, &opts.delimiter.to_string())?;
     let mut prefixes = matcher.find_prefixes(&mut engine).await?;
-    debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
     trace!(?prefixes, "matcher generated prefixes");
-
-    // List directories for the prefix at the first glob character
-    //
-    // TODO: apply sections of the glob as prefixes until we get to the last one
-    // So a*/something/1*/other/*  would find ab ac and then use ab/something/1
-    // and ac/something/1 to find prefixes before other, then just the full
-    // expansion all the prefixes in a{bc}/something/1{23}/other/*
-    //
-    // probably only do that full expansion if the glob is immediately followed
-    // by a delimiter char?
-    //
-    // Not doing it right now because s3glob is already finishing in a couple
-    // seconds for tens of millions of objects.
+    debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
 
     // If there are no common prefixes, then the prefix itself is the only
     // matching prefix.
@@ -254,6 +252,12 @@ async fn run(opts: Opts) -> Result<()> {
                     print_default(obj, decimal);
                 }
             }
+            eprintln!(
+                "Found {} matching objects out of {} scanned in {} prefixes",
+                objects.len(),
+                total_objects.load(Ordering::Relaxed),
+                total_prefixes
+            );
         }
         Command::Download { dest, .. } => {
             let objects = matching_objects.lock().await;
@@ -306,6 +310,38 @@ async fn run(opts: Opts) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Create a new S3 client with region auto-detection
+async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
+    let region = RegionProviderChain::first_try(Region::new(opts.region.clone()));
+    let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
+    if opts.no_sign_requests {
+        config = config.no_credentials();
+    }
+    let config = config.load().await;
+    let client = Client::new(&config);
+
+    let res = client.head_bucket().bucket(bucket).send().await;
+
+    let bucket_region = match res {
+        Ok(_) => return Ok(client),
+        Err(err) => err
+            .raw_response()
+            .and_then(|res| res.headers().get("x-amz-bucket-region"))
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("failed to extract bucket region"))?,
+    };
+
+    let region = Region::new(bucket_region);
+
+    let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
+    if opts.no_sign_requests {
+        config = config.no_credentials();
+    }
+    let config = config.load().await;
+    let client = Client::new(&config);
+    Ok(client)
 }
 
 fn decimal_format() -> FormatSizeOptions {

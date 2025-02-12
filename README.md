@@ -11,11 +11,24 @@ in about 5 seconds, where I gave up on `aws s3 ls` after 5 minutes.
 These two commands are equivalent:
 
 ```bash
-s3glob "s3://my-bucket/a*/something/1*/other/*"
-s3glob      "my-bucket/a*/something/1*/other/*"
+s3glob ls "s3://my-bucket/a*/something/1*/other/*"
+s3glob ls    "my-bucket/a*/something/1*/other/*"
 ```
 
-Output is in the same format as `aws s3 ls`.
+Output is in the same format as `aws s3 ls`, but you can change it with the `--format` flag.
+For example, this will output just the `s3://<bucket>/<key>` for each object:
+
+```bash
+s3glob ls -f "{uri}" "s3://my-bucket/a*/something/1*/other/*"
+```
+
+You can also download objects:
+
+```bash
+s3glob dl "s3://my-bucket/a*/something/1*/other/*" my-local-dir
+```
+
+This will create a directory structure that mirrors the s3 object hierarchy.
 
 ### Installation
 
@@ -90,6 +103,7 @@ All code is available under the MIT or Apache 2.0 license, at your option.
 
 ### Performing a release
 
-Ensure git-cliff and cargo-release are both installed and run `cargo release [patch|minor]`.
+Ensure git-cliff and cargo-release are both installed (run `mise install` to get them)
+and run `cargo release [patch|minor]`.
 
 If things look good, run again with `--execute`.
