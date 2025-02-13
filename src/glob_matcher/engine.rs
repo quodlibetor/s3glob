@@ -114,12 +114,13 @@ impl Engine for MockS3Engine {
         self.calls.push((prefix.to_string(), delimiter.to_string()));
         let found = self.scan_prefixes_inner(prefix, delimiter);
 
-        info!(prefix, ?found, "mocks3 found prefixes");
+        info!(prefix, ?found, "MockS3 found prefixes");
 
         found
     }
 
     async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>> {
+        info!(?prefixes, "MockS3 checking prefixes");
         let mut valid_prefixes = Vec::new();
 
         for prefix in prefixes {
@@ -147,9 +148,12 @@ impl MockS3Engine {
     }
 
     pub fn assert_calls(&self, expected: &[(impl AsRef<str>, impl AsRef<str>)]) {
+        info!("MockS3 asserting calls");
+        let calls = &self.calls;
         for (i, ((actual_prefix, actual_delim), (expected_prefix, expected_delim))) in
-            self.calls.iter().zip(expected).enumerate()
+            calls.iter().zip(expected).enumerate()
         {
+            info!("MockS3 asserting call {i}");
             let i = i + 1;
             assert!(
                 actual_prefix == expected_prefix.as_ref(),
@@ -167,11 +171,11 @@ impl MockS3Engine {
             );
         }
         assert!(
-            self.calls.len() == expected.len(),
+            calls.len() == expected.len(),
             "Got {} calls, expected {}. Actual calls: {:#?}",
-            self.calls.len(),
+            calls.len(),
             expected.len(),
-            self.calls
+            calls
         );
     }
 

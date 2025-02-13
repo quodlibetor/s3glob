@@ -2,7 +2,7 @@ use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use aws_config::meta::region::RegionProviderChain;
@@ -162,6 +162,7 @@ fn main() {
 }
 
 async fn run(opts: Opts) -> Result<()> {
+    let start = Instant::now();
     let pat = match &opts.command {
         Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
     };
@@ -223,7 +224,7 @@ async fn run(opts: Opts) -> Result<()> {
             let seen_prefixes = add_atomic(&seen_prefixes, 1);
             eprint!(
                 "\rmatches/total {:>4}/{:<10} prefixes/total {:>4}/{:<4}",
-                match_count,
+                match_count.to_formatted_string(&Locale::en),
                 total_objects.to_formatted_string(&Locale::en),
                 seen_prefixes,
                 total_prefixes
@@ -257,10 +258,11 @@ async fn run(opts: Opts) -> Result<()> {
                 }
             }
             eprintln!(
-                "Found {} matching objects out of {} scanned in {} prefixes",
+                "Matched {}/{} objects across {} prefixes in {:?}",
                 objects.len(),
                 total_objects.load(Ordering::Relaxed),
-                total_prefixes
+                total_prefixes,
+                Duration::from_millis(start.elapsed().as_millis() as u64)
             );
         }
         Command::Download { dest, .. } => {
