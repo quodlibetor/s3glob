@@ -2,7 +2,7 @@ use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use aws_config::meta::region::RegionProviderChain;
@@ -142,8 +142,12 @@ fn main() {
             error!("Failed to run: {}", err);
             let mut err = err.source();
             let mut count = 0;
+            let mut prev_msg = String::new();
             while let Some(e) = err {
-                eprintln!("  : {}", e);
+                if e.to_string() != prev_msg {
+                    eprintln!("  : {}", e);
+                    prev_msg = e.to_string();
+                }
                 err = e.source();
                 count += 1;
                 if count > 10 {
@@ -158,6 +162,7 @@ fn main() {
 }
 
 async fn run(opts: Opts) -> Result<()> {
+    let start = Instant::now();
     let pat = match &opts.command {
         Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
     };
@@ -178,9 +183,9 @@ async fn run(opts: Opts) -> Result<()> {
         .find(['*', '?', '[', '{'])
         .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
 
-    let mut engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
+    let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
     let matcher = S3GlobMatcher::parse(raw_pattern, &opts.delimiter.to_string())?;
-    let mut prefixes = matcher.find_prefixes(&mut engine).await?;
+    let mut prefixes = matcher.find_prefixes(engine).await?;
     trace!(?prefixes, "matcher generated prefixes");
     debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
 
@@ -219,7 +224,7 @@ async fn run(opts: Opts) -> Result<()> {
             let seen_prefixes = add_atomic(&seen_prefixes, 1);
             eprint!(
                 "\rmatches/total {:>4}/{:<10} prefixes/total {:>4}/{:<4}",
-                match_count,
+                match_count.to_formatted_string(&Locale::en),
                 total_objects.to_formatted_string(&Locale::en),
                 seen_prefixes,
                 total_prefixes
@@ -253,10 +258,11 @@ async fn run(opts: Opts) -> Result<()> {
                 }
             }
             eprintln!(
-                "Found {} matching objects out of {} scanned in {} prefixes",
+                "Matched {}/{} objects across {} prefixes in {:?}",
                 objects.len(),
                 total_objects.load(Ordering::Relaxed),
-                total_prefixes
+                total_prefixes,
+                Duration::from_millis(start.elapsed().as_millis() as u64)
             );
         }
         Command::Download { dest, .. } => {
@@ -330,7 +336,7 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
             .raw_response()
             .and_then(|res| res.headers().get("x-amz-bucket-region"))
             .map(str::to_owned)
-            .ok_or_else(|| anyhow!("failed to extract bucket region"))?,
+            .ok_or_else(|| anyhow!("failed to extract bucket region: {err}"))?,
     };
 
     let region = Region::new(bucket_region);
