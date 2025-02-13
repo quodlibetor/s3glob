@@ -142,8 +142,12 @@ fn main() {
             error!("Failed to run: {}", err);
             let mut err = err.source();
             let mut count = 0;
+            let mut prev_msg = String::new();
             while let Some(e) = err {
-                eprintln!("  : {}", e);
+                if e.to_string() != prev_msg {
+                    eprintln!("  : {}", e);
+                    prev_msg = e.to_string();
+                }
                 err = e.source();
                 count += 1;
                 if count > 10 {
@@ -330,7 +334,7 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
             .raw_response()
             .and_then(|res| res.headers().get("x-amz-bucket-region"))
             .map(str::to_owned)
-            .ok_or_else(|| anyhow!("failed to extract bucket region"))?,
+            .ok_or_else(|| anyhow!("failed to extract bucket region: {err}"))?,
     };
 
     let region = Region::new(bucket_region);
