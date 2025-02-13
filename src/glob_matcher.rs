@@ -204,8 +204,17 @@ impl S3GlobMatcher {
                                 break;
                             }
                         }
+                        // don't overwrite if we gave up early
                         if new_prefix_count < MAX_PREFIXES {
                             prefixes = new_prefixes;
+                        }
+                        // TODO: Do we need to make sure that every prefix in
+                        // the old prefixes is a prefix in the new ones?
+                        if new_prefix_count < prefixes.len() {
+                            // this means that something after the any matched
+                            // nothing, which I think always means that we have hit the last delimiter
+                            debug!("Any scan decreased the number of prefixes, aborting. (Probably hit the last delimiter.)");
+                            break;
                         }
                     }
                     if part.is_negated() {
