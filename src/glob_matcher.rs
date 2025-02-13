@@ -19,7 +19,9 @@ pub use engine::{Engine, S3Engine};
 ///
 /// Checking that constructed prefixes exist is significantly slower than
 /// scanning for objects.
-const MAX_PREFIXES: usize = 1000;
+const MAX_PREFIXES: usize = 100_000;
+
+const MAX_CHECK_PREFIXES: usize = 10_000;
 
 /// Parallelism is determined by the number of prefixes, and 50 is much faster
 /// than 1
@@ -133,7 +135,7 @@ impl S3GlobMatcher {
             // only included prefixes in trace logs
             trace!(?prefixes, "scanning for part");
             debug!(new_part = %part.display(), %regex_so_far, prefix_count = prefixes.len(), "scanning for part");
-            eprint!("\rDiscovering prefixes: {}      ", prefixes.len());
+            eprint!("\rDiscovering prefixes: {:>5}", prefixes.len());
             // We always want to scan for things including the last part,
             // finding more prefixes in it is guaranteed to be slower than
             // just searching because we have to do an api call to check each
@@ -150,9 +152,13 @@ impl S3GlobMatcher {
                 Glob::Any { .. } => {
                     // never scan if the previous part was an any, because the last scan will have
                     // already found all of the prefixes that match the any
-                    let is_last_part = i == self.parts.len() - 1;
+                    let might_be_dir = self
+                        .parts
+                        .iter()
+                        .skip(i + 1)
+                        .any(|p| p.may_have_delimiter(self.delimiter));
                     let scan_might_help =
-                        !matches!(prev_part, Some(&Glob::Any { .. })) && !is_last_part;
+                        !matches!(prev_part, Some(&Glob::Any { .. })) && might_be_dir;
                     if scan_might_help {
                         debug!(part = %part.display(), "scanning for keys in an Any");
                         let (tx, mut rx) = tokio::sync::mpsc::channel(prefixes.len());
@@ -185,13 +191,17 @@ impl S3GlobMatcher {
                         while let Some(result) = rx.recv().await {
                             let (scanned_prefix, results) = result.context("scanning prefixes")?;
                             let result_len = results.len();
-                            new_prefixes.extend(results);
                             trace!(
                                 scanned_prefix,
                                 scanned_results = result_len,
                                 new_prefix_count,
                                 "Scanning for any, got result from task"
                             );
+                            if !results.is_empty() {
+                                new_prefixes.extend(results);
+                            } else {
+                                new_prefixes.push(scanned_prefix);
+                            }
                             new_prefix_count = new_prefixes.len();
                             if new_prefix_count >= MAX_PREFIXES {
                                 debug!(
@@ -207,14 +217,6 @@ impl S3GlobMatcher {
                         // don't overwrite if we gave up early
                         if new_prefix_count < MAX_PREFIXES {
                             prefixes = new_prefixes;
-                        }
-                        // TODO: Do we need to make sure that every prefix in
-                        // the old prefixes is a prefix in the new ones?
-                        if new_prefix_count < prefixes.len() {
-                            // this means that something after the any matched
-                            // nothing, which I think always means that we have hit the last delimiter
-                            debug!("Any scan decreased the number of prefixes, aborting. (Probably hit the last delimiter.)");
-                            break;
                         }
                     }
                     if part.is_negated() {
@@ -256,10 +258,10 @@ impl S3GlobMatcher {
                                 new_prefixes.push(prefix_join(prefix, alt));
                             }
                         }
-                        if new_prefixes.len() >= MAX_PREFIXES {
+                        if new_prefixes.len() >= MAX_CHECK_PREFIXES {
                             debug!(
                                 new_prefix_count = new_prefixes.len(),
-                                "simple append generated over 1,000 prefixes, using prefixes from previous part"
+                                "simple append generated over {MAX_CHECK_PREFIXES} prefixes, using prefixes from previous part"
                             );
                             break;
                         }
@@ -285,7 +287,7 @@ impl S3GlobMatcher {
 
                                 let after_delim = choice[up_to_delim.len()..].to_string();
                                 if !after_delim.is_empty() {
-                                    appends.insert(regex::escape(&after_delim));
+                                    appends.insert(after_delim);
                                 }
                             } else {
                                 filters.insert(regex::escape(choice));
@@ -297,7 +299,10 @@ impl S3GlobMatcher {
                         let append_matcher =
                             Regex::new(&format!("{}{}", regex_so_far, part.re_string(&delimiter)))
                                 .unwrap();
-                        trace!(filters, ?appends, regex = ?filter.as_str(), append_regex = %append_matcher.as_str(), ?prefixes, "filtering and appending to prefixes");
+                        trace!(filters,
+                            ?appends, regex = ?filter.as_str(), append_regex = %append_matcher.as_str(), ?prefixes,
+                            "filtering and appending to prefixes",
+                        );
 
                         let new_prefixes = if filters.is_empty() {
                             debug!("no filters, appending");
@@ -358,36 +363,7 @@ impl S3GlobMatcher {
             prev_part = Some(part);
         }
 
-        // parallelism is determined by the number of prefixes, so we need to
-        // extend the list until we have several. 50 is generally pretty fast,
-        // but going more than 5 layers deep feels excessive
-        let mut extensions = 0;
-        while !prefixes.is_empty() && prefixes.len() < self.min_prefixes && extensions < 5 {
-            eprint!("\rDiscovering prefixes: {}      ", prefixes.len());
-            debug!(
-                prefix_count = prefixes.len(),
-                extensions, "extending prefixes because there are less than 50"
-            );
-            trace!(
-                ?prefixes,
-                "extending prefixes because there are less than 50"
-            );
-            extensions += 1;
-            let mut new_prefixes = Vec::new();
-            for prefix in &prefixes {
-                let np = engine.scan_prefixes(prefix, &delimiter).await?;
-                for p in np {
-                    if self.is_match(&p) {
-                        new_prefixes.push(p);
-                    }
-                }
-            }
-            if prefixes == new_prefixes {
-                break;
-            }
-            prefixes = new_prefixes;
-        }
-        eprintln!("\rDiscovered prefixes: {}      ", prefixes.len());
+        eprintln!("\rDiscovered prefixes: {:>5}", prefixes.len());
         Ok(prefixes)
     }
 
@@ -500,6 +476,14 @@ impl Glob {
                 sa.extend(new_allowed);
             }
             _ => panic!("Cannot combine glob with non-choice glob"),
+        }
+    }
+
+    fn may_have_delimiter(&self, delimiter: char) -> bool {
+        match self {
+            Glob::Any { .. } => false,
+            Glob::Choice { allowed, .. } => allowed.iter().any(|a| a.contains(delimiter)),
+            Glob::Recursive { .. } => true,
         }
     }
 }
@@ -836,21 +820,21 @@ mod tests {
     #[tokio::test]
     async fn test_find_prefixes_character_class() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
-        let mut scanner = S3GlobMatcher::parse("src/[abc]*.rs".to_string(), "/")?;
+        let mut scanner = S3GlobMatcher::parse("src/[abc]*/zebra.rs".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["src/a", "src/b", "src/c"]));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
-        assert_scanner_part!(&scanner.parts[2], OneChoice(".rs"));
+        assert_scanner_part!(&scanner.parts[2], OneChoice("/zebra.rs"));
         let engine = MockS3Engine::new(vec![
-            "src/abc.rs".to_string(),
-            "src/baz.rs".to_string(),
-            "src/cat.rs".to_string(),
-            "src/dog.rs".to_string(), // Should be filtered out
+            "src/abc/zebra.rs".to_string(),
+            "src/baz/zebra.rs".to_string(),
+            "src/cat/zebra.rs".to_string(),
+            "src/dog/zebra.rs".to_string(), // Should be filtered out
         ]);
 
         let prefixes = scanner.find_prefixes(engine.clone()).await?;
         engine.assert_calls(&[("src/a", "/"), ("src/b", "/"), ("src/c", "/")]);
-        assert!(prefixes == vec!["src/abc.rs", "src/baz.rs", "src/cat.rs"]);
+        assert!(prefixes == vec!["src/abc/zebra.rs", "src/baz/zebra.rs", "src/cat/zebra.rs"]);
         Ok(())
     }
 
@@ -960,18 +944,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_any_after_last_delimiter() -> Result<()> {
-        let mut scanner = S3GlobMatcher::parse("literal/baz*.rs".to_string(), "/")?;
+        let mut scanner = S3GlobMatcher::parse("literal/baz*/a.rs".to_string(), "/")?;
         scanner.set_min_prefixes(0);
 
         assert_scanner_part!(&scanner.parts[0], OneChoice("literal/baz"));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
-        assert_scanner_part!(&scanner.parts[2], OneChoice(".rs"));
+        assert_scanner_part!(&scanner.parts[2], OneChoice("/a.rs"));
 
         let engine = MockS3Engine::new(vec![
-            "literal/baz.rs".to_string(),
-            "literal/baz-extra.rs".to_string(),
-            "literal/bazinga.rs".to_string(),
-            "literal/other.rs".to_string(), // Should be filtered out
+            "literal/baz/a.rs".to_string(),
+            "literal/baz-extra/a.rs".to_string(),
+            "literal/bazinga/a.rs".to_string(),
+            "literal/other/a.rs".to_string(), // Should be filtered out
         ]);
 
         let prefixes = scanner.find_prefixes(engine.clone()).await?;
@@ -979,9 +963,9 @@ mod tests {
         assert!(
             prefixes
                 == vec![
-                    "literal/baz-extra.rs",
-                    "literal/baz.rs",
-                    "literal/bazinga.rs"
+                    "literal/baz-extra/a.rs",
+                    "literal/baz/a.rs",
+                    "literal/bazinga/a.rs"
                 ]
         );
         Ok(())
@@ -990,22 +974,22 @@ mod tests {
     #[tokio::test]
     async fn test_find_prefixes_any_and_character_class() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
-        let mut scanner = S3GlobMatcher::parse("literal/baz*[ab].rs".to_string(), "/")?;
+        let mut scanner = S3GlobMatcher::parse("literal/baz*[ab]/1.rs".to_string(), "/")?;
         scanner.set_min_prefixes(0);
 
         assert_scanner_part!(&scanner.parts[0], OneChoice("literal/baz"));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
-        assert_scanner_part!(&scanner.parts[2], Choice(vec!["a.rs", "b.rs"]));
+        assert_scanner_part!(&scanner.parts[2], Choice(vec!["a/1.rs", "b/1.rs"]));
 
         let engine = MockS3Engine::new(vec![
-            "literal/baz-a.rs".to_string(),
-            "literal/baz-extra-b.rs".to_string(),
-            "literal/baz-c.rs".to_string(), // Should be filtered out
+            "literal/baz-a/1.rs".to_string(),
+            "literal/baz-extra-b/1.rs".to_string(),
+            "literal/baz-c/1.rs".to_string(), // Should be filtered out
         ]);
 
         let prefixes = scanner.find_prefixes(engine.clone()).await?;
         engine.assert_calls(&[("literal/baz", "/")]);
-        assert!(prefixes == vec!["literal/baz-a.rs", "literal/baz-extra-b.rs"]);
+        assert!(prefixes == vec!["literal/baz-a/1.rs", "literal/baz-extra-b/1.rs"]);
         Ok(())
     }
 
@@ -1093,17 +1077,17 @@ mod tests {
     #[tokio::test]
     async fn test_find_prefixes_negative_class_after_wildcard() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
-        let mut scanner = S3GlobMatcher::parse("*[!f]oo".to_string(), "/")?;
+        let mut scanner = S3GlobMatcher::parse("*[!f]oo/*".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
-            "zoo".to_string(),
-            "boo".to_string(),
-            "foo".to_string(),           // Should be filtered out
-            "something/foo".to_string(), // Should be filtered out
+            "zoo/a".to_string(),
+            "boo/a".to_string(),
+            "foo/a".to_string(),           // Should be filtered out
+            "something/foo/a".to_string(), // Should be filtered out
         ]);
 
         let prefixes = scanner.find_prefixes(engine.clone()).await?;
-        assert!(prefixes == vec!["boo", "zoo"]);
+        assert!(prefixes == vec!["boo/", "zoo/"]);
         // TODO: this could be improved to only call the engine once
         Ok(())
     }

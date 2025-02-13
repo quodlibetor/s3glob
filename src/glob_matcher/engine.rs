@@ -64,7 +64,6 @@ impl Engine for S3Engine {
         for prefix in prefixes {
             let client = self.client.clone();
             let bucket = self.bucket.clone();
-            let delimiter = self.delimiter.clone();
             let tx = tx.clone();
             let prefix = prefix.clone();
 
@@ -73,7 +72,6 @@ impl Engine for S3Engine {
                     .list_objects_v2()
                     .bucket(bucket)
                     .prefix(prefix.clone())
-                    .delimiter(delimiter)
                     .max_keys(1)
                     .send()
                     .await;

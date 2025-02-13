@@ -15,7 +15,7 @@ use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-use tracing::{debug, error, trace};
+use tracing::{debug, trace};
 
 mod glob_matcher;
 
@@ -73,6 +73,46 @@ enum Command {
         /// The full key name will be reproduced in the directory, so multiple
         /// folders may be created.
         dest: String,
+    },
+
+    /// Learn how to tune s3glob's parallelism for better performance
+    ///
+    /// You only need to read this doc if you feel like s3glob is running
+    /// slower than you hope.
+    ///
+    /// Because of the APIs provided by AWS, s3glob can only meaningfully issue
+    /// parallel requests for prefixes. Additionally, prefixes can only be
+    /// generated before a delimiter.
+    ///
+    /// So if you have a keyspace (using {..-..} to represent a range) that
+    /// looks like:
+    ///
+    ///    s3://bucket/{a-z}/{0-999}/OBJECT_ID.txt
+    ///
+    /// and you want to find all the text files where OBJECT_ID is 5, you have
+    /// several options for patterns:
+    ///
+    ///    1: s3glob ls bucket/**/5.txt    -- parallelism 1
+    ///    2: s3glob ls bucket/*/**/5.txt  -- parallelism 26
+    ///    3: s3glob ls bucket/*/*/5.txt   -- parallelism 26,000
+    ///
+    /// Which one is best depends on exactly what you're searching for.
+    ///
+    /// If you have suggestions for improving s3glob's parallelism,
+    /// please feel free to open an issue at https://github.com/quodlibetor/s3glob/issues
+    #[clap(verbatim_doc_comment)]
+    Parallelism {
+        #[clap(short, hide = true)]
+        region: bool,
+
+        #[clap(short, hide = true)]
+        delimiter: bool,
+
+        #[clap(short, hide = true)]
+        verbose: bool,
+
+        #[clap(short, hide = true)]
+        no_sign_requests: bool,
     },
 }
 
@@ -139,7 +179,7 @@ fn main() {
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
         if let Err(err) = run(opts).await {
-            error!("Failed to run: {}", err);
+            eprintln!("Failed to run: {}", err);
             let mut err = err.source();
             let mut count = 0;
             let mut prev_msg = String::new();
@@ -165,6 +205,10 @@ async fn run(opts: Opts) -> Result<()> {
     let start = Instant::now();
     let pat = match &opts.command {
         Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
+        Command::Parallelism { .. } => {
+            eprintln!("This is just for documentation, run instead: s3glob help parallelism");
+            return Ok(());
+        }
     };
     let s3re = Regex::new(r"^(?:s3://)?([^/]+)/(.*)").unwrap();
     let matches = s3re.captures(pat);
@@ -313,6 +357,9 @@ async fn run(opts: Opts) -> Result<()> {
             }
             eprintln!();
         }
+        Command::Parallelism { .. } => {
+            eprintln!("This is just for documentation, run instead: s3glob help parallelism");
+        }
     }
 
     Ok(())
@@ -336,7 +383,7 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
             .raw_response()
             .and_then(|res| res.headers().get("x-amz-bucket-region"))
             .map(str::to_owned)
-            .ok_or_else(|| anyhow!("failed to extract bucket region: {err}"))?,
+            .ok_or_else(|| anyhow!(err).context("failed to extract bucket region"))?,
     };
 
     let region = Region::new(bucket_region);
