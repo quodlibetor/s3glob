@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.2 - 2025-02-13
+
+### 🐛 Bug Fixes
+
+- Improve error messages
+- Handle globs at the end of keys better
+
+### ⚡ Performance
+
+- Ensure reasonable concurrency as base for scan
+- Parallelize "directory" scanning for prefixes
+
+### ⚙️ Miscellaneous Tasks
+
+- Add cargo nextest test timeouts
+
 ## v0.2.1 - 2025-02-12
 
 ### 🚀 Features
