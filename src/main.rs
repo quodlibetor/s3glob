@@ -183,9 +183,9 @@ async fn run(opts: Opts) -> Result<()> {
         .find(['*', '?', '[', '{'])
         .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
 
-    let mut engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
+    let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
     let matcher = S3GlobMatcher::parse(raw_pattern, &opts.delimiter.to_string())?;
-    let mut prefixes = matcher.find_prefixes(&mut engine).await?;
+    let mut prefixes = matcher.find_prefixes(engine).await?;
     trace!(?prefixes, "matcher generated prefixes");
     debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
 

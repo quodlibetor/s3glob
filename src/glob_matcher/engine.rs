@@ -5,14 +5,17 @@ use tracing::{debug, trace};
 #[cfg(test)]
 use std::collections::BTreeSet;
 #[cfg(test)]
+use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use tracing::info;
 
 #[async_trait::async_trait]
-pub trait Engine {
+pub trait Engine: Send + Sync + 'static {
     async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>>;
     async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>>;
 }
 
+#[derive(Debug, Clone)]
 pub struct S3Engine {
     client: Client,
     bucket: String,
@@ -102,16 +105,20 @@ impl Engine for S3Engine {
 
 /// A test engine that simulates a real S3 bucket with a set of paths
 #[cfg(test)]
+#[derive(Debug, Clone)]
 pub(super) struct MockS3Engine {
-    pub paths: Vec<String>,
-    pub calls: Vec<(String, String)>, // (prefix, delimiter) pairs
+    pub paths: Arc<Vec<String>>,
+    pub calls: Arc<Mutex<Vec<(String, String)>>>, // (prefix, delimiter) pairs
 }
 
 #[cfg(test)]
 #[async_trait::async_trait]
 impl Engine for MockS3Engine {
     async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
-        self.calls.push((prefix.to_string(), delimiter.to_string()));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((prefix.to_string(), delimiter.to_string()));
         let found = self.scan_prefixes_inner(prefix, delimiter);
 
         info!(prefix, ?found, "MockS3 found prefixes");
@@ -142,14 +149,14 @@ impl Engine for MockS3Engine {
 impl MockS3Engine {
     pub fn new(paths: Vec<String>) -> Self {
         Self {
-            paths,
-            calls: Vec::new(),
+            paths: Arc::new(paths),
+            calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     pub fn assert_calls(&self, expected: &[(impl AsRef<str>, impl AsRef<str>)]) {
         info!("MockS3 asserting calls");
-        let calls = &self.calls;
+        let calls = &self.calls.lock().unwrap();
         for (i, ((actual_prefix, actual_delim), (expected_prefix, expected_delim))) in
             calls.iter().zip(expected).enumerate()
         {
