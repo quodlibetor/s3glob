@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.3 - 2025-02-13
+
+### 🐛 Bug Fixes
+
+- Skip prefix discovery in the file part of keys
+- Show full errors for bucket discovery
+
+### 📚 Documentation
+
+- Add an s3glob help parallelism command
+
 ## v0.2.2 - 2025-02-13
 
 ### 🐛 Bug Fixes
