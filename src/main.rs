@@ -15,7 +15,7 @@ use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
-use tracing::{debug, error, trace};
+use tracing::{debug, trace};
 
 mod glob_matcher;
 
@@ -179,7 +179,7 @@ fn main() {
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
         if let Err(err) = run(opts).await {
-            error!("Failed to run: {}", err);
+            eprintln!("Failed to run: {}", err);
             let mut err = err.source();
             let mut count = 0;
             let mut prev_msg = String::new();
@@ -383,7 +383,7 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
             .raw_response()
             .and_then(|res| res.headers().get("x-amz-bucket-region"))
             .map(str::to_owned)
-            .ok_or_else(|| anyhow!("failed to extract bucket region: {err}"))?,
+            .ok_or_else(|| anyhow!(err).context("failed to extract bucket region"))?,
     };
 
     let region = Region::new(bucket_region);
