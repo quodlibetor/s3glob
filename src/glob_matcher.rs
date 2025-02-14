@@ -25,7 +25,7 @@ const MAX_CHECK_PREFIXES: usize = 10_000;
 
 /// Parallelism is determined by the number of prefixes, and 50 is much faster
 /// than 1
-const DESIRED_MIN_PREFIXES: usize = 50;
+const DESIRED_MIN_PREFIXES: usize = 25;
 
 /// A thing that knows how to generate and filter S3 prefixes based on a glob pattern
 #[derive(Debug, Clone)]
@@ -372,11 +372,17 @@ impl S3GlobMatcher {
             prev_part = Some(part);
         }
 
-        eprintln!(
-            "\r                                          \
-             \rDiscovered prefixes: {:>5}",
-            prefixes.len()
-        );
+        if prefixes.len() < self.min_prefixes {
+            let count = prefixes.len();
+            eprintln!("\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow");
+        } else {
+            // clear the previous output
+            eprintln!(
+                "\r                                          \
+                 \rDiscovered prefixes: {:>5}",
+                prefixes.len()
+            );
+        }
         Ok(prefixes)
     }
 
