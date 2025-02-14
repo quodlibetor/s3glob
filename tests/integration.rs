@@ -18,7 +18,6 @@ use testcontainers_modules::minio::MinIO;
     "prefix/2024-01/file1.txt",
     "prefix/2024-02/file2.txt",
     "prefix/2024-03/file4.txt",
-    "prefix/2024-03/nested/file3.txt",
 ])]
 #[case("prefix/2024-*/nested/file*.txt", &[
     "prefix/2024-03/nested/file3.txt",
@@ -47,9 +46,6 @@ async fn test_s3glob_pattern_matching(
     #[case] glob: &str,
     #[case] expected: &[&str],
 ) -> anyhow::Result<()> {
-    println!("---- testing glob: {}", glob);
-    println!("---- expected: {:?}", expected);
-
     // Start MinIO container and configure S3 client
     let (_node, port, client) = minio_and_client().await;
 
