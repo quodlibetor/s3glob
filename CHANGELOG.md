@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.4 - 2025-02-14
+
+### 🐛 Bug Fixes
+
+- Don't try to find prefixes in file parts
+
+### 📚 Documentation
+
+- Point out the parallelism help when few prefixes are found
+
 ## v0.2.3 - 2025-02-13
 
 ### 🐛 Bug Fixes
