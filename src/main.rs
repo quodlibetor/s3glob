@@ -496,12 +496,12 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
 
 fn print_default(obj: &Object, format: FormatSizeOptions) {
     println!(
-        "{:>10} {:>6}    {}",
+        "{:>10}   {:>7}   {}",
         obj.last_modified
             .as_ref()
             .map(|dt| dt.to_string())
             .unwrap_or_default(),
-        SizeFormatter::new(obj.size.unwrap_or(0) as u64, format),
+        SizeFormatter::new(obj.size.unwrap_or(0) as u64, format).to_string(),
         obj.key.as_ref().unwrap_or(&String::new()),
     );
 }
@@ -572,16 +572,16 @@ fn log_directive(loglevel: u8) -> Option<&'static str> {
 }
 
 pub(crate) fn setup_logging(directive: Option<&str>) {
-    // get logging directive from S3GLOB_LOG or RUST_LOG, preferring S3GLOB_LOG,
-    // but some folks just expect RUST_LOG to work with rust programs.
-    let mut env_filter = if std::env::var("S3GLOB_LOG").is_ok() {
-        tracing_subscriber::EnvFilter::from_env("S3GLOB_LOG")
-    } else {
-        tracing_subscriber::EnvFilter::from_env("RUST_LOG")
-    };
+    let mut env_filter = tracing_subscriber::EnvFilter::new("s3glob=warn");
+    if let Ok(env) = std::env::var("S3GLOB_LOG") {
+        env_filter = env_filter.add_directive(env.parse().unwrap());
+    } else if let Ok(env) = std::env::var("RUST_LOG") {
+        env_filter = env_filter.add_directive(env.parse().unwrap());
+    }
     if let Some(directive) = directive {
         env_filter = env_filter.add_directive(directive.parse().unwrap());
     }
+
     let use_ansi = std::io::stderr().is_terminal()
         || std::env::var("CLICOLOR").is_ok_and(|v| ["1", "true"].contains(&v.as_str()))
         || std::env::var("CLICOLOR_FORCE").is_ok_and(|v| ["1", "true"].contains(&v.as_str()));

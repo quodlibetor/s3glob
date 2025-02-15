@@ -1,6 +1,7 @@
 use anyhow::{Context as _, Result};
 use aws_sdk_s3::Client;
-use tracing::{debug, trace};
+use num_format::{Locale, ToFormattedString as _};
+use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 use std::collections::BTreeSet;
@@ -46,10 +47,28 @@ impl Engine for S3Engine {
             .into_paginator()
             .send();
 
+        let mut warning_count = 0;
+        let mut warning_inc = 50_000;
         while let Some(page) = paginator.next().await {
             let page = page?;
+            if prefixes.len() >= warning_count + warning_inc {
+                if warning_count == 0 {
+                    eprintln!(); // create a new line after the "discovering.." message
+                }
+                warn!(
+                    "found {} objects in {prefix} and still discovering more",
+                    prefixes.len().to_formatted_string(&Locale::en)
+                );
+                warning_count += warning_inc;
+                if warning_count >= 100_000 {
+                    warning_inc = 100_000;
+                }
+            }
             if let Some(common_prefixes) = page.common_prefixes {
                 prefixes.extend(common_prefixes.into_iter().filter_map(|p| p.prefix));
+            }
+            if let Some(contents) = page.contents {
+                prefixes.extend(contents.into_iter().filter_map(|c| c.key));
             }
         }
         Ok(prefixes)
