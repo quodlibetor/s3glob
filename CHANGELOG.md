@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.5 - 2025-02-15
+
+### 🚀 Features
+
+- Add the ability to stream output
+- Warn when a large number of prefixes are being discovered
+
+### 🐛 Bug Fixes
+
+- Support actual aws cli option --no-sign-request
+
 ## v0.2.4 - 2025-02-14
 
 ### 🐛 Bug Fixes
