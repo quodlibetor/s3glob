@@ -171,8 +171,8 @@ struct Opts {
     ///
     /// This is useful for downloading objects from a bucket that is not
     /// associated with your AWS account, such as a public bucket.
-    #[clap(long, global = true)]
-    no_sign_requests: bool,
+    #[clap(long, global = true, alias = "no-sign-requests")]
+    no_sign_request: bool,
 }
 
 fn main() {
@@ -409,7 +409,7 @@ struct PrefixResult {
 async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     let region = RegionProviderChain::first_try(Region::new(opts.region.clone()));
     let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
-    if opts.no_sign_requests {
+    if opts.no_sign_request {
         config = config.no_credentials();
     }
     let config = config.load().await;
@@ -429,7 +429,7 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     let region = Region::new(bucket_region);
 
     let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
-    if opts.no_sign_requests {
+    if opts.no_sign_request {
         config = config.no_credentials();
     }
     let config = config.load().await;
