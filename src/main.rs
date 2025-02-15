@@ -14,7 +14,7 @@ use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::runtime::Runtime;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, trace};
 
 mod glob_matcher;
@@ -52,6 +52,10 @@ enum Command {
         ///     s3glob ls -f "{last_modified} {size_human} {key}" "my-bucket/*"
         #[clap(short, long, verbatim_doc_comment)]
         format: Option<String>,
+
+        /// Stream keys as they are found, rather than sorting and printing at the end
+        #[clap(long)]
+        stream: bool,
     },
 
     /// Download objects matching the pattern
@@ -167,8 +171,8 @@ struct Opts {
     ///
     /// This is useful for downloading objects from a bucket that is not
     /// associated with your AWS account, such as a public bucket.
-    #[clap(long, global = true)]
-    no_sign_requests: bool,
+    #[clap(long, global = true, alias = "no-sign-requests")]
+    no_sign_request: bool,
 }
 
 fn main() {
@@ -240,60 +244,70 @@ async fn run(opts: Opts) -> Result<()> {
         prefixes.push(prefix);
     }
 
-    // Process directories concurrently
-    let matching_objects = Arc::new(Mutex::new(Vec::new()));
     let mut tasks = Vec::new();
 
     let total_objects = Arc::new(AtomicUsize::new(0));
     let seen_prefixes = Arc::new(AtomicUsize::new(0));
     let total_prefixes = prefixes.len();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PrefixResult>();
     for prefix in prefixes {
         let client = client.clone();
-        let matching_objects = Arc::clone(&matching_objects);
         let total_objects = Arc::clone(&total_objects);
         let seen_prefixes = Arc::clone(&seen_prefixes);
         let matcher = matcher.clone();
         let bucket = bucket.clone();
+        let tx = tx.clone();
 
         tasks.push(tokio::spawn(async move {
-            let (objects, seen) =
-                list_matching_objects(&client, &bucket, &prefix, &matcher).await?;
-            let match_count = {
-                let mut m = matching_objects.lock().await;
-                m.extend(objects);
-                m.len()
-            };
+            list_matching_objects(&client, &bucket, &prefix, &matcher, total_objects, tx).await?;
 
-            let total_objects = add_atomic(&total_objects, seen);
-            let seen_prefixes = add_atomic(&seen_prefixes, 1);
-            eprint!(
-                "\rmatches/total {:>4}/{:<10} prefixes/total {:>4}/{:<4}",
-                match_count.to_formatted_string(&Locale::en),
-                total_objects.to_formatted_string(&Locale::en),
-                seen_prefixes,
-                total_prefixes
-            );
+            add_atomic(&seen_prefixes, 1);
             Ok::<_, anyhow::Error>(())
         }));
     }
-
-    // Wait for all tasks to complete
-    for task in tasks {
-        task.await??;
-    }
-
-    eprintln!();
+    drop(tx);
 
     match opts.command {
-        Command::List { format, .. } => {
+        Command::List { format, stream, .. } => {
             let user_format = if let Some(user_fmt) = format {
                 Some(compile_format(&user_fmt)?)
             } else {
                 None
             };
-            let mut objects = matching_objects.lock().await;
-            objects.sort_by(|a, b| a.key.cmp(&b.key));
+            let mut matching_objects = Vec::new();
+            let mut match_count = 0;
             let decimal = decimal_format();
+            while let Some(PrefixResult {
+                matching_objects: mo,
+                ..
+            }) = rx.recv().await
+            {
+                if stream {
+                    match_count += mo.len();
+                    for obj in mo.iter() {
+                        if let Some(user_fmt) = &user_format {
+                            print_user(&bucket, obj, user_fmt);
+                        } else {
+                            print_default(obj, decimal);
+                        }
+                    }
+                } else {
+                    match_count += mo.len();
+                    matching_objects.extend(mo);
+                    eprint!(
+                        "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                        match_count.to_formatted_string(&Locale::en),
+                        total_objects
+                            .load(Ordering::Relaxed)
+                            .to_formatted_string(&Locale::en),
+                        seen_prefixes.load(Ordering::Relaxed),
+                        total_prefixes
+                    );
+                }
+            }
+            eprintln!();
+            let mut objects = matching_objects;
+            objects.sort_by(|a, b| a.key.cmp(&b.key));
             for obj in objects.iter() {
                 if let Some(user_fmt) = &user_format {
                     print_user(&bucket, obj, user_fmt);
@@ -303,14 +317,33 @@ async fn run(opts: Opts) -> Result<()> {
             }
             eprintln!(
                 "Matched {}/{} objects across {} prefixes in {:?}",
-                objects.len(),
+                match_count,
                 total_objects.load(Ordering::Relaxed),
                 total_prefixes,
                 Duration::from_millis(start.elapsed().as_millis() as u64)
             );
         }
         Command::Download { dest, .. } => {
-            let objects = matching_objects.lock().await;
+            let mut matching_objects = Vec::new();
+            let mut match_count = 0;
+            while let Some(PrefixResult {
+                matching_objects: mo,
+                ..
+            }) = rx.recv().await
+            {
+                match_count += mo.len();
+                matching_objects.extend(mo);
+                eprint!(
+                    "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                    match_count.to_formatted_string(&Locale::en),
+                    total_objects
+                        .load(Ordering::Relaxed)
+                        .to_formatted_string(&Locale::en),
+                    seen_prefixes.load(Ordering::Relaxed),
+                    total_prefixes
+                );
+            }
+            let objects = matching_objects;
             let obj_count = objects.len();
             let base_path = Path::new(&dest);
             let mut total_bytes = 0_usize;
@@ -365,11 +398,18 @@ async fn run(opts: Opts) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct PrefixResult {
+    #[allow(dead_code)]
+    prefix: String,
+    matching_objects: Vec<Object>,
+}
+
 /// Create a new S3 client with region auto-detection
 async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     let region = RegionProviderChain::first_try(Region::new(opts.region.clone()));
     let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
-    if opts.no_sign_requests {
+    if opts.no_sign_request {
         config = config.no_credentials();
     }
     let config = config.load().await;
@@ -389,7 +429,7 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     let region = Region::new(bucket_region);
 
     let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
-    if opts.no_sign_requests {
+    if opts.no_sign_request {
         config = config.no_credentials();
     }
     let config = config.load().await;
@@ -456,12 +496,12 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
 
 fn print_default(obj: &Object, format: FormatSizeOptions) {
     println!(
-        "{:>10} {:>6}    {}",
+        "{:>10}   {:>7}   {}",
         obj.last_modified
             .as_ref()
             .map(|dt| dt.to_string())
             .unwrap_or_default(),
-        SizeFormatter::new(obj.size.unwrap_or(0) as u64, format),
+        SizeFormatter::new(obj.size.unwrap_or(0) as u64, format).to_string(),
         obj.key.as_ref().unwrap_or(&String::new()),
     );
 }
@@ -491,8 +531,9 @@ async fn list_matching_objects(
     bucket: &str,
     prefix: &str,
     matcher: &S3GlobMatcher,
-) -> Result<(Vec<aws_sdk_s3::types::Object>, usize)> {
-    let mut matching_objects = Vec::new();
+    total_objects: Arc<AtomicUsize>,
+    tx: UnboundedSender<PrefixResult>,
+) -> Result<()> {
     let mut paginator = client
         .list_objects_v2()
         .bucket(bucket)
@@ -500,11 +541,11 @@ async fn list_matching_objects(
         .into_paginator()
         .send();
 
-    let mut seen_objects = 0;
     while let Some(page) = paginator.next().await {
         let page = page?;
         if let Some(contents) = page.contents {
-            seen_objects += contents.len();
+            let mut matching_objects = Vec::new();
+            total_objects.fetch_add(contents.len(), Ordering::Relaxed);
             for obj in contents {
                 if let Some(key) = &obj.key {
                     if matcher.is_match(key) {
@@ -512,10 +553,13 @@ async fn list_matching_objects(
                     }
                 }
             }
+            tx.send(PrefixResult {
+                prefix: prefix.to_string(),
+                matching_objects,
+            })?;
         }
     }
-
-    Ok((matching_objects, seen_objects))
+    Ok(())
 }
 
 fn log_directive(loglevel: u8) -> Option<&'static str> {
@@ -528,16 +572,16 @@ fn log_directive(loglevel: u8) -> Option<&'static str> {
 }
 
 pub(crate) fn setup_logging(directive: Option<&str>) {
-    // get logging directive from S3GLOB_LOG or RUST_LOG, preferring S3GLOB_LOG,
-    // but some folks just expect RUST_LOG to work with rust programs.
-    let mut env_filter = if std::env::var("S3GLOB_LOG").is_ok() {
-        tracing_subscriber::EnvFilter::from_env("S3GLOB_LOG")
-    } else {
-        tracing_subscriber::EnvFilter::from_env("RUST_LOG")
-    };
+    let mut env_filter = tracing_subscriber::EnvFilter::new("s3glob=warn");
+    if let Ok(env) = std::env::var("S3GLOB_LOG") {
+        env_filter = env_filter.add_directive(env.parse().unwrap());
+    } else if let Ok(env) = std::env::var("RUST_LOG") {
+        env_filter = env_filter.add_directive(env.parse().unwrap());
+    }
     if let Some(directive) = directive {
         env_filter = env_filter.add_directive(directive.parse().unwrap());
     }
+
     let use_ansi = std::io::stderr().is_terminal()
         || std::env::var("CLICOLOR").is_ok_and(|v| ["1", "true"].contains(&v.as_str()))
         || std::env::var("CLICOLOR_FORCE").is_ok_and(|v| ["1", "true"].contains(&v.as_str()));
