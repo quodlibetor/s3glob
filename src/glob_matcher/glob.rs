@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use itertools::Itertools as _;
 
 use super::prefix_join;
@@ -165,14 +165,36 @@ pub(super) fn parse_pattern(raw: &str) -> Result<Glob> {
             let mut alts: Vec<char> = Vec::new();
             let mut ended = false;
             let mut is_negated = false;
-            for chr in iter {
+            while let Some(chr) = iter.next() {
                 raw.push(chr);
                 match chr {
+                    '!' if raw.len() == 2 => {
+                        is_negated = true;
+                    }
                     ']' if raw.len() == 2 || (is_negated && raw.len() == 3) => {
                         alts.push(chr);
                     }
-                    '!' if raw.len() == 2 => {
-                        is_negated = true;
+                    '-' if (!is_negated && raw.len() != 2) || (is_negated && raw.len() != 3) => {
+                        // collect the range
+                        let next_char = iter
+                            .next()
+                            .ok_or_else(|| anyhow!("Character class is not closed: {}", raw))?;
+                        if next_char == ']' {
+                            raw.push(next_char);
+                            bail!("Range is not closed: {}", raw);
+                        }
+                        // the first character is the start of the range and
+                        // will be re-inserted next in the coming loop
+                        let start = alts.pop().unwrap();
+                        let end = next_char;
+                        raw.push(end);
+                        if end <= start {
+                            bail!("Range is invalid (end <= start): {start}-{end} in {raw}");
+                        }
+                        for c in start..=end {
+                            alts.push(c);
+                        }
+                        continue;
                     }
                     ']' => {
                         ended = true;
@@ -182,7 +204,11 @@ pub(super) fn parse_pattern(raw: &str) -> Result<Glob> {
                 }
             }
             if !ended {
-                bail!("Alternation has no closing bracket (missing ']'): {}", raw);
+                if raw == "[]" {
+                    bail!("Empty character class: {}", raw);
+                } else {
+                    bail!("Alternation has no closing bracket (missing ']'): {}", raw);
+                }
             }
             if is_negated {
                 Glob::Any {
@@ -342,6 +368,159 @@ mod tests {
         assert_scanner_part!(&scanner.parts[1], Any("*"));
         assert_scanner_part!(&scanner.parts[2], Choice(vec!["foo/baz"]));
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_character_range() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[a-c]".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Choice(vec!["a", "b", "c"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_numeric_range() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[0-2]".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Choice(vec!["0", "1", "2"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_multiple_ranges() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[a-c0-2]".to_string(), "/")?;
+
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Choice(vec!["a", "b", "c", "0", "1", "2"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_range_with_single_chars() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[a-cx]".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Choice(vec!["a", "b", "c", "x"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_range_with_dash_at_start() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[-a-c]".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Choice(vec!["-", "a", "b", "c"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_range_with_dash_at_end() -> Result<()> {
+        let result = S3GlobMatcher::parse("[a-c-]".to_string(), "/");
+
+        assert!(result.is_err());
+        let err_msg = format!("{:#?}", result.unwrap_err());
+        println!("err_msg: {err_msg}");
+        assert!(err_msg.contains("Range is not closed: [a-c-"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_range_missing_end() {
+        let result = S3GlobMatcher::parse("[a-]".to_string(), "/");
+        assert!(result.is_err());
+        let err_msg = format!("{:#?}", result.unwrap_err());
+        println!("err_msg: {err_msg}");
+        assert!(err_msg.contains("Range is not closed: [a-"));
+    }
+
+    #[test]
+    fn test_parse_range_with_negation() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[!a-c]".to_string(), "/")?;
+
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Any("[!a-c]"),
+            &["d", "x", "0"],
+            !&["a", "b", "c"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_range_end_less_than_start() {
+        let result = S3GlobMatcher::parse("[c-a]".to_string(), "/");
+        assert!(result.is_err());
+        let err_msg = format!("{:#?}", result.unwrap_err());
+        println!("err_msg: {err_msg}");
+        assert!(err_msg.contains("Range is invalid (end <= start): c-a in [c-a"));
+    }
+
+    #[test]
+    fn test_parse_negated_dash() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[!-]".to_string(), "/")?;
+
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Any("[!-]"),
+            &["a", "b", "1", "[", "]"], // should match any character
+            !&["-"]                     // should not match dash
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_unicode_range() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[α-γ]".to_string(), "/")?;
+
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Choice(vec!["α", "β", "γ"]) // Greek letters alpha through gamma
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_unicode_with_ascii_range() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[A-Cα-γ]".to_string(), "/")?;
+
+        assert_scanner_part!(
+            &scanner.parts[0],
+            Choice(vec!["A", "B", "C", "α", "β", "γ"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_emoji_range() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[😀-😃]".to_string(), "/")?;
+
+        assert_scanner_part!(&scanner.parts[0], Choice(vec!["😀", "😁", "😂", "😃"]));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_unclosed_character_class() {
+        let result = S3GlobMatcher::parse("[a-c".to_string(), "/");
+        assert!(result.is_err());
+        let err_msg = format!("{:#?}", result.unwrap_err());
+        println!("err_msg: {err_msg}");
+        assert!(err_msg.contains("Alternation has no closing bracket (missing ']'): [a-c"));
+    }
+
+    #[test]
+    fn test_parse_empty_character_class() {
+        let result = S3GlobMatcher::parse("[]".to_string(), "/");
+        assert!(result.is_err());
+        let err_msg = format!("{:#?}", result.unwrap_err());
+        println!("err_msg: {err_msg}");
+        assert!(err_msg.contains("Empty character class: []"));
+    }
+
+    #[test]
+    fn test_parse_range_dash_only() -> Result<()> {
+        let scanner = S3GlobMatcher::parse("[-]".to_string(), "/")?;
+        assert_scanner_part!(&scanner.parts[0], Choice(vec!["-"]));
         Ok(())
     }
 }
