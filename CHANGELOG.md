@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.6 - 2025-02-17
+
+### 🐛 Bug Fixes
+
+- Support character ranges [a-c] in prefix generation
+
 ## v0.2.5 - 2025-02-15
 
 ### 🚀 Features
