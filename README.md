@@ -12,7 +12,7 @@ These two commands are equivalent:
 
 ```bash
 s3glob ls "s3://my-bucket/a*/something/1*/other/*"
-s3glob ls    "my-bucket/a*/something/1*/other/*"
+s3glob ls      "my-bucket/a*/something/1*/other/*"
 ```
 
 Output is in the same format as `aws s3 ls`, but you can change it with the `--format` flag.
