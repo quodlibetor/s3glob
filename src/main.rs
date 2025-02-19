@@ -576,7 +576,7 @@ fn log_directive(loglevel: u8) -> Option<&'static str> {
         0 => None,
         1 => Some("s3glob=debug"),
         2 => Some("s3glob=trace"),
-        _ => Some("debug,s3glob=trace"),
+        _ => Some("trace"),
     }
 }
 
