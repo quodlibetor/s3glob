@@ -138,7 +138,7 @@ async fn test_format_patterns(
 }
 
 #[rstest]
-#[case("prefix/2024/file.txt", &["prefix/2024/file.txt"])]
+#[case("prefix/2024/file1.txt", &["prefix/2024/file1.txt"])]
 #[case("prefix/2024/file*.txt", &[
     "prefix/2024/file1.txt",
     "prefix/2024/file2.txt",

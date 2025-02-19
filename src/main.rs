@@ -233,7 +233,15 @@ async fn run(opts: Opts) -> Result<()> {
 
     let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
     let matcher = S3GlobMatcher::parse(raw_pattern, &opts.delimiter.to_string())?;
-    let mut prefixes = matcher.find_prefixes(engine).await?;
+    let mut prefixes = match matcher.find_prefixes(engine).await {
+        Ok(prefixes) => prefixes,
+        Err(err) => {
+            // the matcher prints some progress info to stderr, if there's an
+            // error we should make sure to add a newline
+            eprintln!();
+            return Err(err);
+        }
+    };
     trace!(?prefixes, "matcher generated prefixes");
     debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
 
@@ -343,6 +351,7 @@ async fn run(opts: Opts) -> Result<()> {
                     total_prefixes
                 );
             }
+            eprintln!();
             let objects = matching_objects;
             let obj_count = objects.len();
             let base_path = Path::new(&dest);
@@ -567,7 +576,7 @@ fn log_directive(loglevel: u8) -> Option<&'static str> {
         0 => None,
         1 => Some("s3glob=debug"),
         2 => Some("s3glob=trace"),
-        _ => Some("debug,s3glob=trace"),
+        _ => Some("trace"),
     }
 }
 
