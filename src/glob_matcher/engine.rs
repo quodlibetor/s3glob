@@ -1,10 +1,10 @@
+use std::collections::BTreeSet;
+
 use anyhow::{Context as _, Result};
 use aws_sdk_s3::Client;
 use num_format::{Locale, ToFormattedString as _};
 use tracing::{debug, trace, warn};
 
-#[cfg(test)]
-use std::collections::BTreeSet;
 #[cfg(test)]
 use std::sync::{Arc, Mutex};
 #[cfg(test)]
@@ -13,7 +13,10 @@ use tracing::info;
 #[async_trait::async_trait]
 pub trait Engine: Send + Sync + 'static {
     async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>>;
-    async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>>;
+    async fn check_prefixes<P>(&mut self, prefixes: P) -> Result<BTreeSet<String>>
+    where
+        P: IntoIterator<Item = String> + Send + Sync + 'static,
+        P::IntoIter: Send + Sync + 'static;
 }
 
 #[derive(Debug, Clone)]
@@ -76,9 +79,14 @@ impl Engine for S3Engine {
 
     // TODO: convert this to take &mut prefixes so that we don't have to
     // reallocate the vector on each call
-    async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>> {
-        debug!(prefix_count = prefixes.len(), "checking prefixes");
-        let (tx, mut rx) = tokio::sync::mpsc::channel(prefixes.len());
+    async fn check_prefixes<P>(&mut self, prefixes: P) -> Result<BTreeSet<String>>
+    where
+        P: IntoIterator<Item = String> + Send + Sync + 'static,
+        P::IntoIter: Send + Sync + 'static,
+    {
+        debug!("checking prefixes");
+        let prefixes = prefixes.into_iter();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(prefixes.size_hint().0);
 
         for prefix in prefixes {
             let client = self.client.clone();
@@ -110,9 +118,9 @@ impl Engine for S3Engine {
 
         drop(tx);
 
-        let mut new_prefixes = Vec::new();
+        let mut new_prefixes = BTreeSet::new();
         while let Some(result) = rx.recv().await {
-            new_prefixes.push(result.context("checking prefix exists")?);
+            new_prefixes.insert(result.context("checking prefix exists")?);
         }
         debug!(valid_prefix_count = new_prefixes.len(), "checked prefixes");
 
@@ -143,16 +151,21 @@ impl Engine for MockS3Engine {
         found
     }
 
-    async fn check_prefixes(&mut self, prefixes: &[String]) -> Result<Vec<String>> {
+    async fn check_prefixes<P>(&mut self, prefixes: P) -> Result<BTreeSet<String>>
+    where
+        P: IntoIterator<Item = String> + Send + Sync + 'static,
+        P::IntoIter: Send + Sync + 'static,
+    {
+        let prefixes = prefixes.into_iter().collect::<Vec<_>>();
         info!(?prefixes, "MockS3 checking prefixes");
-        let mut valid_prefixes = Vec::new();
+        let mut valid_prefixes = BTreeSet::new();
 
-        for prefix in prefixes {
+        for prefix in &prefixes {
             // Use ListObjectsV2 with max-keys=1 to efficiently check existence
             let response = self.scan_prefixes_inner(prefix, "/")?;
 
             if !response.is_empty() {
-                valid_prefixes.push(prefix.clone());
+                valid_prefixes.insert(prefix.to_string());
             }
         }
 
@@ -196,7 +209,7 @@ impl MockS3Engine {
         }
         assert!(
             calls.len() == expected.len(),
-            "Got {} calls, expected {}. Actual calls: {:#?}",
+            "Got {} calls, expected {}. Actual calls: {:?}",
             calls.len(),
             expected.len(),
             calls
