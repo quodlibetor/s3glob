@@ -143,7 +143,12 @@ impl S3GlobMatcher {
                 debug!("no more delimiters, stopping prefix generation");
                 break;
             }
-            eprint!("\rDiscovering prefixes: {:>6}", prefixes.len());
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                // don't overwrite log messages
+                eprintln!("Discovering prefixes: {:>6}", prefixes.len());
+            } else {
+                eprint!("\rDiscovering prefixes: {:>6}", prefixes.len());
+            }
             // We always want to scan for things including the last part,
             // finding more prefixes in it is guaranteed to be slower than
             // just searching because we have to do an api call to check each
