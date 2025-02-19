@@ -6,7 +6,7 @@ const GLOB_CHARS: &[char] = &['*', '?', '[', '{'];
 
 use std::collections::BTreeSet;
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
 use glob::Glob;
 use globset::GlobMatcher;
 use itertools::Itertools as _;
@@ -188,21 +188,19 @@ impl S3GlobMatcher {
                         drop(tx);
 
                         let mut new_prefixes = Vec::new();
-                        let mut new_prefix_count = new_prefixes.len();
+                        let mut new_prefix_count = 0;
                         while let Some(result) = rx.recv().await {
-                            let (scanned_prefix, results) = result.context("scanning prefixes")?;
+                            let (scanned_prefix, mut results) =
+                                result.context("scanning prefixes")?;
                             let result_len = results.len();
                             trace!(
                                 scanned_prefix,
-                                scanned_results = result_len,
-                                new_prefix_count,
+                                scanned_results_count = result_len,
+                                scanned_results = ?results,
                                 "Scanning for any, got result from task"
                             );
-                            if !results.is_empty() {
-                                new_prefixes.extend(results);
-                            } else {
-                                new_prefixes.push(scanned_prefix);
-                            }
+                            results.retain(|r| !prefixes.contains(r));
+                            new_prefixes.extend(results);
                             new_prefix_count = new_prefixes.len();
                             if new_prefix_count >= MAX_PREFIXES {
                                 debug!(
@@ -215,7 +213,7 @@ impl S3GlobMatcher {
                                 break;
                             }
                         }
-                        // don't overwrite if we gave up early
+                        // don't overwrite if we gave up early, we'll break at the top of the loop
                         if new_prefix_count < MAX_PREFIXES {
                             prefixes = new_prefixes;
                         }
@@ -266,7 +264,7 @@ impl S3GlobMatcher {
                             );
                             break;
                         }
-                        prefixes = engine.check_prefixes(&new_prefixes).await?;
+                        prefixes = check_prefixes(&mut engine, &prefixes, &new_prefixes).await?;
                     } else {
                         // Build up the filters and appends
                         let mut filters = BTreeSet::new();
@@ -326,22 +324,31 @@ impl S3GlobMatcher {
                                 }
                             }
                             new_prefixes
+                        } else if appends.is_empty() {
+                            debug!("no appends, filtering");
+                            let mut new_prefixes = Vec::with_capacity(prefixes.len());
+                            for prefix in &prefixes {
+                                if filter.is_match(prefix) {
+                                    new_prefixes.push(prefix.clone());
+                                }
+                            }
+                            new_prefixes
                         } else {
                             debug!("filtering and appending");
                             let mut new_prefixes = Vec::with_capacity(prefixes.len());
                             for prefix in &prefixes {
                                 if filter.is_match(prefix) {
-                                    // we only need to append if it's not already matched
-                                    if !appends.is_empty() && !append_matcher.is_match(prefix) {
+                                    // we only need to add alts if it's not already matched
+                                    if append_matcher.is_match(prefix) {
+                                        new_prefixes.push(prefix.clone());
+                                    } else {
                                         for alt in &appends {
                                             new_prefixes.push(prefix_join(prefix, alt));
                                         }
-                                    } else {
-                                        new_prefixes.push(prefix.to_string());
                                     }
                                 }
                             }
-                            trace!(prefixes = ?new_prefixes, "filtered and appended prefixes");
+                            trace!(?new_prefixes, "filtered and appended prefixes");
                             new_prefixes
                         };
 
@@ -351,12 +358,13 @@ impl S3GlobMatcher {
                                 // than scanning existing prefixes.
                                 debug!(
                                     new_prefix_count = new_prefixes.len(),
-                                    "Appends generated over 1,000 prefixes, using prefixes from previous part"
+                                    "Appends generated over {MAX_PREFIXES} prefixes, using prefixes from previous part"
                                 );
                                 break;
                             }
                             trace!(new_prefixes = ?new_prefixes, new_prefix_count = new_prefixes.len(), "checking appended prefixes");
-                            prefixes = engine.check_prefixes(&new_prefixes).await?;
+                            prefixes =
+                                check_prefixes(&mut engine, &prefixes, &new_prefixes).await?;
                         } else {
                             debug!("no appends, using new prefixes");
                             prefixes = new_prefixes;
@@ -406,6 +414,43 @@ impl S3GlobMatcher {
     fn set_min_prefixes(&mut self, min_prefixes: usize) {
         self.min_prefixes = min_prefixes;
     }
+}
+
+async fn check_prefixes(
+    engine: &mut (impl Engine + Clone),
+    prefixes: &[String],
+    new_prefixes: &[String],
+) -> Result<Vec<String>, anyhow::Error> {
+    if prefixes.is_empty() || new_prefixes.is_empty() {
+        bail!("Surprisingly, no prefixes to build off of and no prefixes found");
+    }
+    let checked_prefixes = engine.check_prefixes(new_prefixes).await?;
+    if checked_prefixes.is_empty() {
+        let mut sorted_new_prefixes = new_prefixes.to_vec();
+        sorted_new_prefixes.sort_unstable();
+        let mut sorted_base_prefixes = prefixes.to_vec();
+        sorted_base_prefixes.sort_unstable();
+        let mut message = vec!["Searched for prefixes do not exist in the bucket:".to_string()];
+        let mut new_idx = 0;
+        for prefix in sorted_base_prefixes {
+            message.push(format!("  {}", prefix));
+            let mut new_prefix = sorted_new_prefixes.get(new_idx);
+            while new_prefix.is_some()
+                && &prefix <= new_prefix.unwrap()
+                && new_prefix.unwrap().starts_with(&prefix)
+            {
+                message.push(format!(
+                    "    INVALID: {}",
+                    &sorted_new_prefixes[new_idx][prefix.len()..]
+                ));
+                new_idx += 1;
+                new_prefix = sorted_new_prefixes.get(new_idx);
+            }
+        }
+
+        bail!("{}", message.join("\n"));
+    }
+    Ok(checked_prefixes)
 }
 
 fn prefix_join(prefix: &str, alt: &str) -> String {
