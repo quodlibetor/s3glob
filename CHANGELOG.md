@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.2.7 - 2025-02-19
+
+### 🚀 Features
+
+- Better error when all generated prefixes become invalid
+
+### 🐛 Bug Fixes
+
+- Small improvements to progress output
+- -vvv should generate a directive that parses
+
+### ⚡ Performance
+
+- Use a set for some "prefix contains" queries
+
+### ⚙️ Miscellaneous Tasks
+
+- Reduce toomanyrequests Docker Hub errors in CI (#9)
+- Add github attestations to dist release config (#11)
+
 ## v0.2.6 - 2025-02-17
 
 ### 🐛 Bug Fixes
