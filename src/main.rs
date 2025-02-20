@@ -8,8 +8,8 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
-use clap::{ArgAction, Parser, Subcommand};
-use glob_matcher::{S3Engine, S3GlobMatcher};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use glob_matcher::{S3Engine, S3GlobMatcher, GLOB_CHARS};
 use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
@@ -77,6 +77,16 @@ enum Command {
         /// The full key name will be reproduced in the directory, so multiple
         /// folders may be created.
         dest: String,
+
+        /// Control how S3 object keys are mapped to local file paths
+        ///
+        /// - absolute | abs: the full key path will be reproduced in the
+        ///   destination
+        /// - from-first-glob | g: the key path relative to the first path part
+        ///   containing a glob in the pattern will be reproduced in the
+        ///   destination
+        #[clap(short, long, verbatim_doc_comment, default_value = "from-first-glob")]
+        path_mode: PathType,
     },
 
     /// Learn how to tune s3glob's parallelism for better performance
@@ -118,6 +128,42 @@ enum Command {
         #[clap(short, hide = true)]
         no_sign_requests: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathType {
+    Abs,
+    Absolute,
+    G,
+    FromFirstGlob,
+}
+
+impl ValueEnum for PathType {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[
+            PathType::Absolute,
+            PathType::Abs,
+            PathType::FromFirstGlob,
+            PathType::G,
+        ]
+    }
+
+    fn from_str(s: &str, _ignore_case: bool) -> Result<Self, String> {
+        match s {
+            "absolute" | "abs" => Ok(PathType::Absolute),
+            "from-first-glob" | "g" => Ok(PathType::FromFirstGlob),
+            _ => Err(format!("invalid path type: {}", s)),
+        }
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        match self {
+            PathType::Abs => Some(clap::builder::PossibleValue::new("abs")),
+            PathType::Absolute => Some(clap::builder::PossibleValue::new("absolute")),
+            PathType::FromFirstGlob => Some(clap::builder::PossibleValue::new("from-first-glob")),
+            PathType::G => Some(clap::builder::PossibleValue::new("g")),
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -228,11 +274,11 @@ async fn run(opts: Opts) -> Result<()> {
     let client = create_s3_client(&opts, &bucket).await?;
 
     let prefix = raw_pattern
-        .find(['*', '?', '[', '{'])
+        .find(GLOB_CHARS)
         .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
 
     let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
-    let matcher = S3GlobMatcher::parse(raw_pattern, &opts.delimiter.to_string())?;
+    let matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
     let mut prefixes = match matcher.find_prefixes(engine).await {
         Ok(prefixes) => prefixes,
         Err(err) => {
@@ -331,7 +377,9 @@ async fn run(opts: Opts) -> Result<()> {
                 Duration::from_millis(start.elapsed().as_millis() as u64)
             );
         }
-        Command::Download { dest, .. } => {
+        Command::Download {
+            dest, path_mode, ..
+        } => {
             let mut matching_objects = Vec::new();
             let mut match_count = 0;
             while let Some(PrefixResult {
@@ -356,9 +404,13 @@ async fn run(opts: Opts) -> Result<()> {
             let obj_count = objects.len();
             let base_path = Path::new(&dest);
             let mut total_bytes = 0_usize;
+            let prefix_to_strip = extract_prefix_to_strip(&raw_pattern, path_mode);
             for (i, obj) in objects.iter().enumerate() {
                 let key = obj.key.as_ref().unwrap();
-                let path = base_path.join(key);
+                let key_suffix = key
+                    .strip_prefix(&prefix_to_strip)
+                    .expect("all found objects will include the prefix");
+                let path = base_path.join(key_suffix);
                 let dir = path.parent().unwrap();
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("Creating directory: {}", dir.display()))?;
@@ -405,6 +457,23 @@ async fn run(opts: Opts) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn extract_prefix_to_strip(raw_pattern: &str, path_mode: PathType) -> String {
+    match path_mode {
+        PathType::Abs | PathType::Absolute => String::new(),
+        PathType::FromFirstGlob | PathType::G => {
+            let up_to_glob: String = raw_pattern
+                .chars()
+                .take_while(|c| !GLOB_CHARS.contains(c))
+                .collect();
+            // find the last slash in the prefix and only include that
+            match up_to_glob.rfind('/') {
+                Some(slash_idx) => up_to_glob[..slash_idx + 1].to_string(),
+                None => up_to_glob,
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -607,6 +676,7 @@ pub(crate) fn setup_logging(directive: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::comparison_to_empty)]
     use aws_sdk_s3::types::Object;
     use rstest::rstest;
 
@@ -629,5 +699,55 @@ mod tests {
     #[test]
     fn test_format_invalid_variable() {
         assert!(compile_format("{invalid_var}").is_err());
+    }
+
+    macro_rules! assert_extract_prefix_to_strip {
+        ($pattern:expr, $path_mode:expr, $expected:expr) => {
+            let actual = extract_prefix_to_strip($pattern, $path_mode);
+            assert2::check!(
+                actual == $expected,
+                "input: {} path_mode: {:?}",
+                $pattern,
+                $path_mode,
+            );
+        };
+    }
+
+    #[test]
+    fn test_extract_prefix_to_strip() {
+        // Test absolute path mode
+        assert_extract_prefix_to_strip!("prefix/path/to/*.txt", PathType::Absolute, "");
+        assert_extract_prefix_to_strip!("bucket/deep/path/*.txt", PathType::Abs, "");
+
+        // Test from-first-glob path mode
+        assert_extract_prefix_to_strip!(
+            "prefix/path/to/*.txt",
+            PathType::FromFirstGlob,
+            "prefix/path/to/"
+        );
+        assert_extract_prefix_to_strip!(
+            "prefix/path/*/more/*.txt",
+            PathType::FromFirstGlob,
+            "prefix/path/"
+        );
+        assert_extract_prefix_to_strip!("prefix/*.txt", PathType::FromFirstGlob, "prefix/");
+        assert_extract_prefix_to_strip!("*.txt", PathType::FromFirstGlob, "");
+        assert_extract_prefix_to_strip!("prefix/a.txt", PathType::FromFirstGlob, "prefix/");
+        // Test with different glob characters
+        assert_extract_prefix_to_strip!(
+            "prefix/path/to/[abc]/*.txt",
+            PathType::FromFirstGlob,
+            "prefix/path/to/"
+        );
+        assert_extract_prefix_to_strip!(
+            "prefix/path/to/?/*.txt",
+            PathType::FromFirstGlob,
+            "prefix/path/to/"
+        );
+        assert_extract_prefix_to_strip!(
+            "prefix/path/{a,b}/*.txt",
+            PathType::FromFirstGlob,
+            "prefix/path/"
+        );
     }
 }

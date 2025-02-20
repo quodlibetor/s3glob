@@ -80,7 +80,12 @@ async fn test_s3glob_pattern_matching(
         let tempdir = TempDir::new()?;
         let mut cmd = run_s3glob(
             port,
-            &[command, uri.as_str(), tempdir.path().to_str().unwrap()],
+            &[
+                command,
+                "-pabs",
+                uri.as_str(),
+                tempdir.path().to_str().unwrap(),
+            ],
         )?;
         let _ = cmd.assert().success();
         for object in &test_objects {
@@ -91,6 +96,59 @@ async fn test_s3glob_pattern_matching(
             }
         }
     };
+
+    Ok(())
+}
+
+#[rstest]
+#[case("prefix/2024-01/file1.txt", &["file1.txt"])]
+#[case("prefix/2024-01/file*.txt", &["file1.txt", "file2.txt"])]
+#[case("prefix/2024-*/file1.txt", &["2024-02/file1.txt"])]
+#[case("prefix/2024-*/nested/*3*", &["2024-02/nested/file3.txt"])]
+#[case("prefix/2024-0{1,3}/*", &["2024-01/file1.txt", "2024-03/file5.txt"])]
+#[tokio::test]
+async fn test_download_prefix_from_first_glob(
+    #[case] glob: &str,
+    #[case] expected: &[&str],
+) -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let test_objects = vec![
+        "prefix/2024-01/file1.txt",
+        "prefix/2024-01/file2.txt",
+        "prefix/2024-02/nested/file3.txt",
+        "prefix/2024-02/nested/file4.txt",
+        "prefix/2024-03/file5.txt",
+    ];
+    for key in &test_objects {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let tempdir = TempDir::new()?;
+
+    let mut cmd = run_s3glob(
+        port,
+        &[
+            "dl",
+            "-p",
+            "from-first-glob",
+            format!("s3://{}/{}", bucket, glob).as_str(),
+            tempdir.path().to_str().unwrap(),
+        ],
+    )?;
+
+    let _ = cmd.assert().success();
+
+    for object in test_objects {
+        if expected.contains(&object) {
+            tempdir.child(object).assert(predicate::path::exists());
+        } else {
+            tempdir.child(object).assert(predicate::path::missing());
+        }
+    }
 
     Ok(())
 }
@@ -179,7 +237,7 @@ async fn test_patterns_in_file_not_path_component(
     } else {
         let tempdir = TempDir::new()?;
         let out_path = tempdir.path().to_str().unwrap();
-        let mut cmd = run_s3glob(port, &[command, needle.as_str(), out_path])?;
+        let mut cmd = run_s3glob(port, &[command, "-pabs", needle.as_str(), out_path])?;
         let _ = cmd.assert().success();
         for object in &test_objects {
             if expected.contains(object) {

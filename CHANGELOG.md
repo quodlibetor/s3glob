@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.3.0 - 2025-02-20
+
+### 🚀 Features
+
+- Add --path-mode and change default download behavior to only keep paths after glob patterns
+
 ## v0.2.7 - 2025-02-19
 
 ### 🚀 Features
