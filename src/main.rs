@@ -1,10 +1,10 @@
-use std::io::{IsTerminal as _, Write as _};
-use std::path::Path;
+use std::io::IsTerminal as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context as _, Result};
+use anyhow::{anyhow, bail, Result};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
@@ -13,9 +13,10 @@ use glob_matcher::{S3Engine, S3GlobMatcher, GLOB_CHARS};
 use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
+use tokio::io::AsyncWriteExt as _;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, trace};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::{debug, trace, warn};
 
 mod glob_matcher;
 
@@ -380,18 +381,25 @@ async fn run(opts: Opts) -> Result<()> {
         Command::Download {
             dest, path_mode, ..
         } => {
-            let mut matching_objects = Vec::new();
-            let mut match_count = 0;
+            let mut total_matches = 0;
+            let pools = DlPools::new();
+            let prefix_to_strip = extract_prefix_to_strip(&raw_pattern, path_mode);
+            let (ntfctn_tx, mut ntfctn_rx) = tokio::sync::mpsc::unbounded_channel::<Notification>();
+            let base_path = PathBuf::from(dest);
+            let dl = Downloader::new(client, bucket, prefix_to_strip, base_path, ntfctn_tx);
             while let Some(PrefixResult {
                 matching_objects: mo,
                 ..
             }) = rx.recv().await
             {
-                match_count += mo.len();
-                matching_objects.extend(mo);
+                total_matches += mo.len();
+                for obj in mo {
+                    pools.download_object(dl.fresh(), obj);
+                }
+
                 eprint!(
                     "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
-                    match_count.to_formatted_string(&Locale::en),
+                    total_matches.to_formatted_string(&Locale::en),
                     total_objects
                         .load(Ordering::Relaxed)
                         .to_formatted_string(&Locale::en),
@@ -399,57 +407,53 @@ async fn run(opts: Opts) -> Result<()> {
                     total_prefixes
                 );
             }
+            // close the tx so the downloaders know to finish
+            drop(pools);
             eprintln!();
-            let objects = matching_objects;
-            let obj_count = objects.len();
-            let base_path = Path::new(&dest);
+            let start_time = Instant::now();
+            let mut downloaded_matches = 0;
             let mut total_bytes = 0_usize;
-            let prefix_to_strip = extract_prefix_to_strip(&raw_pattern, path_mode);
-            for (i, obj) in objects.iter().enumerate() {
-                let key = obj.key.as_ref().unwrap();
-                let key_suffix = key
-                    .strip_prefix(&prefix_to_strip)
-                    .expect("all found objects will include the prefix");
-                let path = base_path.join(key_suffix);
-                let dir = path.parent().unwrap();
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("Creating directory: {}", dir.display()))?;
-                let mut obj = client.get_object().bucket(&bucket).key(key).send().await?;
-                let temp_path = path.with_extension(format!(".s3glob-tmp-{i}"));
-                let mut file = std::fs::File::create(&temp_path)?;
-                while let Some(bytes) = obj
-                    .body
-                    .try_next()
-                    .await
-                    .context("failed to read from S3 download stream")?
-                {
-                    file.write_all(&bytes).with_context(|| {
-                        format!("failed to write to file: {}", &temp_path.display())
-                    })?;
-                    total_bytes += bytes.len();
-                    eprint!(
-                        "\rdownloaded {}/{} objects, {}",
-                        i,
-                        obj_count,
-                        SizeFormatter::new(total_bytes as u64, decimal_format())
-                    );
+            let mut speed = 0.0;
+            let mut files = Vec::with_capacity(total_matches);
+            while let Some(n) = ntfctn_rx.recv().await {
+                match n {
+                    Notification::ObjectDownloaded(path) => {
+                        downloaded_matches += 1;
+                        files.push(path.display().to_string());
+                    }
+                    Notification::BytesDownloaded(bytes) => {
+                        total_bytes += bytes;
+                    }
                 }
-                std::fs::rename(&temp_path, &path).with_context(|| {
-                    format!(
-                        "failed to rename file: {} -> {}",
-                        &temp_path.display(),
-                        &path.display()
-                    )
-                })?;
-
+                let elapsed = start_time.elapsed().as_secs_f64();
+                speed = total_bytes as f64 / elapsed;
                 eprint!(
-                    "\rdownloaded {}/{} objects, {}",
-                    i + 1,
-                    obj_count,
-                    SizeFormatter::new(total_bytes as u64, decimal_format())
+                    "\rdownloaded {}/{} objects, {:>7}   {:>10}/s",
+                    downloaded_matches,
+                    total_matches,
+                    SizeFormatter::new(total_bytes as u64, decimal_format()).to_string(),
+                    SizeFormatter::new(speed.round() as u64, decimal_format()).to_string(),
                 );
+                // TODO: the ntfc receiver should shut down, shouldn't it?
+                if downloaded_matches >= total_matches {
+                    break;
+                }
             }
-            eprintln!();
+            eprintln!("\n");
+
+            files.sort_unstable();
+            for path in files {
+                println!("{}", path);
+            }
+            let dl_ms = start_time.elapsed().as_millis() as u64;
+            eprintln!(
+                "\ndiscovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
+                downloaded_matches,
+                Duration::from_millis(start.elapsed().as_millis() as u64 - dl_ms),
+                SizeFormatter::new(total_bytes as u64, decimal_format()),
+                Duration::from_millis(dl_ms),
+                SizeFormatter::new(speed.round() as u64, decimal_format()),
+            );
         }
         Command::Parallelism { .. } => {
             eprintln!("This is just for documentation, run instead: s3glob help parallelism");
@@ -457,6 +461,195 @@ async fn run(opts: Opts) -> Result<()> {
     }
 
     Ok(())
+}
+
+struct DlPools {
+    two_hundred_kb: UnboundedSender<(Downloader, Object)>,
+    one_mb: UnboundedSender<(Downloader, Object)>,
+    ten_mb: UnboundedSender<(Downloader, Object)>,
+    more: UnboundedSender<(Downloader, Object)>,
+}
+
+impl DlPools {
+    /// Loose heuristics based on pretty fast internet, I haven done a ton of benchmarking
+    fn new() -> DlPools {
+        let (two_hundred_kb, rx) = tokio::sync::mpsc::unbounded_channel();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(500));
+        start_threadpool(semaphore, rx);
+        let (one_mb, rx) = tokio::sync::mpsc::unbounded_channel();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(50));
+        start_threadpool(semaphore, rx);
+
+        let (ten_mb, rx) = tokio::sync::mpsc::unbounded_channel();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+        start_threadpool(semaphore, rx);
+
+        let (more, rx) = tokio::sync::mpsc::unbounded_channel();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
+        start_threadpool(semaphore, rx);
+
+        Self {
+            two_hundred_kb,
+            one_mb,
+            ten_mb,
+            more,
+        }
+    }
+
+    fn download_object(&self, dl: Downloader, object: Object) {
+        let tx = if let Some(size) = object.size {
+            if size < 200_000 {
+                &self.two_hundred_kb
+            } else if size < 1_000_000 {
+                &self.one_mb
+            } else if size < 10_000_000 {
+                &self.ten_mb
+            } else {
+                &self.more
+            }
+        } else {
+            debug!(?object, "object size not known, using more pool");
+            &self.more
+        };
+        tx.send((dl, object))
+            .expect("send on channel should succeed");
+    }
+}
+
+fn start_threadpool(
+    semaphore: Arc<tokio::sync::Semaphore>,
+    mut rx: UnboundedReceiver<(Downloader, Object)>,
+) {
+    tokio::spawn(async move {
+        while let Some((dl, obj)) = rx.recv().await {
+            let permit = semaphore.clone().acquire_owned().await;
+            tokio::spawn(async move {
+                dl.download_object(obj).await;
+                drop(permit);
+            });
+        }
+    });
+}
+
+#[derive(Debug)]
+struct Downloader {
+    client: Client,
+    bucket: String,
+    prefix_to_strip: String,
+    base_path: PathBuf,
+    obj_counter: Arc<AtomicUsize>,
+    obj_id: usize,
+    notifier: UnboundedSender<Notification>,
+}
+
+#[derive(Debug)]
+enum Notification {
+    ObjectDownloaded(PathBuf),
+    BytesDownloaded(usize),
+}
+
+impl Downloader {
+    fn new(
+        client: Client,
+        bucket: String,
+        prefix_to_strip: String,
+        base_path: PathBuf,
+        notifier: UnboundedSender<Notification>,
+    ) -> Self {
+        Self {
+            client,
+            bucket,
+            obj_counter: Arc::new(AtomicUsize::new(0)),
+            obj_id: 0,
+            notifier,
+            base_path,
+            prefix_to_strip,
+        }
+    }
+
+    /// Create a downloader that can safely download another object
+    fn fresh(&self) -> Self {
+        let obj_id = add_atomic(&self.obj_counter, 1);
+        Self {
+            client: self.client.clone(),
+            bucket: self.bucket.clone(),
+            obj_counter: Arc::clone(&self.obj_counter),
+            obj_id,
+            notifier: self.notifier.clone(),
+            prefix_to_strip: self.prefix_to_strip.clone(),
+            base_path: self.base_path.clone(),
+        }
+    }
+
+    async fn download_object(self, obj: Object) {
+        let key = obj.key.as_ref().unwrap();
+        let key_suffix = key
+            .strip_prefix(&self.prefix_to_strip)
+            .expect("all found objects will include the prefix");
+        let path = self.base_path.join(key_suffix);
+        let dir = path.parent().unwrap();
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("Failed to create directory {}: {}", dir.display(), e);
+            return;
+        };
+        let result = self
+            .client
+            .get_object()
+            .bucket(self.bucket)
+            .key(key)
+            .send()
+            .await;
+        let Ok(mut obj) = result else {
+            warn!("Failed to download object {}", key);
+            return;
+        };
+        let temp_path = path.with_extension(format!(".s3glob-tmp-{}", self.obj_id));
+        let mut file = match tokio::fs::File::create(&temp_path).await {
+            Ok(file) => file,
+            Err(e) => {
+                warn!("Failed to create file {}: {}", temp_path.display(), e);
+                return;
+            }
+        };
+        let mut res = obj.body.try_next().await;
+        loop {
+            match res {
+                Ok(Some(bytes)) => {
+                    if let Err(e) = file.write_all(&bytes).await {
+                        warn!("Failed to write to file {}: {}", path.display(), e);
+                        return;
+                    };
+                    self.notifier
+                        .send(Notification::BytesDownloaded(bytes.len()))
+                        .expect("can send on channel");
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("Failed to download object {}: {}", key, e);
+                    return;
+                }
+            }
+            res = obj.body.try_next().await;
+        }
+        if let Err(e) = file.flush().await {
+            warn!("Failed to flush file {}: {}", temp_path.display(), e);
+            drop(file);
+            return;
+        };
+        drop(file);
+        if let Err(e) = std::fs::rename(&temp_path, &path) {
+            warn!(
+                "Failed to rename file {} -> {}: {}",
+                &temp_path.display(),
+                path.display(),
+                e
+            );
+            return;
+        };
+        self.notifier
+            .send(Notification::ObjectDownloaded(path))
+            .expect("send on our channel should succeed");
+    }
 }
 
 fn extract_prefix_to_strip(raw_pattern: &str, path_mode: PathType) -> String {
