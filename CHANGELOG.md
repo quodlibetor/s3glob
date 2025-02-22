@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.3.1 - 2025-02-22
+
+### ⚡ Performance
+
+- Download objects in parallel for (potentially) huge speedups (#13)
+
 ## v0.3.0 - 2025-02-20
 
 ### 🚀 Features
