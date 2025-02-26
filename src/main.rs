@@ -463,6 +463,18 @@ async fn run(opts: Opts) -> Result<()> {
     Ok(())
 }
 
+/// A collection of pools for downloading objects
+///
+/// The general idea is that we want to saturate pretty fast internet,
+/// while still prioritizing completing downloads over starting a lot of
+/// concurrent downloads.
+///
+/// So, we have different numbers of parallel downloads allowed simultaneously
+/// (e.g. 500 parallel for objects that are less than 200kb, but 4 for objects
+/// that are over 10mb).
+///
+/// These numbers are loosely based on my experience, I haven't done a ton of
+/// benchmarking.
 struct DlPools {
     two_hundred_kb: UnboundedSender<(Downloader, Object)>,
     one_mb: UnboundedSender<(Downloader, Object)>,
@@ -471,7 +483,7 @@ struct DlPools {
 }
 
 impl DlPools {
-    /// Loose heuristics based on pretty fast internet, I haven done a ton of benchmarking
+    /// Create a new set of downloader pools
     fn new() -> DlPools {
         let (two_hundred_kb, rx) = tokio::sync::mpsc::unbounded_channel();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(500));
