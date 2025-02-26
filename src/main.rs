@@ -230,7 +230,8 @@ fn main() {
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
         if let Err(err) = run(opts).await {
-            eprintln!("Failed to run: {}", err);
+            // TODO: Separate user error from internal error?
+            eprintln!("Error: {}", err);
             let mut err = err.source();
             let mut count = 0;
             let mut prev_msg = String::new();
@@ -409,6 +410,7 @@ async fn run(opts: Opts) -> Result<()> {
             }
             // close the tx so the downloaders know to finish
             drop(pools);
+            drop(dl);
             eprintln!();
             let start_time = Instant::now();
             let mut downloaded_matches = 0;
@@ -434,10 +436,10 @@ async fn run(opts: Opts) -> Result<()> {
                     SizeFormatter::new(total_bytes as u64, decimal_format()).to_string(),
                     SizeFormatter::new(speed.round() as u64, decimal_format()).to_string(),
                 );
-                // TODO: the ntfc receiver should shut down, shouldn't it?
-                if downloaded_matches >= total_matches {
-                    break;
-                }
+            }
+            if files.is_empty() {
+                eprintln!();
+                bail!("No objects found matching the pattern.");
             }
             eprintln!("\n");
 
