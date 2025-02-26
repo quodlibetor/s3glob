@@ -27,6 +27,14 @@ impl Glob {
         }
     }
 
+    pub(crate) fn raw(&self) -> &str {
+        match self {
+            Glob::Any { raw, .. } => raw,
+            Glob::Recursive { .. } => "**",
+            Glob::Choice { raw, .. } => raw,
+        }
+    }
+
     pub(crate) fn pattern_len(&self) -> usize {
         match self {
             Glob::Any { raw, .. } => raw.len(),

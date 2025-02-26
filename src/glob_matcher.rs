@@ -127,7 +127,7 @@ impl S3GlobMatcher {
         let mut regex_so_far = "^".to_string();
         let mut prev_part = None;
         let mut part_iter = self.parts.iter().enumerate();
-        for (i, part) in &mut part_iter {
+        for (part_idx, part) in &mut part_iter {
             if prefixes.len() >= MAX_PREFIXES {
                 debug!(
                     new_prefix_count = prefixes.len(),
@@ -138,7 +138,7 @@ impl S3GlobMatcher {
             // only included prefixes in trace logs
             trace!(?prefixes, "scanning for part");
             debug!(%regex_so_far, new_part = %part.re_string(&delimiter), prefix_count = prefixes.len(), "scanning for part");
-            if self.after_may_have_delimiter(i) {
+            if self.after_may_have_delimiter(part_idx) {
                 debug!("no more delimiters, stopping prefix generation");
                 break;
             }
@@ -368,9 +368,20 @@ impl S3GlobMatcher {
                             }
                             trace!(new_prefixes = ?new_prefixes, new_prefix_count = new_prefixes.len(), "checking appended prefixes");
                             prefixes = check_prefixes(&mut engine, &prefixes, new_prefixes).await?;
-                        } else {
+                        } else if !new_prefixes.is_empty() {
                             debug!("no appends, using new prefixes");
                             prefixes = new_prefixes;
+                        } else {
+                            let glob_so_far = self
+                                .parts
+                                .iter()
+                                .take(part_idx + 1)
+                                .map(|p| p.raw())
+                                .join("");
+                            bail!(
+                                "No existing prefixes matched the filter: {glob_so_far}\n  {}",
+                                prefixes.iter().join("\n  ")
+                            );
                         }
                     }
                 }
