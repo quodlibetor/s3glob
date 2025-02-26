@@ -362,6 +362,54 @@ async fn test_download_prefix_shortest(
     Ok(())
 }
 
+#[tokio::test]
+async fn test_download_flatten() -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    // Create some nested test files
+    let source_files = [
+        "prefix/nested/deep/file1.txt",
+        "prefix/other/path/file2.txt",
+        "prefix/file3.txt",
+    ];
+    for key in &source_files {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let tempdir = TempDir::new()?;
+
+    // Run s3glob with flatten flag
+    let mut cmd = run_s3glob(
+        port,
+        &[
+            "dl",
+            "--flatten",
+            format!("s3://{}/prefix/**/*.txt", bucket).as_str(),
+            tempdir.path().to_str().unwrap(),
+        ],
+    )?;
+
+    let _ = cmd.assert().success();
+
+    // Expected flattened filenames
+    let expected_files = ["nested-deep-file1.txt", "other-path-file2.txt", "file3.txt"];
+
+    // Verify that files exist with flattened names
+    for expected in &expected_files {
+        tempdir.child(expected).assert(predicate::path::exists());
+    }
+
+    // Verify original paths don't exist
+    for source in &source_files {
+        tempdir.child(source).assert(predicate::path::missing());
+    }
+
+    Ok(())
+}
+
 //
 // Helpers
 //

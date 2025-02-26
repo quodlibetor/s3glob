@@ -92,6 +92,13 @@ enum Command {
         ///   This strips the longest common directory prefix from the key path.
         #[clap(short, long, verbatim_doc_comment, default_value = "from-first-glob")]
         path_mode: PathMode,
+
+        /// Flatten the downloaded files into a single directory
+        ///
+        /// This will replace all slashes in the key path with dashes in the
+        /// downloaded file.
+        #[clap(long)]
+        flatten: bool,
     },
 
     /// Learn how to tune s3glob's parallelism for better performance
@@ -392,7 +399,10 @@ async fn run(opts: Opts) -> Result<()> {
             );
         }
         Command::Download {
-            dest, path_mode, ..
+            dest,
+            path_mode,
+            flatten,
+            ..
         } => {
             let mut total_matches = 0;
             let pools = DlPools::new();
@@ -403,6 +413,7 @@ async fn run(opts: Opts) -> Result<()> {
                 client.clone(),
                 bucket.clone(),
                 prefix_to_strip,
+                flatten,
                 base_path.clone(),
                 ntfctn_tx.clone(),
             );
@@ -449,7 +460,14 @@ async fn run(opts: Opts) -> Result<()> {
                     "Stripping longest common prefix from keys: {}",
                     prefix_to_strip
                 );
-                let dl = Downloader::new(client, bucket, prefix_to_strip, base_path, ntfctn_tx);
+                let dl = Downloader::new(
+                    client,
+                    bucket,
+                    prefix_to_strip,
+                    flatten,
+                    base_path,
+                    ntfctn_tx,
+                );
                 let pools = DlPools::new();
                 for obj in objects_to_download {
                     pools.download_object(dl.fresh(), obj);
@@ -613,6 +631,7 @@ struct Downloader {
     client: Client,
     bucket: String,
     prefix_to_strip: String,
+    flatten: bool,
     base_path: PathBuf,
     obj_counter: Arc<AtomicUsize>,
     obj_id: usize,
@@ -630,6 +649,7 @@ impl Downloader {
         client: Client,
         bucket: String,
         prefix_to_strip: String,
+        flatten: bool,
         base_path: PathBuf,
         notifier: UnboundedSender<Notification>,
     ) -> Self {
@@ -640,6 +660,7 @@ impl Downloader {
             obj_id: 0,
             notifier,
             base_path,
+            flatten,
             prefix_to_strip,
         }
     }
@@ -654,15 +675,20 @@ impl Downloader {
             obj_id,
             notifier: self.notifier.clone(),
             prefix_to_strip: self.prefix_to_strip.clone(),
+            flatten: self.flatten,
             base_path: self.base_path.clone(),
         }
     }
 
     async fn download_object(self, obj: S3Object) {
         let key = &obj.key;
-        let key_suffix = key
+        let mut key_suffix = key
             .strip_prefix(&self.prefix_to_strip)
-            .expect("all found objects will include the prefix");
+            .expect("all found objects will include the prefix")
+            .to_string();
+        if self.flatten {
+            key_suffix = key_suffix.replace(std::path::MAIN_SEPARATOR_STR, "-");
+        }
         let path = self.base_path.join(key_suffix);
         let dir = path.parent().unwrap();
         if let Err(e) = std::fs::create_dir_all(dir) {
