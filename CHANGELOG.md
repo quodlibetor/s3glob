@@ -1,126 +1,143 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
-
-## v0.3.1 - 2025-02-22
-
-### ⚡ Performance
-
-- Download objects in parallel for (potentially) huge speedups (#13)
-
-## v0.3.0 - 2025-02-20
+## [unreleased]
 
 ### 🚀 Features
 
-- Add --path-mode and change default download behavior to only keep paths after glob patterns
-
-## v0.2.7 - 2025-02-19
-
-### 🚀 Features
-
-- Better error when all generated prefixes become invalid
+- **breaking** Support listing intermediate prefixes, not just full objects by Brandon W Maister in [3a21b0f](https://github.com/quodlibetor/s3glob/commit/3a21b0f5721285bc93bbaa10fc642b8c8daa4822)
 
 ### 🐛 Bug Fixes
 
-- Small improvements to progress output
-- -vvv should generate a directive that parses
-
-### ⚡ Performance
-
-- Use a set for some "prefix contains" queries
-
-### ⚙️ Miscellaneous Tasks
-
-- Reduce toomanyrequests Docker Hub errors in CI (#9)
-- Add github attestations to dist release config (#11)
-
-## v0.2.6 - 2025-02-17
-
-### 🐛 Bug Fixes
-
-- Support character ranges [a-c] in prefix generation
-
-## v0.2.5 - 2025-02-15
-
-### 🚀 Features
-
-- Add the ability to stream output
-- Warn when a large number of prefixes are being discovered
-
-### 🐛 Bug Fixes
-
-- Support actual aws cli option --no-sign-request
-
-## v0.2.4 - 2025-02-14
-
-### 🐛 Bug Fixes
-
-- Don't try to find prefixes in file parts
+- Return a useful error if a glob filters out all prefixes by Brandon W Maister in [5708291](https://github.com/quodlibetor/s3glob/commit/570829165ebf3992881e15b757e037d7e532305d)
+- Correctly end when there are no more files to download by Brandon W Maister in [a25564b](https://github.com/quodlibetor/s3glob/commit/a25564bc7acbccddad56c0904359e237f30ac317)
 
 ### 📚 Documentation
 
-- Point out the parallelism help when few prefixes are found
+- Add comment explaining downloader pools by Brandon W Maister in [25b1411](https://github.com/quodlibetor/s3glob/commit/25b14110ae2ebfe1fa077476527b2014adce3018)
 
-## v0.2.3 - 2025-02-13
-
-### 🐛 Bug Fixes
-
-- Skip prefix discovery in the file part of keys
-- Show full errors for bucket discovery
-
-### 📚 Documentation
-
-- Add an s3glob help parallelism command
-
-## v0.2.2 - 2025-02-13
-
-### 🐛 Bug Fixes
-
-- Improve error messages
-- Handle globs at the end of keys better
+## [0.3.1](https://github.com/quodlibetor/s3glob/compare/v0.3.0..v0.3.1) - 2025-02-22
 
 ### ⚡ Performance
 
-- Ensure reasonable concurrency as base for scan
-- Parallelize "directory" scanning for prefixes
+- Download objects in parallel for (potentially) huge speedups by [@quodlibetor](https://github.com/quodlibetor) in [#13](https://github.com/quodlibetor/s3glob/pull/13)
 
-### ⚙️ Miscellaneous Tasks
-
-- Add cargo nextest test timeouts
-
-## v0.2.1 - 2025-02-12
+## [0.3.0](https://github.com/quodlibetor/s3glob/compare/v0.2.7..v0.3.0) - 2025-02-20
 
 ### 🚀 Features
 
-- Do region auto-discovery for buckets
-- Improve documentation in the README and cli
-- Provide a --no-sign-requests flag for public buckets
+- Add --path-mode and change default download behavior to only keep paths after glob patterns by [@quodlibetor](https://github.com/quodlibetor) in [958fc6e](https://github.com/quodlibetor/s3glob/commit/958fc6e26e44755b42d83b07316525250561e1c5)
 
-### ⚙️ Miscellaneous Tasks
-
-- Add mise config for dev tools
-
-## v0.2.0 - 2025-02-11
+## [0.2.7](https://github.com/quodlibetor/s3glob/compare/v0.2.6..v0.2.7) - 2025-02-19
 
 ### 🚀 Features
 
-- Add support for downloading matches
-- Add {uri} as a list format token
-- Dramatically improve performance for early patterns
-
-### ⚙️ Miscellaneous Tasks
-
-- Recognize more release comments in cliff
-- Use cargo-nextest in CI
-
-## v0.1.1 - 2025-01-20
-
-### 🚀 Features
-
-- Add the ability for users to specify the output format
+- Better error when all generated prefixes become invalid by [@quodlibetor](https://github.com/quodlibetor) in [8c54af1](https://github.com/quodlibetor/s3glob/commit/8c54af1c945ecf47c332a1d74d5f2eddfe554349)
 
 ### 🐛 Bug Fixes
 
-- Ensure that globs in the file part still get searched
+- Small improvements to progress output by [@quodlibetor](https://github.com/quodlibetor) in [d071674](https://github.com/quodlibetor/s3glob/commit/d07167461c3452aa737594b06bc11f3e130cf7fe)
+- -vvv should generate a directive that parses by [@quodlibetor](https://github.com/quodlibetor) in [f6876c6](https://github.com/quodlibetor/s3glob/commit/f6876c6f2635c5d14a1df79e339612dd9ebe54f1)
+
+### ⚡ Performance
+
+- Use a set for some "prefix contains" queries by [@quodlibetor](https://github.com/quodlibetor) in [bf50c5c](https://github.com/quodlibetor/s3glob/commit/bf50c5c27356f41b3cc399f176876d221a89c9a9)
+
+### ⚙️ Miscellaneous Tasks
+
+- Reduce toomanyrequests Docker Hub errors in CI by [@quodlibetor](https://github.com/quodlibetor) in [#9](https://github.com/quodlibetor/s3glob/pull/9)
+- Add github attestations to dist release config by [@quodlibetor](https://github.com/quodlibetor) in [#11](https://github.com/quodlibetor/s3glob/pull/11)
+
+## [0.2.6](https://github.com/quodlibetor/s3glob/compare/v0.2.5..v0.2.6) - 2025-02-17
+
+### 🐛 Bug Fixes
+
+- Support character ranges [a-c] in prefix generation by [@quodlibetor](https://github.com/quodlibetor) in [f3b1393](https://github.com/quodlibetor/s3glob/commit/f3b139351ce22c3065b4ba804a881147bf7a0bc6)
+
+## [0.2.5](https://github.com/quodlibetor/s3glob/compare/v0.2.4..v0.2.5) - 2025-02-15
+
+### 🚀 Features
+
+- Add the ability to stream output by [@quodlibetor](https://github.com/quodlibetor) in [bcfc81a](https://github.com/quodlibetor/s3glob/commit/bcfc81a3ea2e29c528a23cb2dde3f25170b19612)
+- Warn when a large number of prefixes are being discovered by [@quodlibetor](https://github.com/quodlibetor) in [a5c5d1c](https://github.com/quodlibetor/s3glob/commit/a5c5d1c86fcab44eb9754e81f0ae1ea8c93459f8)
+
+### 🐛 Bug Fixes
+
+- Support actual aws cli option --no-sign-request by [@quodlibetor](https://github.com/quodlibetor) in [04b718a](https://github.com/quodlibetor/s3glob/commit/04b718a54f0170ad7f660d5d70f80e066e10460d)
+
+## [0.2.4](https://github.com/quodlibetor/s3glob/compare/v0.2.3..v0.2.4) - 2025-02-14
+
+### 🐛 Bug Fixes
+
+- Don't try to find prefixes in file parts by [@quodlibetor](https://github.com/quodlibetor) in [359331b](https://github.com/quodlibetor/s3glob/commit/359331bf3878eac953d9578e36052f8e0e1e3898)
+
+### 📚 Documentation
+
+- Point out the parallelism help when few prefixes are found by [@quodlibetor](https://github.com/quodlibetor) in [f07d3b1](https://github.com/quodlibetor/s3glob/commit/f07d3b129df0b8c20fab9428163b399830ea8ff1)
+
+## [0.2.3](https://github.com/quodlibetor/s3glob/compare/v0.2.2..v0.2.3) - 2025-02-13
+
+### 🐛 Bug Fixes
+
+- Skip prefix discovery in the file part of keys by [@quodlibetor](https://github.com/quodlibetor) in [9d7726a](https://github.com/quodlibetor/s3glob/commit/9d7726a3446f922fee072918d28528ce05249f8b)
+- Show full errors for bucket discovery by [@quodlibetor](https://github.com/quodlibetor) in [038451d](https://github.com/quodlibetor/s3glob/commit/038451d71613530f0da63b8aa78c7f92f9540fdb)
+
+### 📚 Documentation
+
+- Add an s3glob help parallelism command by [@quodlibetor](https://github.com/quodlibetor) in [d0c5a65](https://github.com/quodlibetor/s3glob/commit/d0c5a6590eb419a3961e6fa1502c3c59ebb8e0ac)
+
+## [0.2.2](https://github.com/quodlibetor/s3glob/compare/v0.2.1..v0.2.2) - 2025-02-13
+
+### 🐛 Bug Fixes
+
+- Improve error messages by [@quodlibetor](https://github.com/quodlibetor) in [ec42518](https://github.com/quodlibetor/s3glob/commit/ec42518ce077eac246739c00f3c4c653ac753236)
+- Handle globs at the end of keys better by [@quodlibetor](https://github.com/quodlibetor) in [50fcd20](https://github.com/quodlibetor/s3glob/commit/50fcd209b23af3e800e3d6b14d46c4a57f020f6b)
+
+### ⚡ Performance
+
+- Ensure reasonable concurrency as base for scan by [@quodlibetor](https://github.com/quodlibetor) in [3fce5b2](https://github.com/quodlibetor/s3glob/commit/3fce5b2be0d944b3196c1cf8fc169aeb611efea7)
+- Parallelize "directory" scanning for prefixes by [@quodlibetor](https://github.com/quodlibetor) in [ab4aba0](https://github.com/quodlibetor/s3glob/commit/ab4aba0931f13b18ce2477761dc2f967232e1ae1)
+
+### ⚙️ Miscellaneous Tasks
+
+- Add cargo nextest test timeouts by [@quodlibetor](https://github.com/quodlibetor) in [626c6c3](https://github.com/quodlibetor/s3glob/commit/626c6c339eefbc2e28a8cf9f04954639e56034ee)
+
+## [0.2.1](https://github.com/quodlibetor/s3glob/compare/v0.2.0..v0.2.1) - 2025-02-12
+
+### 🚀 Features
+
+- Do region auto-discovery for buckets by [@quodlibetor](https://github.com/quodlibetor) in [ed7cc9d](https://github.com/quodlibetor/s3glob/commit/ed7cc9d2a3bd41cf0264a964f3bb6ff027346394)
+- Improve documentation in the README and cli by [@quodlibetor](https://github.com/quodlibetor) in [49469a9](https://github.com/quodlibetor/s3glob/commit/49469a96cc57bca706706453c2a4bf8720805eae)
+- Provide a --no-sign-requests flag for public buckets by [@quodlibetor](https://github.com/quodlibetor) in [9c69788](https://github.com/quodlibetor/s3glob/commit/9c697886baa784ef107c59a2f3e4285ce058ee03)
+
+### ⚙️ Miscellaneous Tasks
+
+- Add mise config for dev tools by [@quodlibetor](https://github.com/quodlibetor) in [09115f0](https://github.com/quodlibetor/s3glob/commit/09115f08c0dad7699c5eef5e131218e7b3fb9b92)
+
+## [0.2.0](https://github.com/quodlibetor/s3glob/compare/v0.1.1..v0.2.0) - 2025-02-11
+
+### 🚀 Features
+
+- Add support for downloading matches by [@quodlibetor](https://github.com/quodlibetor) in [712df04](https://github.com/quodlibetor/s3glob/commit/712df04fc2523e2c86f6ed9dfa63ff2e5d0ee4ee)
+- Add {uri} as a list format token by [@quodlibetor](https://github.com/quodlibetor) in [ba1b599](https://github.com/quodlibetor/s3glob/commit/ba1b599573c5b02874d96f825e0398c2d0a49f39)
+- Dramatically improve performance for early patterns by [@quodlibetor](https://github.com/quodlibetor) in [01e17a1](https://github.com/quodlibetor/s3glob/commit/01e17a11822f803774b1eaa59dbc4ca22d66256b)
+
+### ⚙️ Miscellaneous Tasks
+
+- Recognize more release comments in cliff by [@quodlibetor](https://github.com/quodlibetor) in [179e750](https://github.com/quodlibetor/s3glob/commit/179e7501c38c113b3baf7d024440cda3069c5fd9)
+- Use cargo-nextest in CI by [@quodlibetor](https://github.com/quodlibetor) in [13c56b9](https://github.com/quodlibetor/s3glob/commit/13c56b9b89d3ab2677bc9ff13e57e716471c2780)
+
+## [0.1.1](https://github.com/quodlibetor/s3glob/compare/v0.1.0..v0.1.1) - 2025-01-20
+
+### 🚀 Features
+
+- Add the ability for users to specify the output format by [@quodlibetor](https://github.com/quodlibetor) in [7efdcef](https://github.com/quodlibetor/s3glob/commit/7efdcef774c5f61dcd27605190ec46869ae180ce)
+
+### 🐛 Bug Fixes
+
+- Ensure that globs in the file part still get searched by [@quodlibetor](https://github.com/quodlibetor) in [25179a4](https://github.com/quodlibetor/s3glob/commit/25179a47e84772bf272187b75c4a6a00ca1e42d7)
+
+### New Contributors
+
+- @quodlibetor made their first contribution
 
 <!-- generated by git-cliff -->
