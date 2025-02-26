@@ -12,6 +12,11 @@ use regex::Regex;
 pub(crate) enum Glob {
     /// A single `*` or `?`, or a negated character class
     Any { raw: String, not: Option<Vec<char>> },
+    /// A synthetic `*` that is used to represent the fact that a glob pattern
+    /// ends with a delimiter.
+    ///
+    /// If a user asks for foo/*/ then they actually want all the things within /, not just foo/*
+    SyntheticAny,
     /// A literal string or group of alternatives, like `foo` or `{foo,bar}` or `[abc]`
     Choice { raw: String, allowed: Vec<String> },
     /// A recursive glob, always `**`
@@ -24,6 +29,7 @@ impl Glob {
             Glob::Any { raw, .. } => format!("Any({raw})"),
             Glob::Recursive { .. } => "Recursive(**)".to_string(),
             Glob::Choice { raw, .. } => format!("Choice({raw})"),
+            Glob::SyntheticAny => "SyntheticAny".to_string(),
         }
     }
 
@@ -32,6 +38,7 @@ impl Glob {
             Glob::Any { raw, .. } => raw,
             Glob::Recursive { .. } => "**",
             Glob::Choice { raw, .. } => raw,
+            Glob::SyntheticAny => "",
         }
     }
 
@@ -40,6 +47,7 @@ impl Glob {
             Glob::Any { raw, .. } => raw.len(),
             Glob::Recursive { .. } => 2,
             Glob::Choice { raw, .. } => raw.len(),
+            Glob::SyntheticAny => 0,
         }
     }
 
@@ -57,6 +65,10 @@ impl Glob {
     /// True if this is a negated character class `[!abc]`
     pub(crate) fn is_negated(&self) -> bool {
         matches!(self, Glob::Any { not: Some(_), .. })
+    }
+
+    pub(crate) fn is_recursive(&self) -> bool {
+        matches!(self, Glob::Recursive { .. })
     }
 
     pub(crate) fn re_string(&self, delimiter: &str) -> String {
@@ -84,11 +96,20 @@ impl Glob {
                 }
             }
             Glob::Recursive { .. } => ".*".to_string(),
+            Glob::SyntheticAny => format!("[^{delimiter}]*"),
         }
     }
 
     pub(crate) fn re(&self, delimiter: &str) -> Regex {
         Regex::new(&self.re_string(delimiter)).unwrap()
+    }
+
+    /// True if this glob is a literal part and ends with the delimiter
+    pub(crate) fn ends_with(&self, delimiter: &str) -> bool {
+        match self {
+            Glob::Choice { allowed, .. } => allowed.iter().any(|a| a.ends_with(delimiter)),
+            _ => false,
+        }
     }
 
     /// Create the combination of two glob patterns
@@ -112,7 +133,7 @@ impl Glob {
 
     pub(crate) fn may_have_delimiter(&self, delimiter: char) -> bool {
         match self {
-            Glob::Any { .. } => false,
+            Glob::Any { .. } | Glob::SyntheticAny => false,
             Glob::Choice { allowed, .. } => allowed.iter().any(|a| a.contains(delimiter)),
             Glob::Recursive { .. } => true,
         }
@@ -267,7 +288,8 @@ mod tests {
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["/a", "/b"]));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
         assert_scanner_part!(&scanner.parts[2], OneChoice("/"));
-        check!(scanner.parts.len() == 3);
+        assert_scanner_part!(&scanner.parts[3], SyntheticAny);
+        check!(scanner.parts.len() == 4);
 
         Ok(())
     }

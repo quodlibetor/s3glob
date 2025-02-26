@@ -25,7 +25,7 @@ use testcontainers_modules::minio::MinIO;
 #[case("prefix/2024-*/*", &[
     "prefix/2024-01/file1.txt",
     "prefix/2024-02/file2.txt",
-    "prefix/2024-03/nested/file3.txt",
+    "prefix/2024-03/nested/",
     "prefix/2024-03/file4.txt",
 ])]
 #[case("prefix/2024-*/**", &[
@@ -36,7 +36,7 @@ use testcontainers_modules::minio::MinIO;
 ])]
 #[case("prefix/2024-{01,03}/*", &[
     "prefix/2024-01/file1.txt",
-    "prefix/2024-03/nested/file3.txt",
+    "prefix/2024-03/nested/",
     "prefix/2024-03/file4.txt",
 ])]
 #[trace]

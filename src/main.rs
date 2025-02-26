@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
@@ -292,21 +294,47 @@ async fn run(opts: Opts) -> Result<()> {
     let total_objects = Arc::new(AtomicUsize::new(0));
     let seen_prefixes = Arc::new(AtomicUsize::new(0));
     let total_prefixes = prefixes.len();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PrefixResult>();
-    for prefix in prefixes {
-        let client = client.clone();
-        let total_objects = Arc::clone(&total_objects);
-        let seen_prefixes = Arc::clone(&seen_prefixes);
-        let matcher = matcher.clone();
-        let bucket = bucket.clone();
-        let tx = tx.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
+    if matcher.is_complete() {
+        for prefix in prefixes {
+            // just get the object info for each prefix
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let prefix = prefix.clone();
+            let tx = tx.clone();
+            total_objects.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let r = client
+                    .head_object()
+                    .bucket(bucket)
+                    .key(prefix.clone())
+                    .send()
+                    .await;
+                match r {
+                    Ok(o) => tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
+                        prefix, o,
+                    ))]),
+                    Err(_) => tx.send(vec![PrefixResult::Prefix(prefix)]),
+                }
+            });
+        }
+    } else {
+        for prefix in prefixes {
+            let client = client.clone();
+            let total_objects = Arc::clone(&total_objects);
+            let seen_prefixes = Arc::clone(&seen_prefixes);
+            let matcher = matcher.clone();
+            let bucket = bucket.clone();
+            let tx = tx.clone();
 
-        tokio::spawn(async move {
-            list_matching_objects(&client, &bucket, &prefix, &matcher, total_objects, tx).await?;
+            tokio::spawn(async move {
+                list_matching_objects(&client, &bucket, &prefix, &matcher, total_objects, tx)
+                    .await?;
 
-            add_atomic(&seen_prefixes, 1);
-            Ok::<_, anyhow::Error>(())
-        });
+                add_atomic(&seen_prefixes, 1);
+                Ok::<_, anyhow::Error>(())
+            });
+        }
     }
     drop(tx);
 
@@ -320,23 +348,15 @@ async fn run(opts: Opts) -> Result<()> {
             let mut matching_objects = Vec::new();
             let mut match_count = 0;
             let decimal = decimal_format();
-            while let Some(PrefixResult {
-                matching_objects: mo,
-                ..
-            }) = rx.recv().await
-            {
+            while let Some(results) = rx.recv().await {
                 if stream {
-                    match_count += mo.len();
-                    for obj in mo.iter() {
-                        if let Some(user_fmt) = &user_format {
-                            print_user(&bucket, obj, user_fmt);
-                        } else {
-                            print_default(obj, decimal);
-                        }
+                    match_count += results.len();
+                    for result in results {
+                        print_prefix_result(&bucket, &user_format, decimal, result);
                     }
                 } else {
-                    match_count += mo.len();
-                    matching_objects.extend(mo);
+                    match_count += results.len();
+                    matching_objects.extend(results);
                     eprint!(
                         "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
                         match_count.to_formatted_string(&Locale::en),
@@ -350,13 +370,9 @@ async fn run(opts: Opts) -> Result<()> {
             }
             eprintln!();
             let mut objects = matching_objects;
-            objects.sort_by(|a, b| a.key.cmp(&b.key));
-            for obj in objects.iter() {
-                if let Some(user_fmt) = &user_format {
-                    print_user(&bucket, obj, user_fmt);
-                } else {
-                    print_default(obj, decimal);
-                }
+            objects.sort_by_key(|r| r.key().to_owned());
+            for obj in objects {
+                print_prefix_result(&bucket, &user_format, decimal, obj);
             }
             eprintln!(
                 "Matched {}/{} objects across {} prefixes in {:?}",
@@ -375,14 +391,20 @@ async fn run(opts: Opts) -> Result<()> {
             let (ntfctn_tx, mut ntfctn_rx) = tokio::sync::mpsc::unbounded_channel::<Notification>();
             let base_path = PathBuf::from(dest);
             let dl = Downloader::new(client, bucket, prefix_to_strip, base_path, ntfctn_tx);
-            while let Some(PrefixResult {
-                matching_objects: mo,
-                ..
-            }) = rx.recv().await
-            {
-                total_matches += mo.len();
-                for obj in mo {
-                    pools.download_object(dl.fresh(), obj);
+            while let Some(result) = rx.recv().await {
+                total_matches += result
+                    .iter()
+                    .filter(|r| matches!(r, PrefixResult::Object(_)))
+                    .count();
+                for obj in result {
+                    match obj {
+                        PrefixResult::Object(obj) => {
+                            pools.download_object(dl.fresh(), obj);
+                        }
+                        PrefixResult::Prefix(prefix) => {
+                            debug!("Skipping prefix: {}", prefix);
+                        }
+                    }
                 }
 
                 eprint!(
@@ -452,6 +474,26 @@ async fn run(opts: Opts) -> Result<()> {
     Ok(())
 }
 
+fn print_prefix_result(
+    bucket: &str,
+    user_format: &Option<Vec<FormatToken>>,
+    decimal: FormatSizeOptions,
+    result: PrefixResult,
+) {
+    match result {
+        PrefixResult::Object(obj) => {
+            if let Some(user_fmt) = user_format {
+                print_user(bucket, &obj, user_fmt);
+            } else {
+                print_default(&obj, decimal);
+            }
+        }
+        PrefixResult::Prefix(prefix) => {
+            println!("   {prefix}");
+        }
+    }
+}
+
 /// A collection of pools for downloading objects
 ///
 /// The general idea is that we want to saturate pretty fast internet,
@@ -465,10 +507,10 @@ async fn run(opts: Opts) -> Result<()> {
 /// These numbers are loosely based on my experience, I haven't done a ton of
 /// benchmarking.
 struct DlPools {
-    two_hundred_kb: UnboundedSender<(Downloader, Object)>,
-    one_mb: UnboundedSender<(Downloader, Object)>,
-    ten_mb: UnboundedSender<(Downloader, Object)>,
-    more: UnboundedSender<(Downloader, Object)>,
+    two_hundred_kb: UnboundedSender<(Downloader, S3Object)>,
+    one_mb: UnboundedSender<(Downloader, S3Object)>,
+    ten_mb: UnboundedSender<(Downloader, S3Object)>,
+    more: UnboundedSender<(Downloader, S3Object)>,
 }
 
 impl DlPools {
@@ -497,19 +539,15 @@ impl DlPools {
         }
     }
 
-    fn download_object(&self, dl: Downloader, object: Object) {
-        let tx = if let Some(size) = object.size {
-            if size < 200_000 {
-                &self.two_hundred_kb
-            } else if size < 1_000_000 {
-                &self.one_mb
-            } else if size < 10_000_000 {
-                &self.ten_mb
-            } else {
-                &self.more
-            }
+    fn download_object(&self, dl: Downloader, object: S3Object) {
+        let size = object.size;
+        let tx = if size < 200_000 {
+            &self.two_hundred_kb
+        } else if size < 1_000_000 {
+            &self.one_mb
+        } else if size < 10_000_000 {
+            &self.ten_mb
         } else {
-            debug!(?object, "object size not known, using more pool");
             &self.more
         };
         tx.send((dl, object))
@@ -519,7 +557,7 @@ impl DlPools {
 
 fn start_threadpool(
     semaphore: Arc<tokio::sync::Semaphore>,
-    mut rx: UnboundedReceiver<(Downloader, Object)>,
+    mut rx: UnboundedReceiver<(Downloader, S3Object)>,
 ) {
     tokio::spawn(async move {
         while let Some((dl, obj)) = rx.recv().await {
@@ -582,8 +620,8 @@ impl Downloader {
         }
     }
 
-    async fn download_object(self, obj: Object) {
-        let key = obj.key.as_ref().unwrap();
+    async fn download_object(self, obj: S3Object) {
+        let key = &obj.key;
         let key_suffix = key
             .strip_prefix(&self.prefix_to_strip)
             .expect("all found objects will include the prefix");
@@ -671,10 +709,47 @@ fn extract_prefix_to_strip(raw_pattern: &str, path_mode: PathType) -> String {
 }
 
 #[derive(Debug)]
-struct PrefixResult {
-    #[allow(dead_code)]
-    prefix: String,
-    matching_objects: Vec<Object>,
+enum PrefixResult {
+    Object(S3Object),
+    Prefix(String),
+}
+
+impl PrefixResult {
+    fn key(&self) -> &str {
+        match self {
+            Self::Object(obj) => &obj.key,
+            Self::Prefix(prefix) => prefix,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct S3Object {
+    key: String,
+    size: i64,
+    last_modified: DateTime,
+}
+
+impl From<Object> for S3Object {
+    fn from(obj: Object) -> Self {
+        Self {
+            key: obj.key.unwrap(),
+            size: obj.size.unwrap_or(0),
+            last_modified: obj
+                .last_modified
+                .unwrap_or_else(|| DateTime::from_millis(0)),
+        }
+    }
+}
+
+impl S3Object {
+    fn from_head_object(key: String, obj: HeadObjectOutput) -> Self {
+        Self {
+            key,
+            size: obj.content_length().unwrap(),
+            last_modified: obj.last_modified.unwrap(),
+        }
+    }
 }
 
 /// Create a new S3 client with region auto-detection
@@ -718,7 +793,7 @@ fn decimal_format() -> FormatSizeOptions {
 #[derive(Debug)]
 enum FormatToken {
     Literal(String),
-    Variable(fn(&str, &Object) -> String),
+    Variable(fn(&str, &S3Object) -> String),
 }
 
 fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
@@ -739,20 +814,16 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
                 var.push(c);
             }
             match var.as_str() {
-                "key" => tokens.push(FormatToken::Variable(|_, obj| {
-                    obj.key.as_ref().unwrap().to_string()
-                })),
+                "key" => tokens.push(FormatToken::Variable(|_, obj| obj.key.clone())),
                 "uri" => tokens.push(FormatToken::Variable(|bucket, obj| {
-                    format!("s3://{}/{}", bucket, obj.key.as_ref().unwrap())
+                    format!("s3://{}/{}", bucket, obj.key)
                 })),
-                "size_bytes" => tokens.push(FormatToken::Variable(|_, obj| {
-                    obj.size.unwrap_or(0).to_string()
-                })),
+                "size_bytes" => tokens.push(FormatToken::Variable(|_, obj| obj.size.to_string())),
                 "size_human" => tokens.push(FormatToken::Variable(|_, obj| {
-                    SizeFormatter::new(obj.size.unwrap_or(0) as u64, decimal_format()).to_string()
+                    SizeFormatter::new(obj.size as u64, decimal_format()).to_string()
                 })),
                 "last_modified" => tokens.push(FormatToken::Variable(|_, obj| {
-                    obj.last_modified.as_ref().unwrap().to_string()
+                    obj.last_modified.to_string()
                 })),
                 _ => return Err(anyhow::anyhow!("unknown variable: {}", var)),
             }
@@ -766,23 +837,20 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
     Ok(tokens)
 }
 
-fn print_default(obj: &Object, format: FormatSizeOptions) {
+fn print_default(obj: &S3Object, format: FormatSizeOptions) {
     println!(
         "{:>10}   {:>7}   {}",
-        obj.last_modified
-            .as_ref()
-            .map(|dt| dt.to_string())
-            .unwrap_or_default(),
-        SizeFormatter::new(obj.size.unwrap_or(0) as u64, format).to_string(),
-        obj.key.as_ref().unwrap_or(&String::new()),
+        obj.last_modified,
+        SizeFormatter::new(obj.size as u64, format).to_string(),
+        obj.key,
     );
 }
 
-fn print_user(bucket: &str, obj: &Object, tokens: &[FormatToken]) {
+fn print_user(bucket: &str, obj: &S3Object, tokens: &[FormatToken]) {
     println!("{}", format_user(bucket, obj, tokens));
 }
 
-fn format_user(bucket: &str, obj: &Object, tokens: &[FormatToken]) -> String {
+fn format_user(bucket: &str, obj: &S3Object, tokens: &[FormatToken]) -> String {
     let mut result = String::new();
     for token in tokens {
         match token {
@@ -804,7 +872,7 @@ async fn list_matching_objects(
     prefix: &str,
     matcher: &S3GlobMatcher,
     total_objects: Arc<AtomicUsize>,
-    tx: UnboundedSender<PrefixResult>,
+    tx: UnboundedSender<Vec<PrefixResult>>,
 ) -> Result<()> {
     let mut paginator = client
         .list_objects_v2()
@@ -825,10 +893,12 @@ async fn list_matching_objects(
                     }
                 }
             }
-            tx.send(PrefixResult {
-                prefix: prefix.to_string(),
-                matching_objects,
-            })?;
+            tx.send(
+                matching_objects
+                    .into_iter()
+                    .map(|o| PrefixResult::Object(S3Object::from(o)))
+                    .collect::<Vec<_>>(),
+            )?;
         }
     }
     Ok(())
@@ -886,7 +956,7 @@ mod tests {
 
         let object = Object::builder().key("test/file.txt").size(1234).build();
 
-        let result = format_user("bkt", &object, &fmt);
+        let result = format_user("bkt", &S3Object::from(object), &fmt);
         assert_eq!(result, expected);
     }
 

@@ -37,6 +37,10 @@ pub struct S3GlobMatcher {
     parts: Vec<glob::Glob>,
     glob: GlobMatcher,
     min_prefixes: usize,
+    /// True if no further listing needs to be done by the caller
+    ///
+    /// Generally anything that does not contain a ** will be complete
+    is_complete: bool,
 }
 
 /// A scanner takes a glob pattern and can efficiently generate a list of S3
@@ -82,9 +86,13 @@ impl S3GlobMatcher {
                 new_parts.push(part);
             }
         }
+        if new_parts.last().is_some_and(|p| p.ends_with(delimiter)) {
+            new_parts.push(glob::Glob::SyntheticAny);
+        }
 
         debug!(pattern = %raw, parsed = ?new_parts, "parsed pattern");
         let glob = globset::Glob::new(&raw)?;
+        let is_complete = new_parts.iter().all(|p| !p.is_recursive());
 
         Ok(S3GlobMatcher {
             raw,
@@ -92,6 +100,7 @@ impl S3GlobMatcher {
             parts: new_parts,
             glob: glob.compile_matcher(),
             min_prefixes: DESIRED_MIN_PREFIXES,
+            is_complete,
         })
     }
 
@@ -138,10 +147,6 @@ impl S3GlobMatcher {
             // only included prefixes in trace logs
             trace!(?prefixes, "scanning for part");
             debug!(%regex_so_far, new_part = %part.re_string(&delimiter), prefix_count = prefixes.len(), "scanning for part");
-            if self.after_may_have_delimiter(part_idx) {
-                debug!("no more delimiters, stopping prefix generation");
-                break;
-            }
             if tracing::enabled!(tracing::Level::DEBUG) {
                 // don't overwrite log messages
                 eprintln!("Discovering prefixes: {:>6}", prefixes.len());
@@ -161,7 +166,7 @@ impl S3GlobMatcher {
                 // Any is the only place where we actually need to hit the
                 // engine to scan for prefixes, everything else is either a
                 // literal append or a regex filter
-                glob::Glob::Any { .. } => {
+                glob::Glob::Any { .. } | glob::Glob::SyntheticAny => {
                     // never scan if the previous part was an any, because the last scan will have
                     // already found all of the prefixes that match the any
                     let scan_might_help = !matches!(prev_part, Some(&Glob::Any { .. }));
@@ -195,8 +200,7 @@ impl S3GlobMatcher {
                         let mut new_prefixes = BTreeSet::new();
                         let mut new_prefix_count = 0;
                         while let Some(result) = rx.recv().await {
-                            let (scanned_prefix, mut results) =
-                                result.context("scanning prefixes")?;
+                            let (scanned_prefix, results) = result.context("scanning prefixes")?;
                             let result_len = results.len();
                             trace!(
                                 scanned_prefix,
@@ -204,7 +208,6 @@ impl S3GlobMatcher {
                                 scanned_results = ?results,
                                 "Scanning for any, got result from task"
                             );
-                            results.retain(|r| !prefixes.contains(r));
                             new_prefixes.extend(results);
                             new_prefix_count = new_prefixes.len();
                             if new_prefix_count >= MAX_PREFIXES {
@@ -250,9 +253,8 @@ impl S3GlobMatcher {
                     //   the delimiter, or the pattern starts with an
                     //   alternation
 
-                    // if there is no previous part, or the previous part is a literal,
-                    // then we can just append the alternatives to the prefixes
-                    let is_simple_append = prefixes.len() == 1;
+                    // if there is no previous part
+                    let is_simple_append = part_idx == 0;
 
                     if is_simple_append {
                         debug!(allowed = %allowed.join(","), "simple append");
@@ -411,13 +413,9 @@ impl S3GlobMatcher {
         Ok(prefixes.into_iter().collect())
     }
 
-    /// True if any part after the given index may have a delimiter
-    fn after_may_have_delimiter(&self, i: usize) -> bool {
-        !self
-            .parts
-            .iter()
-            .skip(i)
-            .any(|p| p.may_have_delimiter(self.delimiter))
+    /// True if no further listing needs to be done by the caller
+    pub fn is_complete(&self) -> bool {
+        self.is_complete
     }
 
     pub fn is_match(&self, path: &str) -> bool {
@@ -847,7 +845,7 @@ mod tests {
         ]);
 
         let prefixes = scanner.find_prefixes(engine.clone()).await?;
-        assert!(prefixes == vec!["boo/", "zoo/"]);
+        assert!(prefixes == vec!["boo/a", "zoo/a"]);
         // TODO: this could be improved to only call the engine once
         Ok(())
     }
@@ -946,7 +944,7 @@ mod tests {
         ]);
 
         let prefixes = scanner.find_prefixes(engine.clone()).await?;
-        assert!(prefixes == vec!["src/bar/", "src/baz/", "src/foo/"]);
+        assert!(prefixes == vec!["src/bar/2_zebra", "src/baz/3_zebra", "src/foo/1_zebra"]);
         Ok(())
     }
 
@@ -962,7 +960,8 @@ mod tests {
         ]);
 
         let prefixes = scanner.find_prefixes(engine.clone()).await?;
-        assert!(prefixes == vec!["src/foo/1"]);
+        assert!(prefixes == vec!["src/foo/1_zebra"]);
+        assert!(scanner.is_complete());
         Ok(())
     }
 
@@ -989,6 +988,12 @@ mod tests {
                     assert_scanner_part!(@test_matches, $part.re("/"), $expected_matches, !$expected_does_not_match);
                 }
                 other => panic!("Expected Any({:?}), got {:?}", $expected, other),
+            }
+        };
+        ($part:expr, SyntheticAny) => {
+            match $part {
+                Glob::SyntheticAny => {}
+                other => panic!("Expected SyntheticAny, got {:?}", other),
             }
         };
         ($part:expr, Any($expected:expr)) => {{
