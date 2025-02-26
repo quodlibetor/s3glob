@@ -28,8 +28,8 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
-  test:
-    name: Test
+  test-integration:
+    name: Integration Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,5 +51,31 @@ jobs:
       - name: Compile tests
         run: cargo nextest run --verbose --no-run
 
-      - name: Run tests
-        run: cargo nextest run --no-fail-fast
+      - name: Run integration tests
+        run: cargo nextest run --no-fail-fast -E 'binary(integration)'
+
+  test-unit:
+    name: Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Compile tests
+        run: cargo nextest run --verbose --no-run
+
+      - name: Run unit tests
+        run: cargo nextest run --no-fail-fast -E 'not binary(integration)'
