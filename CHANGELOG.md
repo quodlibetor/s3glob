@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.4.0](https://github.com/quodlibetor/s3glob/compare/v0.3.1..0.4.0) - 2025-02-26
+## [0.4.0](https://github.com/quodlibetor/s3glob/compare/v0.3.1...v0.4.0) - 2025-02-26
 
 ### 🚀 Features
 
