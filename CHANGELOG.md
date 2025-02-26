@@ -1,6 +1,6 @@
 # Changelog
 
-## [unreleased]
+## [0.4.1](https://github.com/quodlibetor/s3glob/compare/v0.4.0...v0.4.1) - 2025-02-26
 
 ### 🚀 Features
 
@@ -12,6 +12,7 @@
 
 - Fix link in CHANGELOG.md by [@quodlibetor](https://github.com/quodlibetor) in [6813927](https://github.com/quodlibetor/s3glob/commit/6813927f5cdee1a42b44481a060c682fbbacd9e4)
 - Split unit and integration test jobs by [@quodlibetor](https://github.com/quodlibetor) in [de6e56f](https://github.com/quodlibetor/s3glob/commit/de6e56feddad0be98d35c40ae7585feab2ffbae5)
+- Fix changelog template by Brandon W Maister in [09e3e80](https://github.com/quodlibetor/s3glob/commit/09e3e8069b22d4f8ac4b76d139a7109943220bd3)
 
 ## [0.4.0](https://github.com/quodlibetor/s3glob/compare/v0.3.1...v0.4.0) - 2025-02-26
 
