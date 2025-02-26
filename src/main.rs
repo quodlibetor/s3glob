@@ -300,8 +300,6 @@ async fn run(opts: Opts) -> Result<()> {
         prefixes.push(prefix);
     }
 
-    let mut tasks = Vec::new();
-
     let total_objects = Arc::new(AtomicUsize::new(0));
     let seen_prefixes = Arc::new(AtomicUsize::new(0));
     let total_prefixes = prefixes.len();
@@ -314,12 +312,12 @@ async fn run(opts: Opts) -> Result<()> {
         let bucket = bucket.clone();
         let tx = tx.clone();
 
-        tasks.push(tokio::spawn(async move {
+        tokio::spawn(async move {
             list_matching_objects(&client, &bucket, &prefix, &matcher, total_objects, tx).await?;
 
             add_atomic(&seen_prefixes, 1);
             Ok::<_, anyhow::Error>(())
-        }));
+        });
     }
     drop(tx);
 
