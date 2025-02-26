@@ -275,13 +275,9 @@ async fn run(opts: Opts) -> Result<()> {
 
     let client = create_s3_client(&opts, &bucket).await?;
 
-    let prefix = raw_pattern
-        .find(GLOB_CHARS)
-        .map_or(raw_pattern.clone(), |i| raw_pattern[..i].to_owned());
-
     let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
     let matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
-    let mut prefixes = match matcher.find_prefixes(engine).await {
+    let prefixes = match matcher.find_prefixes(engine).await {
         Ok(prefixes) => prefixes,
         Err(err) => {
             // the matcher prints some progress info to stderr, if there's an
@@ -292,13 +288,6 @@ async fn run(opts: Opts) -> Result<()> {
     };
     trace!(?prefixes, "matcher generated prefixes");
     debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
-
-    // If there are no common prefixes, then the prefix itself is the only
-    // matching prefix.
-    if prefixes.is_empty() {
-        debug!(?prefix, "no glob_prefixes found, using simple prefix");
-        prefixes.push(prefix);
-    }
 
     let total_objects = Arc::new(AtomicUsize::new(0));
     let seen_prefixes = Arc::new(AtomicUsize::new(0));
