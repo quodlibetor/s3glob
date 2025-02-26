@@ -489,7 +489,8 @@ fn print_prefix_result(
             }
         }
         PrefixResult::Prefix(prefix) => {
-            println!("   {prefix}");
+            // TODO: support user-customizable prefix formatting too?
+            println!("PRE     {prefix}");
         }
     }
 }
