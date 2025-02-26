@@ -1,19 +1,23 @@
 # Changelog
 
-## [unreleased]
+## [0.4.0](https://github.com/quodlibetor/s3glob/compare/v0.3.1..0.4.0) - 2025-02-26
 
 ### 🚀 Features
 
-- **breaking** Support listing intermediate prefixes, not just full objects by Brandon W Maister in [3a21b0f](https://github.com/quodlibetor/s3glob/commit/3a21b0f5721285bc93bbaa10fc642b8c8daa4822)
+- **breaking** Support listing intermediate prefixes, not just full objects by [@quodlibetor](https://github.com/quodlibetor) in [8ba6dc6](https://github.com/quodlibetor/s3glob/commit/8ba6dc621f5859e65aba3f4e2eae2d6f241c7b87)
 
 ### 🐛 Bug Fixes
 
-- Return a useful error if a glob filters out all prefixes by Brandon W Maister in [5708291](https://github.com/quodlibetor/s3glob/commit/570829165ebf3992881e15b757e037d7e532305d)
-- Correctly end when there are no more files to download by Brandon W Maister in [a25564b](https://github.com/quodlibetor/s3glob/commit/a25564bc7acbccddad56c0904359e237f30ac317)
+- Return a useful error if a glob filters out all prefixes by [@quodlibetor](https://github.com/quodlibetor) in [5708291](https://github.com/quodlibetor/s3glob/commit/570829165ebf3992881e15b757e037d7e532305d)
+- Correctly end when there are no more files to download by [@quodlibetor](https://github.com/quodlibetor) in [a25564b](https://github.com/quodlibetor/s3glob/commit/a25564bc7acbccddad56c0904359e237f30ac317)
 
 ### 📚 Documentation
 
-- Add comment explaining downloader pools by Brandon W Maister in [25b1411](https://github.com/quodlibetor/s3glob/commit/25b14110ae2ebfe1fa077476527b2014adce3018)
+- Add comment explaining downloader pools by [@quodlibetor](https://github.com/quodlibetor) in [25b1411](https://github.com/quodlibetor/s3glob/commit/25b14110ae2ebfe1fa077476527b2014adce3018)
+
+### ⚙️ Miscellaneous Tasks
+
+- Improve changelog generation with github links by [@quodlibetor](https://github.com/quodlibetor) in [9f7f93b](https://github.com/quodlibetor/s3glob/commit/9f7f93bca87d3d74a0f127f1602a6ab4151e688e)
 
 ## [0.3.1](https://github.com/quodlibetor/s3glob/compare/v0.3.0..v0.3.1) - 2025-02-22
 
