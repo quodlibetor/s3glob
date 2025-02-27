@@ -13,6 +13,7 @@ use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use glob_matcher::{S3Engine, S3GlobMatcher, GLOB_CHARS};
 use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
+use messaging::{MessageLevel, MESSAGE_LEVEL};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::io::AsyncWriteExt as _;
@@ -21,6 +22,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, trace, warn};
 
 mod glob_matcher;
+mod messaging;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -232,6 +234,15 @@ struct Opts {
     #[clap(short, long, global = true, action = ArgAction::Count, verbatim_doc_comment)]
     verbose: u8,
 
+    /// Be more quiet, specify multiple times to increase quietness
+    ///
+    /// - `-q` will not show progress messages, only errors
+    /// - `-qq` will not even show error messages
+    ///
+    /// This overrides the --verbose flag if both are set.
+    #[clap(short, long, global = true, action = ArgAction::Count, verbatim_doc_comment)]
+    quiet: u8,
+
     /// Do not provide your credentials when issuing requests
     ///
     /// This is useful for downloading objects from a bucket that is not
@@ -242,20 +253,25 @@ struct Opts {
 
 fn main() {
     let opts = Opts::parse();
-    setup_logging(log_directive(opts.verbose));
+    setup_logging(log_directive(opts.verbose, opts.quiet));
+    if opts.quiet == 1 {
+        MESSAGE_LEVEL.get_or_init(|| MessageLevel::Quiet);
+    } else if opts.quiet >= 2 {
+        MESSAGE_LEVEL.get_or_init(|| MessageLevel::VeryQuiet);
+    }
     debug!(?opts, "parsed options");
 
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
         if let Err(err) = run(opts).await {
             // TODO: Separate user error from internal error?
-            eprintln!("Error: {}", err);
+            message_err!("Error: {}", err);
             let mut err = err.source();
             let mut count = 0;
             let mut prev_msg = String::new();
             while let Some(e) = err {
                 if e.to_string() != prev_msg {
-                    eprintln!("  : {}", e);
+                    message_err!("  : {}", e);
                     prev_msg = e.to_string();
                 }
                 err = e.source();
@@ -276,7 +292,7 @@ async fn run(opts: Opts) -> Result<()> {
     let pat = match &opts.command {
         Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
         Command::Parallelism { .. } => {
-            eprintln!("This is just for documentation, run instead: s3glob help parallelism");
+            progressln!("This is just for documentation, run instead: s3glob help parallelism");
             return Ok(());
         }
     };
@@ -300,7 +316,7 @@ async fn run(opts: Opts) -> Result<()> {
         Err(err) => {
             // the matcher prints some progress info to stderr, if there's an
             // error we should make sure to add a newline
-            eprintln!();
+            progressln!();
             return Err(err);
         }
     };
@@ -373,7 +389,7 @@ async fn run(opts: Opts) -> Result<()> {
                 } else {
                     match_count += results.len();
                     matching_objects.extend(results);
-                    eprint!(
+                    progress!(
                         "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
                         match_count.to_formatted_string(&Locale::en),
                         total_objects
@@ -384,13 +400,13 @@ async fn run(opts: Opts) -> Result<()> {
                     );
                 }
             }
-            eprintln!();
+            progressln!();
             let mut objects = matching_objects;
             objects.sort_by_key(|r| r.key().to_owned());
             for obj in objects {
                 print_prefix_result(&bucket, &user_format, decimal, obj);
             }
-            eprintln!(
+            progressln!(
                 "Matched {}/{} objects across {} prefixes in {:?}",
                 match_count,
                 total_objects.load(Ordering::Relaxed),
@@ -439,7 +455,7 @@ async fn run(opts: Opts) -> Result<()> {
                     }
                 }
 
-                eprint!(
+                progress!(
                     "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
                     total_matches.to_formatted_string(&Locale::en),
                     total_objects
@@ -456,7 +472,7 @@ async fn run(opts: Opts) -> Result<()> {
             if matches!(path_mode, PathMode::Shortest | PathMode::S) {
                 let prefix_to_strip =
                     extract_prefix_to_strip(&raw_pattern, path_mode, &objects_to_download);
-                eprintln!(
+                progressln!(
                     "Stripping longest common prefix from keys: {}",
                     prefix_to_strip
                 );
@@ -475,7 +491,7 @@ async fn run(opts: Opts) -> Result<()> {
             } else {
                 drop(ntfctn_tx);
             }
-            eprintln!();
+            progressln!();
             let start_time = Instant::now();
             let mut downloaded_matches = 0;
             let mut total_bytes = 0_usize;
@@ -493,7 +509,7 @@ async fn run(opts: Opts) -> Result<()> {
                 }
                 let elapsed = start_time.elapsed().as_secs_f64();
                 speed = total_bytes as f64 / elapsed;
-                eprint!(
+                progress!(
                     "\rdownloaded {}/{} objects, {:>7}   {:>10}/s",
                     downloaded_matches,
                     total_matches,
@@ -502,17 +518,17 @@ async fn run(opts: Opts) -> Result<()> {
                 );
             }
             if files.is_empty() {
-                eprintln!();
+                progressln!();
                 bail!("No objects found matching the pattern.");
             }
-            eprintln!("\n");
+            progressln!("\n");
 
             files.sort_unstable();
             for path in files {
                 println!("{}", path);
             }
             let dl_ms = start_time.elapsed().as_millis() as u64;
-            eprintln!(
+            progressln!(
                 "\ndiscovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
                 downloaded_matches,
                 Duration::from_millis(start.elapsed().as_millis() as u64 - dl_ms),
@@ -522,7 +538,7 @@ async fn run(opts: Opts) -> Result<()> {
             );
         }
         Command::Parallelism { .. } => {
-            eprintln!("This is just for documentation, run instead: s3glob help parallelism");
+            progressln!("This is just for documentation, run instead: s3glob help parallelism");
         }
     }
 
@@ -986,7 +1002,10 @@ async fn list_matching_objects(
     Ok(())
 }
 
-fn log_directive(loglevel: u8) -> Option<&'static str> {
+fn log_directive(loglevel: u8, quiet: u8) -> Option<&'static str> {
+    if quiet >= 2 {
+        return Some("s3glob=error");
+    }
     match loglevel {
         0 => None,
         1 => Some("s3glob=debug"),

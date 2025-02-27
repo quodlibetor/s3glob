@@ -13,6 +13,8 @@ use tracing::{debug, trace};
 mod engine;
 pub use engine::{Engine, S3Engine};
 
+use crate::{progress, progressln};
+
 mod glob;
 
 pub(crate) const GLOB_CHARS: &[char] = &['*', '?', '[', '{'];
@@ -149,9 +151,9 @@ impl S3GlobMatcher {
             debug!(%regex_so_far, new_part = %part.re_string(&delimiter), prefix_count = prefixes.len(), "scanning for part");
             if tracing::enabled!(tracing::Level::DEBUG) {
                 // don't overwrite log messages
-                eprintln!("Discovering prefixes: {:>6}", prefixes.len());
+                progressln!("Discovering prefixes: {:>6}", prefixes.len());
             } else {
-                eprint!("\rDiscovering prefixes: {:>6}", prefixes.len());
+                progress!("\rDiscovering prefixes: {:>6}", prefixes.len());
             }
             // We always want to scan for things including the last part,
             // finding more prefixes in it is guaranteed to be slower than
@@ -401,10 +403,10 @@ impl S3GlobMatcher {
 
         if prefixes.len() < self.min_prefixes {
             let count = prefixes.len();
-            eprintln!("\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow");
+            progressln!("\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow");
         } else {
             // clear the previous output
-            eprintln!(
+            progressln!(
                 "\r                                          \
                  \rDiscovered prefixes: {:>5}",
                 prefixes.len()

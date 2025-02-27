@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use tracing::info;
 
+use crate::progressln;
+
 #[async_trait::async_trait]
 pub trait Engine: Send + Sync + 'static {
     async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>>;
@@ -56,7 +58,7 @@ impl Engine for S3Engine {
             let page = page?;
             if prefixes.len() >= warning_count + warning_inc {
                 if warning_count == 0 {
-                    eprintln!(); // create a new line after the "discovering.." message
+                    progressln!(); // create a new line after the "discovering.." message
                 }
                 warn!(
                     "found {} objects in {prefix} and still discovering more",
