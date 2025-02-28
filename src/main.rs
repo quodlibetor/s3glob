@@ -19,6 +19,7 @@ use regex::Regex;
 use tokio::io::AsyncWriteExt as _;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Semaphore;
 use tracing::{debug, trace, warn};
 
 mod glob_matcher;
@@ -106,11 +107,15 @@ enum Command {
     /// Learn how to tune s3glob's parallelism for better performance
     ///
     /// You only need to read this doc if you feel like s3glob is running
-    /// slower than you hope.
+    /// slower than you hope, or if you're getting a slowdown error.
     ///
-    /// Because of the APIs provided by AWS, s3glob can only meaningfully issue
-    /// parallel requests for prefixes. Additionally, prefixes can only be
-    /// generated before a delimiter.
+    /// If you want to limit parallel API calls, you can use the
+    /// --max-parallelism flag.
+    ///
+    /// You probably want the maximum parallelism possible. Because of the
+    /// APIs provided by AWS, s3glob can only meaningfully issue parallel
+    /// requests for prefixes. Additionally, prefixes can only be generated
+    /// before a delimiter.
     ///
     /// So if you have a keyspace (using {..-..} to represent a range) that
     /// looks like:
@@ -249,6 +254,13 @@ struct Opts {
     /// associated with your AWS account, such as a public bucket.
     #[clap(long, global = true, alias = "no-sign-requests")]
     no_sign_request: bool,
+
+    /// Maximum number of parallel requests to make
+    ///
+    /// If you get a slowdown error you can use this to limit the number of
+    /// concurrent requests.
+    #[clap(short = 'M', long, global = true, default_value = "10000")]
+    max_parallelism: usize,
 }
 
 fn main() {
@@ -310,7 +322,8 @@ async fn run(opts: Opts) -> Result<()> {
     let client = create_s3_client(&opts, &bucket).await?;
 
     let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
-    let matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
+    let mut matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
+    matcher.set_max_parallelism(opts.max_parallelism);
     let presult = match matcher.find_prefixes(engine).await {
         Ok(prefixes) => prefixes,
         Err(err) => {
@@ -331,12 +344,15 @@ async fn run(opts: Opts) -> Result<()> {
     let total_prefixes = presult.prefixes.len();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
     if matcher.is_complete() {
+        let permit = Arc::new(Semaphore::new(opts.max_parallelism));
         for prefix in presult.prefixes {
             // just get the object info for each prefix
             let client = client.clone();
             let bucket = bucket.clone();
             let prefix = prefix.clone();
             let tx = tx.clone();
+            let permit = permit.clone().acquire_owned().await;
+
             total_objects.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let r = client
@@ -345,6 +361,7 @@ async fn run(opts: Opts) -> Result<()> {
                     .key(prefix.clone())
                     .send()
                     .await;
+                drop(permit);
                 match r {
                     Ok(o) => tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
                         prefix, o,
@@ -354,6 +371,7 @@ async fn run(opts: Opts) -> Result<()> {
             });
         }
     } else {
+        let permit = Arc::new(Semaphore::new(opts.max_parallelism));
         for prefix in presult.prefixes {
             let client = client.clone();
             let total_objects = Arc::clone(&total_objects);
@@ -361,10 +379,12 @@ async fn run(opts: Opts) -> Result<()> {
             let matcher = matcher.clone();
             let bucket = bucket.clone();
             let tx = tx.clone();
+            let permit = permit.clone().acquire_owned().await;
 
             tokio::spawn(async move {
                 list_matching_objects(&client, &bucket, &prefix, &matcher, total_objects, tx)
                     .await?;
+                drop(permit);
 
                 add_atomic(&seen_prefixes, 1);
                 Ok::<_, anyhow::Error>(())
@@ -428,7 +448,7 @@ async fn run(opts: Opts) -> Result<()> {
             ..
         } => {
             let mut total_matches = 0;
-            let pools = DlPools::new();
+            let pools = DlPools::new(opts.max_parallelism);
             let prefix_to_strip = extract_prefix_to_strip(&raw_pattern, path_mode, &[]);
             let (ntfctn_tx, mut ntfctn_rx) = tokio::sync::mpsc::unbounded_channel::<Notification>();
             let base_path = PathBuf::from(dest);
@@ -492,7 +512,7 @@ async fn run(opts: Opts) -> Result<()> {
                     base_path,
                     ntfctn_tx,
                 );
-                let pools = DlPools::new();
+                let pools = DlPools::new(opts.max_parallelism);
                 for obj in objects_to_download {
                     pools.download_object(dl.fresh(), obj);
                 }
@@ -595,20 +615,20 @@ struct DlPools {
 
 impl DlPools {
     /// Create a new set of downloader pools
-    fn new() -> DlPools {
+    fn new(max_parallelism: usize) -> DlPools {
         let (two_hundred_kb, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(500));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(500)));
         start_threadpool(semaphore, rx);
         let (one_mb, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(50));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(50)));
         start_threadpool(semaphore, rx);
 
         let (ten_mb, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(10)));
         start_threadpool(semaphore, rx);
 
         let (more, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(5)));
         start_threadpool(semaphore, rx);
 
         Self {

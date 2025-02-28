@@ -2,12 +2,14 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
 use glob::Glob;
 use globset::GlobMatcher;
 use itertools::Itertools as _;
 use regex::Regex;
+use tokio::sync::Semaphore;
 use tracing::{debug, trace, warn};
 
 mod engine;
@@ -38,6 +40,7 @@ pub struct S3GlobMatcher {
     delimiter: char,
     parts: Vec<glob::Glob>,
     glob: GlobMatcher,
+    max_parallelism: usize,
     min_prefixes: usize,
     /// True if no further listing needs to be done by the caller
     ///
@@ -108,9 +111,16 @@ impl S3GlobMatcher {
             delimiter: delimiter.chars().next().unwrap(),
             parts: new_parts,
             glob: glob.compile_matcher(),
+            max_parallelism: 500,
             min_prefixes: DESIRED_MIN_PREFIXES,
             is_complete,
         })
+    }
+
+    // TODO: this should be a constructor argument, but I don't want to change
+    // all the tests right now
+    pub fn set_max_parallelism(&mut self, max_parallelism: usize) {
+        self.max_parallelism = max_parallelism;
     }
 
     /// Find all S3 prefixes that could match this pattern
@@ -190,10 +200,12 @@ impl S3GlobMatcher {
                         let (tx, mut rx) = tokio::sync::mpsc::channel(prefixes.len());
 
                         let mut tasks = Vec::new();
+                        let semaphore = Arc::new(Semaphore::new(self.max_parallelism));
                         for prefix in &prefixes {
                             let client_prefix = prefix.clone();
                             let delimiter = delimiter.clone();
                             let tx = tx.clone();
+                            let permit = semaphore.clone().acquire_owned().await;
                             let mut engine = engine.clone();
                             let prefix = prefix.clone();
 
@@ -206,6 +218,7 @@ impl S3GlobMatcher {
                                         let _ = tx.send(Err(e)).await;
                                     }
                                 }
+                                drop(permit);
                             });
                             tasks.push(task);
                         }
@@ -288,7 +301,13 @@ impl S3GlobMatcher {
                             break;
                         }
                         max_objects_observed = max_objects_observed.max(new_prefixes.len());
-                        prefixes = check_prefixes(&mut engine, &prefixes, new_prefixes).await?;
+                        prefixes = check_prefixes(
+                            &mut engine,
+                            &prefixes,
+                            new_prefixes,
+                            self.max_parallelism,
+                        )
+                        .await?;
                     } else {
                         // Build up the filters and appends
                         let mut filters = BTreeSet::new();
@@ -387,7 +406,13 @@ impl S3GlobMatcher {
                             }
                             trace!(new_prefixes = ?new_prefixes, new_prefix_count = new_prefixes.len(), "checking appended prefixes");
                             max_objects_observed = max_objects_observed.max(new_prefixes.len());
-                            prefixes = check_prefixes(&mut engine, &prefixes, new_prefixes).await?;
+                            prefixes = check_prefixes(
+                                &mut engine,
+                                &prefixes,
+                                new_prefixes,
+                                self.max_parallelism,
+                            )
+                            .await?;
                         } else if !new_prefixes.is_empty() {
                             debug!("no appends, using new prefixes");
                             prefixes = new_prefixes;
@@ -461,11 +486,14 @@ async fn check_prefixes(
     engine: &mut (impl Engine + Clone),
     prefixes: &BTreeSet<String>,
     new_prefixes: BTreeSet<String>,
+    max_parallelism: usize,
 ) -> Result<BTreeSet<String>, anyhow::Error> {
     if prefixes.is_empty() || new_prefixes.is_empty() {
         bail!("Surprisingly, no prefixes to build off of and no prefixes found");
     }
-    let checked_prefixes = engine.check_prefixes(new_prefixes.clone()).await?;
+    let checked_prefixes = engine
+        .check_prefixes(new_prefixes.clone(), max_parallelism)
+        .await?;
     if checked_prefixes.is_empty() {
         let mut message = vec!["Searched for prefixes do not exist in the bucket:".to_string()];
         let new_prefixes = new_prefixes.iter().collect::<Vec<_>>();

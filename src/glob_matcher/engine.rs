@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use aws_sdk_s3::Client;
@@ -6,7 +7,7 @@ use num_format::{Locale, ToFormattedString as _};
 use tracing::{debug, trace, warn};
 
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 #[cfg(test)]
 use tracing::info;
 
@@ -15,7 +16,11 @@ use crate::progressln;
 #[async_trait::async_trait]
 pub trait Engine: Send + Sync + 'static {
     async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>>;
-    async fn check_prefixes<P>(&mut self, prefixes: P) -> Result<BTreeSet<String>>
+    async fn check_prefixes<P>(
+        &mut self,
+        prefixes: P,
+        max_parallelism: usize,
+    ) -> Result<BTreeSet<String>>
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static;
@@ -81,7 +86,11 @@ impl Engine for S3Engine {
 
     // TODO: convert this to take &mut prefixes so that we don't have to
     // reallocate the vector on each call
-    async fn check_prefixes<P>(&mut self, prefixes: P) -> Result<BTreeSet<String>>
+    async fn check_prefixes<P>(
+        &mut self,
+        prefixes: P,
+        max_parallelism: usize,
+    ) -> Result<BTreeSet<String>>
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static,
@@ -90,11 +99,14 @@ impl Engine for S3Engine {
         let prefixes = prefixes.into_iter();
         let (tx, mut rx) = tokio::sync::mpsc::channel(prefixes.size_hint().0);
 
+        let permit = Arc::new(tokio::sync::Semaphore::new(max_parallelism));
+
         for prefix in prefixes {
             let client = self.client.clone();
             let bucket = self.bucket.clone();
             let tx = tx.clone();
             let prefix = prefix.clone();
+            let permit = permit.clone().acquire_owned().await;
 
             tokio::spawn(async move {
                 let result = client
@@ -104,6 +116,7 @@ impl Engine for S3Engine {
                     .max_keys(1)
                     .send()
                     .await;
+                drop(permit);
 
                 match result {
                     Ok(response) => {
@@ -153,7 +166,11 @@ impl Engine for MockS3Engine {
         found
     }
 
-    async fn check_prefixes<P>(&mut self, prefixes: P) -> Result<BTreeSet<String>>
+    async fn check_prefixes<P>(
+        &mut self,
+        prefixes: P,
+        _max_parallelism: usize,
+    ) -> Result<BTreeSet<String>>
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static,
