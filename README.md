@@ -6,6 +6,8 @@ glob patterns.
 In my experience (on an ec2 instance) s3glob can list 10s of millions of files
 in about 5 seconds, where I gave up on `aws s3 ls` after 5 minutes.
 
+![s3glob in action](./static/s3glob.gif)
+
 ## Usage
 
 These two commands are equivalent:

@@ -13,14 +13,17 @@ use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use glob_matcher::{S3Engine, S3GlobMatcher, GLOB_CHARS};
 use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
+use messaging::{MessageLevel, MESSAGE_LEVEL};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::io::AsyncWriteExt as _;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Semaphore;
 use tracing::{debug, trace, warn};
 
 mod glob_matcher;
+mod messaging;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -104,11 +107,15 @@ enum Command {
     /// Learn how to tune s3glob's parallelism for better performance
     ///
     /// You only need to read this doc if you feel like s3glob is running
-    /// slower than you hope.
+    /// slower than you hope, or if you're getting a slowdown error.
     ///
-    /// Because of the APIs provided by AWS, s3glob can only meaningfully issue
-    /// parallel requests for prefixes. Additionally, prefixes can only be
-    /// generated before a delimiter.
+    /// If you want to limit parallel API calls, you can use the
+    /// --max-parallelism flag.
+    ///
+    /// You probably want the maximum parallelism possible. Because of the
+    /// APIs provided by AWS, s3glob can only meaningfully issue parallel
+    /// requests for prefixes. Additionally, prefixes can only be generated
+    /// before a delimiter.
     ///
     /// So if you have a keyspace (using {..-..} to represent a range) that
     /// looks like:
@@ -232,30 +239,51 @@ struct Opts {
     #[clap(short, long, global = true, action = ArgAction::Count, verbatim_doc_comment)]
     verbose: u8,
 
+    /// Be more quiet, specify multiple times to increase quietness
+    ///
+    /// - `-q` will not show progress messages, only errors
+    /// - `-qq` will not even show error messages
+    ///
+    /// This overrides the --verbose flag if both are set.
+    #[clap(short, long, global = true, action = ArgAction::Count, verbatim_doc_comment)]
+    quiet: u8,
+
     /// Do not provide your credentials when issuing requests
     ///
     /// This is useful for downloading objects from a bucket that is not
     /// associated with your AWS account, such as a public bucket.
     #[clap(long, global = true, alias = "no-sign-requests")]
     no_sign_request: bool,
+
+    /// Maximum number of parallel requests to make
+    ///
+    /// If you get a slowdown error you can use this to limit the number of
+    /// concurrent requests.
+    #[clap(short = 'M', long, global = true, default_value = "10000")]
+    max_parallelism: usize,
 }
 
 fn main() {
     let opts = Opts::parse();
-    setup_logging(log_directive(opts.verbose));
+    setup_logging(log_directive(opts.verbose, opts.quiet));
+    if opts.quiet == 1 {
+        MESSAGE_LEVEL.get_or_init(|| MessageLevel::Quiet);
+    } else if opts.quiet >= 2 {
+        MESSAGE_LEVEL.get_or_init(|| MessageLevel::VeryQuiet);
+    }
     debug!(?opts, "parsed options");
 
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
         if let Err(err) = run(opts).await {
             // TODO: Separate user error from internal error?
-            eprintln!("Error: {}", err);
+            message_err!("Error: {}", err);
             let mut err = err.source();
             let mut count = 0;
             let mut prev_msg = String::new();
             while let Some(e) = err {
                 if e.to_string() != prev_msg {
-                    eprintln!("  : {}", e);
+                    message_err!("  : {}", e);
                     prev_msg = e.to_string();
                 }
                 err = e.source();
@@ -276,7 +304,7 @@ async fn run(opts: Opts) -> Result<()> {
     let pat = match &opts.command {
         Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
         Command::Parallelism { .. } => {
-            eprintln!("This is just for documentation, run instead: s3glob help parallelism");
+            progressln!("This is just for documentation, run instead: s3glob help parallelism");
             return Ok(());
         }
     };
@@ -294,30 +322,37 @@ async fn run(opts: Opts) -> Result<()> {
     let client = create_s3_client(&opts, &bucket).await?;
 
     let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
-    let matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
-    let prefixes = match matcher.find_prefixes(engine).await {
+    let mut matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
+    matcher.set_max_parallelism(opts.max_parallelism);
+    let presult = match matcher.find_prefixes(engine).await {
         Ok(prefixes) => prefixes,
         Err(err) => {
             // the matcher prints some progress info to stderr, if there's an
             // error we should make sure to add a newline
-            eprintln!();
+            progressln!();
             return Err(err);
         }
     };
-    trace!(?prefixes, "matcher generated prefixes");
-    debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
+    trace!(?presult.prefixes, "matcher generated prefixes");
+    debug!(
+        prefix_count = presult.prefixes.len(),
+        "matcher generated prefixes"
+    );
 
     let total_objects = Arc::new(AtomicUsize::new(0));
     let seen_prefixes = Arc::new(AtomicUsize::new(0));
-    let total_prefixes = prefixes.len();
+    let total_prefixes = presult.prefixes.len();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
     if matcher.is_complete() {
-        for prefix in prefixes {
+        let permit = Arc::new(Semaphore::new(opts.max_parallelism));
+        for prefix in presult.prefixes {
             // just get the object info for each prefix
             let client = client.clone();
             let bucket = bucket.clone();
             let prefix = prefix.clone();
             let tx = tx.clone();
+            let permit = permit.clone().acquire_owned().await;
+
             total_objects.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let r = client
@@ -326,6 +361,7 @@ async fn run(opts: Opts) -> Result<()> {
                     .key(prefix.clone())
                     .send()
                     .await;
+                drop(permit);
                 match r {
                     Ok(o) => tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
                         prefix, o,
@@ -335,17 +371,20 @@ async fn run(opts: Opts) -> Result<()> {
             });
         }
     } else {
-        for prefix in prefixes {
+        let permit = Arc::new(Semaphore::new(opts.max_parallelism));
+        for prefix in presult.prefixes {
             let client = client.clone();
             let total_objects = Arc::clone(&total_objects);
             let seen_prefixes = Arc::clone(&seen_prefixes);
             let matcher = matcher.clone();
             let bucket = bucket.clone();
             let tx = tx.clone();
+            let permit = permit.clone().acquire_owned().await;
 
             tokio::spawn(async move {
                 list_matching_objects(&client, &bucket, &prefix, &matcher, total_objects, tx)
                     .await?;
+                drop(permit);
 
                 add_atomic(&seen_prefixes, 1);
                 Ok::<_, anyhow::Error>(())
@@ -373,28 +412,32 @@ async fn run(opts: Opts) -> Result<()> {
                 } else {
                     match_count += results.len();
                     matching_objects.extend(results);
-                    eprint!(
-                        "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
-                        match_count.to_formatted_string(&Locale::en),
-                        total_objects
-                            .load(Ordering::Relaxed)
-                            .to_formatted_string(&Locale::en),
-                        seen_prefixes.load(Ordering::Relaxed),
-                        total_prefixes
-                    );
+                    if !matcher.is_complete() {
+                        progress!(
+                            "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                            match_count.to_formatted_string(&Locale::en),
+                            total_objects
+                                .load(Ordering::Relaxed)
+                                .to_formatted_string(&Locale::en),
+                            seen_prefixes.load(Ordering::Relaxed),
+                            total_prefixes
+                        );
+                    }
                 }
             }
-            eprintln!();
+            progressln!();
             let mut objects = matching_objects;
             objects.sort_by_key(|r| r.key().to_owned());
             for obj in objects {
                 print_prefix_result(&bucket, &user_format, decimal, obj);
             }
-            eprintln!(
+            progressln!(
                 "Matched {}/{} objects across {} prefixes in {:?}",
                 match_count,
-                total_objects.load(Ordering::Relaxed),
-                total_prefixes,
+                total_objects
+                    .load(Ordering::Relaxed)
+                    .max(presult.max_objects_observed),
+                presult.max_prefixes_observed,
                 Duration::from_millis(start.elapsed().as_millis() as u64)
             );
         }
@@ -405,7 +448,7 @@ async fn run(opts: Opts) -> Result<()> {
             ..
         } => {
             let mut total_matches = 0;
-            let pools = DlPools::new();
+            let pools = DlPools::new(opts.max_parallelism);
             let prefix_to_strip = extract_prefix_to_strip(&raw_pattern, path_mode, &[]);
             let (ntfctn_tx, mut ntfctn_rx) = tokio::sync::mpsc::unbounded_channel::<Notification>();
             let base_path = PathBuf::from(dest);
@@ -438,16 +481,17 @@ async fn run(opts: Opts) -> Result<()> {
                         }
                     }
                 }
-
-                eprint!(
-                    "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
-                    total_matches.to_formatted_string(&Locale::en),
-                    total_objects
-                        .load(Ordering::Relaxed)
-                        .to_formatted_string(&Locale::en),
-                    seen_prefixes.load(Ordering::Relaxed),
-                    total_prefixes
-                );
+                if !matcher.is_complete() {
+                    progress!(
+                        "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                        total_matches.to_formatted_string(&Locale::en),
+                        total_objects
+                            .load(Ordering::Relaxed)
+                            .to_formatted_string(&Locale::en),
+                        seen_prefixes.load(Ordering::Relaxed),
+                        total_prefixes
+                    );
+                }
             }
             debug!("closing downloader tx");
             // close the tx so the downloaders know to finish
@@ -456,7 +500,7 @@ async fn run(opts: Opts) -> Result<()> {
             if matches!(path_mode, PathMode::Shortest | PathMode::S) {
                 let prefix_to_strip =
                     extract_prefix_to_strip(&raw_pattern, path_mode, &objects_to_download);
-                eprintln!(
+                progressln!(
                     "Stripping longest common prefix from keys: {}",
                     prefix_to_strip
                 );
@@ -468,14 +512,14 @@ async fn run(opts: Opts) -> Result<()> {
                     base_path,
                     ntfctn_tx,
                 );
-                let pools = DlPools::new();
+                let pools = DlPools::new(opts.max_parallelism);
                 for obj in objects_to_download {
                     pools.download_object(dl.fresh(), obj);
                 }
             } else {
                 drop(ntfctn_tx);
             }
-            eprintln!();
+            progressln!();
             let start_time = Instant::now();
             let mut downloaded_matches = 0;
             let mut total_bytes = 0_usize;
@@ -493,7 +537,7 @@ async fn run(opts: Opts) -> Result<()> {
                 }
                 let elapsed = start_time.elapsed().as_secs_f64();
                 speed = total_bytes as f64 / elapsed;
-                eprint!(
+                progress!(
                     "\rdownloaded {}/{} objects, {:>7}   {:>10}/s",
                     downloaded_matches,
                     total_matches,
@@ -502,17 +546,17 @@ async fn run(opts: Opts) -> Result<()> {
                 );
             }
             if files.is_empty() {
-                eprintln!();
+                progressln!();
                 bail!("No objects found matching the pattern.");
             }
-            eprintln!("\n");
+            progressln!("\n");
 
             files.sort_unstable();
             for path in files {
                 println!("{}", path);
             }
             let dl_ms = start_time.elapsed().as_millis() as u64;
-            eprintln!(
+            progressln!(
                 "\ndiscovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
                 downloaded_matches,
                 Duration::from_millis(start.elapsed().as_millis() as u64 - dl_ms),
@@ -522,7 +566,7 @@ async fn run(opts: Opts) -> Result<()> {
             );
         }
         Command::Parallelism { .. } => {
-            eprintln!("This is just for documentation, run instead: s3glob help parallelism");
+            progressln!("This is just for documentation, run instead: s3glob help parallelism");
         }
     }
 
@@ -571,20 +615,20 @@ struct DlPools {
 
 impl DlPools {
     /// Create a new set of downloader pools
-    fn new() -> DlPools {
+    fn new(max_parallelism: usize) -> DlPools {
         let (two_hundred_kb, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(500));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(500)));
         start_threadpool(semaphore, rx);
         let (one_mb, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(50));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(50)));
         start_threadpool(semaphore, rx);
 
         let (ten_mb, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(10)));
         start_threadpool(semaphore, rx);
 
         let (more, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(5)));
         start_threadpool(semaphore, rx);
 
         Self {
@@ -986,7 +1030,10 @@ async fn list_matching_objects(
     Ok(())
 }
 
-fn log_directive(loglevel: u8) -> Option<&'static str> {
+fn log_directive(loglevel: u8, quiet: u8) -> Option<&'static str> {
+    if quiet >= 2 {
+        return Some("s3glob=error");
+    }
     match loglevel {
         0 => None,
         1 => Some("s3glob=debug"),
