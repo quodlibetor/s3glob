@@ -311,7 +311,7 @@ async fn run(opts: Opts) -> Result<()> {
 
     let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
     let matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
-    let prefixes = match matcher.find_prefixes(engine).await {
+    let presult = match matcher.find_prefixes(engine).await {
         Ok(prefixes) => prefixes,
         Err(err) => {
             // the matcher prints some progress info to stderr, if there's an
@@ -320,15 +320,18 @@ async fn run(opts: Opts) -> Result<()> {
             return Err(err);
         }
     };
-    trace!(?prefixes, "matcher generated prefixes");
-    debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
+    trace!(?presult.prefixes, "matcher generated prefixes");
+    debug!(
+        prefix_count = presult.prefixes.len(),
+        "matcher generated prefixes"
+    );
 
     let total_objects = Arc::new(AtomicUsize::new(0));
     let seen_prefixes = Arc::new(AtomicUsize::new(0));
-    let total_prefixes = prefixes.len();
+    let total_prefixes = presult.prefixes.len();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
     if matcher.is_complete() {
-        for prefix in prefixes {
+        for prefix in presult.prefixes {
             // just get the object info for each prefix
             let client = client.clone();
             let bucket = bucket.clone();
@@ -351,7 +354,7 @@ async fn run(opts: Opts) -> Result<()> {
             });
         }
     } else {
-        for prefix in prefixes {
+        for prefix in presult.prefixes {
             let client = client.clone();
             let total_objects = Arc::clone(&total_objects);
             let seen_prefixes = Arc::clone(&seen_prefixes);
@@ -389,15 +392,17 @@ async fn run(opts: Opts) -> Result<()> {
                 } else {
                     match_count += results.len();
                     matching_objects.extend(results);
-                    progress!(
-                        "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
-                        match_count.to_formatted_string(&Locale::en),
-                        total_objects
-                            .load(Ordering::Relaxed)
-                            .to_formatted_string(&Locale::en),
-                        seen_prefixes.load(Ordering::Relaxed),
-                        total_prefixes
-                    );
+                    if !matcher.is_complete() {
+                        progress!(
+                            "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                            match_count.to_formatted_string(&Locale::en),
+                            total_objects
+                                .load(Ordering::Relaxed)
+                                .to_formatted_string(&Locale::en),
+                            seen_prefixes.load(Ordering::Relaxed),
+                            total_prefixes
+                        );
+                    }
                 }
             }
             progressln!();
@@ -409,8 +414,10 @@ async fn run(opts: Opts) -> Result<()> {
             progressln!(
                 "Matched {}/{} objects across {} prefixes in {:?}",
                 match_count,
-                total_objects.load(Ordering::Relaxed),
-                total_prefixes,
+                total_objects
+                    .load(Ordering::Relaxed)
+                    .max(presult.max_objects_observed),
+                presult.max_prefixes_observed,
                 Duration::from_millis(start.elapsed().as_millis() as u64)
             );
         }
@@ -454,16 +461,17 @@ async fn run(opts: Opts) -> Result<()> {
                         }
                     }
                 }
-
-                progress!(
-                    "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
-                    total_matches.to_formatted_string(&Locale::en),
-                    total_objects
-                        .load(Ordering::Relaxed)
-                        .to_formatted_string(&Locale::en),
-                    seen_prefixes.load(Ordering::Relaxed),
-                    total_prefixes
-                );
+                if !matcher.is_complete() {
+                    progress!(
+                        "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                        total_matches.to_formatted_string(&Locale::en),
+                        total_objects
+                            .load(Ordering::Relaxed)
+                            .to_formatted_string(&Locale::en),
+                        seen_prefixes.load(Ordering::Relaxed),
+                        total_prefixes
+                    );
+                }
             }
             debug!("closing downloader tx");
             // close the tx so the downloaders know to finish
