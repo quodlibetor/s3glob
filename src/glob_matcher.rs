@@ -1,10 +1,9 @@
 //! A pattern is a glob that knows how to split itself into a prefix and join with a partial prefix
-#![allow(dead_code)]
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use glob::Glob;
 use globset::GlobMatcher;
 use itertools::Itertools as _;
@@ -423,9 +422,26 @@ impl S3GlobMatcher {
                                 .take(part_idx + 1)
                                 .map(|p| p.raw())
                                 .join("");
+                            let max_prefixes = if tracing::enabled!(tracing::Level::DEBUG) {
+                                usize::MAX
+                            } else {
+                                20
+                            };
+                            let and_more = if prefixes.len() > max_prefixes {
+                                format!(
+                                    "\n  ...and {} more (run with --verbose to see all)",
+                                    prefixes.len() - max_prefixes
+                                )
+                            } else {
+                                String::new()
+                            };
+
                             bail!(
-                                "No existing prefixes matched the filter: {glob_so_far}\n  {}",
-                                prefixes.iter().join("\n  ")
+                                "Could not continue search in prefixes:\n  {}{}\
+                                \n\n\
+                                None of the above matched the pattern:\n  {glob_so_far}",
+                                prefixes.iter().take(max_prefixes).join("\n  "),
+                                and_more,
                             );
                         }
                     }
@@ -444,7 +460,9 @@ impl S3GlobMatcher {
 
         if prefixes.len() < self.min_prefixes && !self.is_complete {
             let count = prefixes.len();
-            progressln!("\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow");
+            progressln!(
+                "\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow"
+            );
         } else if self.is_complete {
             // clear the previous output
             progressln!(
@@ -520,14 +538,7 @@ async fn check_prefixes(
 }
 
 fn prefix_join(prefix: &str, alt: &str) -> String {
-    // minio doesn't support double forward slashes in the path
-    // https://github.com/minio/minio/issues/5874
-    // TODO: make this something the user can configure?
-    if prefix.ends_with('/') && alt.starts_with('/') {
-        format!("{prefix}{}", &alt[1..])
-    } else {
-        format!("{prefix}{alt}")
-    }
+    format!("{prefix}{alt}")
 }
 
 #[cfg(test)]
@@ -820,10 +831,7 @@ mod tests {
         ]);
 
         let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
-        // TODO: there is a legitimate case that this should only be
-        // src/tmp/file, but we strip double forward slashes to work around
-        // minio
-        assert!(prefixes == vec!["src/file", "src/tmp/file"]);
+        assert!(prefixes == vec!["src/tmp/file"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
         Ok(())
