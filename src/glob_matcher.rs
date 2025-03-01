@@ -423,9 +423,26 @@ impl S3GlobMatcher {
                                 .take(part_idx + 1)
                                 .map(|p| p.raw())
                                 .join("");
+                            let max_prefixes = if tracing::enabled!(tracing::Level::DEBUG) {
+                                usize::MAX
+                            } else {
+                                20
+                            };
+                            let and_more = if prefixes.len() > max_prefixes {
+                                format!(
+                                    "\n  ...and {} more (run with --verbose to see all)",
+                                    prefixes.len() - max_prefixes
+                                )
+                            } else {
+                                String::new()
+                            };
+
                             bail!(
-                                "No existing prefixes matched the filter: {glob_so_far}\n  {}",
-                                prefixes.iter().join("\n  ")
+                                "Could not continue search in prefixes:\n  {}{}\
+                                \n\n\
+                                None of the above matched the pattern:\n  {glob_so_far}",
+                                prefixes.iter().take(max_prefixes).join("\n  "),
+                                and_more,
                             );
                         }
                     }
