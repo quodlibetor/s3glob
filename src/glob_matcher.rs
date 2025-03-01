@@ -536,14 +536,7 @@ async fn check_prefixes(
 }
 
 fn prefix_join(prefix: &str, alt: &str) -> String {
-    // minio doesn't support double forward slashes in the path
-    // https://github.com/minio/minio/issues/5874
-    // TODO: make this something the user can configure?
-    if prefix.ends_with('/') && alt.starts_with('/') {
-        format!("{prefix}{}", &alt[1..])
-    } else {
-        format!("{prefix}{alt}")
-    }
+    format!("{prefix}{alt}")
 }
 
 #[cfg(test)]
@@ -836,10 +829,7 @@ mod tests {
         ]);
 
         let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
-        // TODO: there is a legitimate case that this should only be
-        // src/tmp/file, but we strip double forward slashes to work around
-        // minio
-        assert!(prefixes == vec!["src/file", "src/tmp/file"]);
+        assert!(prefixes == vec!["src/tmp/file"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
         Ok(())
