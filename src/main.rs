@@ -1,26 +1,29 @@
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::Object;
-use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
+use aws_sdk_s3::{Client, config::BehaviorVersion, config::Region};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use glob_matcher::{S3Engine, S3GlobMatcher, GLOB_CHARS};
-use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
+use glob_matcher::{GLOB_CHARS, S3Engine, S3GlobMatcher};
+use humansize::{DECIMAL, FormatSizeOptions, SizeFormatter};
+use messaging::{MESSAGE_LEVEL, MessageLevel};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::io::AsyncWriteExt as _;
 use tokio::runtime::Runtime;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, trace, warn};
 
 mod glob_matcher;
+mod messaging;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -88,18 +91,31 @@ enum Command {
         /// - from-first-glob | g: the key path relative to the first path part
         ///   containing a glob in the pattern will be reproduced in the
         ///   destination
+        /// - shortest | s: the shortest path that can be made without conflicts.
+        ///   This strips the longest common directory prefix from the key path.
         #[clap(short, long, verbatim_doc_comment, default_value = "from-first-glob")]
-        path_mode: PathType,
+        path_mode: PathMode,
+
+        /// Flatten the downloaded files into a single directory
+        ///
+        /// This will replace all slashes in the key path with dashes in the
+        /// downloaded file.
+        #[clap(long)]
+        flatten: bool,
     },
 
     /// Learn how to tune s3glob's parallelism for better performance
     ///
     /// You only need to read this doc if you feel like s3glob is running
-    /// slower than you hope.
+    /// slower than you hope, or if you're getting a slowdown error.
     ///
-    /// Because of the APIs provided by AWS, s3glob can only meaningfully issue
-    /// parallel requests for prefixes. Additionally, prefixes can only be
-    /// generated before a delimiter.
+    /// If you want to limit parallel API calls, you can use the
+    /// --max-parallelism flag.
+    ///
+    /// You probably want the maximum parallelism possible. Because of the
+    /// APIs provided by AWS, s3glob can only meaningfully issue parallel
+    /// requests for prefixes. Additionally, prefixes can only be generated
+    /// before a delimiter.
     ///
     /// So if you have a keyspace (using {..-..} to represent a range) that
     /// looks like:
@@ -134,37 +150,44 @@ enum Command {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PathType {
+enum PathMode {
     Abs,
     Absolute,
     G,
     FromFirstGlob,
+    S,
+    Shortest,
 }
 
-impl ValueEnum for PathType {
+impl ValueEnum for PathMode {
     fn value_variants<'a>() -> &'a [Self] {
         &[
-            PathType::Absolute,
-            PathType::Abs,
-            PathType::FromFirstGlob,
-            PathType::G,
+            PathMode::Absolute,
+            PathMode::Abs,
+            PathMode::FromFirstGlob,
+            PathMode::G,
+            PathMode::S,
+            PathMode::Shortest,
         ]
     }
 
     fn from_str(s: &str, _ignore_case: bool) -> Result<Self, String> {
         match s {
-            "absolute" | "abs" => Ok(PathType::Absolute),
-            "from-first-glob" | "g" => Ok(PathType::FromFirstGlob),
+            "absolute" | "abs" => Ok(PathMode::Absolute),
+            "from-first-glob" | "g" => Ok(PathMode::FromFirstGlob),
+            "shortest" | "s" => Ok(PathMode::Shortest),
             _ => Err(format!("invalid path type: {}", s)),
         }
     }
 
     fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
         match self {
-            PathType::Abs => Some(clap::builder::PossibleValue::new("abs")),
-            PathType::Absolute => Some(clap::builder::PossibleValue::new("absolute")),
-            PathType::FromFirstGlob => Some(clap::builder::PossibleValue::new("from-first-glob")),
-            PathType::G => Some(clap::builder::PossibleValue::new("g")),
+            PathMode::Abs => Some(clap::builder::PossibleValue::new("abs")),
+            PathMode::Absolute => Some(clap::builder::PossibleValue::new("absolute")),
+            PathMode::FromFirstGlob => Some(clap::builder::PossibleValue::new("from-first-glob")),
+            PathMode::G => Some(clap::builder::PossibleValue::new("g")),
+            PathMode::Shortest => Some(clap::builder::PossibleValue::new("shortest")),
+            PathMode::S => Some(clap::builder::PossibleValue::new("s")),
         }
     }
 }
@@ -216,30 +239,51 @@ struct Opts {
     #[clap(short, long, global = true, action = ArgAction::Count, verbatim_doc_comment)]
     verbose: u8,
 
+    /// Be more quiet, specify multiple times to increase quietness
+    ///
+    /// - `-q` will not show progress messages, only errors
+    /// - `-qq` will not even show error messages
+    ///
+    /// This overrides the --verbose flag if both are set.
+    #[clap(short, long, global = true, action = ArgAction::Count, verbatim_doc_comment)]
+    quiet: u8,
+
     /// Do not provide your credentials when issuing requests
     ///
     /// This is useful for downloading objects from a bucket that is not
     /// associated with your AWS account, such as a public bucket.
     #[clap(long, global = true, alias = "no-sign-requests")]
     no_sign_request: bool,
+
+    /// Maximum number of parallel requests to make
+    ///
+    /// If you get a slowdown error you can use this to limit the number of
+    /// concurrent requests.
+    #[clap(short = 'M', long, global = true, default_value = "10000")]
+    max_parallelism: usize,
 }
 
 fn main() {
     let opts = Opts::parse();
-    setup_logging(log_directive(opts.verbose));
+    setup_logging(log_directive(opts.verbose, opts.quiet));
+    if opts.quiet == 1 {
+        MESSAGE_LEVEL.get_or_init(|| MessageLevel::Quiet);
+    } else if opts.quiet >= 2 {
+        MESSAGE_LEVEL.get_or_init(|| MessageLevel::VeryQuiet);
+    }
     debug!(?opts, "parsed options");
 
     let rt = Runtime::new().unwrap();
     rt.block_on(async {
         if let Err(err) = run(opts).await {
             // TODO: Separate user error from internal error?
-            eprintln!("Error: {}", err);
+            message_err!("Error: {}", err);
             let mut err = err.source();
             let mut count = 0;
             let mut prev_msg = String::new();
             while let Some(e) = err {
                 if e.to_string() != prev_msg {
-                    eprintln!("  : {}", e);
+                    message_err!("  : {}", e);
                     prev_msg = e.to_string();
                 }
                 err = e.source();
@@ -260,7 +304,7 @@ async fn run(opts: Opts) -> Result<()> {
     let pat = match &opts.command {
         Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
         Command::Parallelism { .. } => {
-            eprintln!("This is just for documentation, run instead: s3glob help parallelism");
+            progressln!("This is just for documentation, run instead: s3glob help parallelism");
             return Ok(());
         }
     };
@@ -277,31 +321,38 @@ async fn run(opts: Opts) -> Result<()> {
 
     let client = create_s3_client(&opts, &bucket).await?;
 
-    let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
-    let matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
-    let prefixes = match matcher.find_prefixes(engine).await {
+    let engine = S3Engine::new(client.clone(), bucket.clone());
+    let mut matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
+    matcher.set_max_parallelism(opts.max_parallelism);
+    let presult = match matcher.find_prefixes(engine).await {
         Ok(prefixes) => prefixes,
         Err(err) => {
             // the matcher prints some progress info to stderr, if there's an
             // error we should make sure to add a newline
-            eprintln!();
+            progressln!();
             return Err(err);
         }
     };
-    trace!(?prefixes, "matcher generated prefixes");
-    debug!(prefix_count = prefixes.len(), "matcher generated prefixes");
+    trace!(?presult.prefixes, "matcher generated prefixes");
+    debug!(
+        prefix_count = presult.prefixes.len(),
+        "matcher generated prefixes"
+    );
 
     let total_objects = Arc::new(AtomicUsize::new(0));
     let seen_prefixes = Arc::new(AtomicUsize::new(0));
-    let total_prefixes = prefixes.len();
+    let total_prefixes = presult.prefixes.len();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
     if matcher.is_complete() {
-        for prefix in prefixes {
+        let permit = Arc::new(Semaphore::new(opts.max_parallelism));
+        for prefix in presult.prefixes {
             // just get the object info for each prefix
             let client = client.clone();
             let bucket = bucket.clone();
             let prefix = prefix.clone();
             let tx = tx.clone();
+            let permit = permit.clone().acquire_owned().await;
+
             total_objects.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let r = client
@@ -310,6 +361,7 @@ async fn run(opts: Opts) -> Result<()> {
                     .key(prefix.clone())
                     .send()
                     .await;
+                drop(permit);
                 match r {
                     Ok(o) => tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
                         prefix, o,
@@ -319,17 +371,20 @@ async fn run(opts: Opts) -> Result<()> {
             });
         }
     } else {
-        for prefix in prefixes {
+        let permit = Arc::new(Semaphore::new(opts.max_parallelism));
+        for prefix in presult.prefixes {
             let client = client.clone();
             let total_objects = Arc::clone(&total_objects);
             let seen_prefixes = Arc::clone(&seen_prefixes);
             let matcher = matcher.clone();
             let bucket = bucket.clone();
             let tx = tx.clone();
+            let permit = permit.clone().acquire_owned().await;
 
             tokio::spawn(async move {
                 list_matching_objects(&client, &bucket, &prefix, &matcher, total_objects, tx)
                     .await?;
+                drop(permit);
 
                 add_atomic(&seen_prefixes, 1);
                 Ok::<_, anyhow::Error>(())
@@ -357,40 +412,56 @@ async fn run(opts: Opts) -> Result<()> {
                 } else {
                     match_count += results.len();
                     matching_objects.extend(results);
-                    eprint!(
-                        "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
-                        match_count.to_formatted_string(&Locale::en),
-                        total_objects
-                            .load(Ordering::Relaxed)
-                            .to_formatted_string(&Locale::en),
-                        seen_prefixes.load(Ordering::Relaxed),
-                        total_prefixes
-                    );
+                    if !matcher.is_complete() {
+                        progress!(
+                            "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                            match_count.to_formatted_string(&Locale::en),
+                            total_objects
+                                .load(Ordering::Relaxed)
+                                .to_formatted_string(&Locale::en),
+                            seen_prefixes.load(Ordering::Relaxed),
+                            total_prefixes
+                        );
+                    }
                 }
             }
-            eprintln!();
+            progressln!();
             let mut objects = matching_objects;
             objects.sort_by_key(|r| r.key().to_owned());
             for obj in objects {
                 print_prefix_result(&bucket, &user_format, decimal, obj);
             }
-            eprintln!(
+            progressln!(
                 "Matched {}/{} objects across {} prefixes in {:?}",
                 match_count,
-                total_objects.load(Ordering::Relaxed),
-                total_prefixes,
+                total_objects
+                    .load(Ordering::Relaxed)
+                    .max(presult.max_objects_observed),
+                presult.max_prefixes_observed,
                 Duration::from_millis(start.elapsed().as_millis() as u64)
             );
         }
         Command::Download {
-            dest, path_mode, ..
+            dest,
+            path_mode,
+            flatten,
+            ..
         } => {
             let mut total_matches = 0;
-            let pools = DlPools::new();
-            let prefix_to_strip = extract_prefix_to_strip(&raw_pattern, path_mode);
+            let pools = DlPools::new(opts.max_parallelism);
+            let prefix_to_strip = extract_prefix_to_strip(&raw_pattern, path_mode, &[]);
             let (ntfctn_tx, mut ntfctn_rx) = tokio::sync::mpsc::unbounded_channel::<Notification>();
             let base_path = PathBuf::from(dest);
-            let dl = Downloader::new(client, bucket, prefix_to_strip, base_path, ntfctn_tx);
+            let dl = Downloader::new(
+                client.clone(),
+                bucket.clone(),
+                prefix_to_strip,
+                flatten,
+                base_path.clone(),
+                ntfctn_tx.clone(),
+            );
+            // if the path_mode is shortes then we need to know all the paths to be able to extract the shortest
+            let mut objects_to_download = Vec::new();
             while let Some(result) = rx.recv().await {
                 total_matches += result
                     .iter()
@@ -399,28 +470,58 @@ async fn run(opts: Opts) -> Result<()> {
                 for obj in result {
                     match obj {
                         PrefixResult::Object(obj) => {
-                            pools.download_object(dl.fresh(), obj);
+                            if matches!(path_mode, PathMode::Shortest | PathMode::S) {
+                                objects_to_download.push(obj);
+                            } else {
+                                pools.download_object(dl.fresh(), obj);
+                            }
                         }
                         PrefixResult::Prefix(prefix) => {
                             debug!("Skipping prefix: {}", prefix);
                         }
                     }
                 }
-
-                eprint!(
-                    "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
-                    total_matches.to_formatted_string(&Locale::en),
-                    total_objects
-                        .load(Ordering::Relaxed)
-                        .to_formatted_string(&Locale::en),
-                    seen_prefixes.load(Ordering::Relaxed),
-                    total_prefixes
-                );
+                if !matcher.is_complete() {
+                    progress!(
+                        "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                        total_matches.to_formatted_string(&Locale::en),
+                        total_objects
+                            .load(Ordering::Relaxed)
+                            .to_formatted_string(&Locale::en),
+                        seen_prefixes.load(Ordering::Relaxed),
+                        total_prefixes
+                    );
+                }
+            }
+            if !matcher.is_complete() {
+                progressln!();
             }
             // close the tx so the downloaders know to finish
-            drop(pools);
             drop(dl);
-            eprintln!();
+            drop(pools);
+            if matches!(path_mode, PathMode::Shortest | PathMode::S) {
+                let prefix_to_strip =
+                    extract_prefix_to_strip(&raw_pattern, path_mode, &objects_to_download);
+                progressln!(
+                    "Stripping longest common prefix from keys: {}",
+                    prefix_to_strip
+                );
+                let dl = Downloader::new(
+                    client,
+                    bucket,
+                    prefix_to_strip,
+                    flatten,
+                    base_path,
+                    ntfctn_tx,
+                );
+                let pools = DlPools::new(opts.max_parallelism);
+                for obj in objects_to_download {
+                    pools.download_object(dl.fresh(), obj);
+                }
+            } else {
+                progressln!();
+                drop(ntfctn_tx);
+            }
             let start_time = Instant::now();
             let mut downloaded_matches = 0;
             let mut total_bytes = 0_usize;
@@ -438,7 +539,7 @@ async fn run(opts: Opts) -> Result<()> {
                 }
                 let elapsed = start_time.elapsed().as_secs_f64();
                 speed = total_bytes as f64 / elapsed;
-                eprint!(
+                progress!(
                     "\rdownloaded {}/{} objects, {:>7}   {:>10}/s",
                     downloaded_matches,
                     total_matches,
@@ -447,17 +548,17 @@ async fn run(opts: Opts) -> Result<()> {
                 );
             }
             if files.is_empty() {
-                eprintln!();
+                progressln!();
                 bail!("No objects found matching the pattern.");
             }
-            eprintln!("\n");
+            progressln!("\n");
 
             files.sort_unstable();
             for path in files {
                 println!("{}", path);
             }
             let dl_ms = start_time.elapsed().as_millis() as u64;
-            eprintln!(
+            progressln!(
                 "\ndiscovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
                 downloaded_matches,
                 Duration::from_millis(start.elapsed().as_millis() as u64 - dl_ms),
@@ -467,7 +568,7 @@ async fn run(opts: Opts) -> Result<()> {
             );
         }
         Command::Parallelism { .. } => {
-            eprintln!("This is just for documentation, run instead: s3glob help parallelism");
+            progressln!("This is just for documentation, run instead: s3glob help parallelism");
         }
     }
 
@@ -489,7 +590,8 @@ fn print_prefix_result(
             }
         }
         PrefixResult::Prefix(prefix) => {
-            println!("   {prefix}");
+            // TODO: support user-customizable prefix formatting too?
+            println!("PRE     {prefix}");
         }
     }
 }
@@ -515,20 +617,20 @@ struct DlPools {
 
 impl DlPools {
     /// Create a new set of downloader pools
-    fn new() -> DlPools {
+    fn new(max_parallelism: usize) -> DlPools {
         let (two_hundred_kb, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(500));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(500)));
         start_threadpool(semaphore, rx);
         let (one_mb, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(50));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(50)));
         start_threadpool(semaphore, rx);
 
         let (ten_mb, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(10)));
         start_threadpool(semaphore, rx);
 
         let (more, rx) = tokio::sync::mpsc::unbounded_channel();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(5));
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(max_parallelism.min(5)));
         start_threadpool(semaphore, rx);
 
         Self {
@@ -575,6 +677,7 @@ struct Downloader {
     client: Client,
     bucket: String,
     prefix_to_strip: String,
+    flatten: bool,
     base_path: PathBuf,
     obj_counter: Arc<AtomicUsize>,
     obj_id: usize,
@@ -592,6 +695,7 @@ impl Downloader {
         client: Client,
         bucket: String,
         prefix_to_strip: String,
+        flatten: bool,
         base_path: PathBuf,
         notifier: UnboundedSender<Notification>,
     ) -> Self {
@@ -602,6 +706,7 @@ impl Downloader {
             obj_id: 0,
             notifier,
             base_path,
+            flatten,
             prefix_to_strip,
         }
     }
@@ -616,15 +721,20 @@ impl Downloader {
             obj_id,
             notifier: self.notifier.clone(),
             prefix_to_strip: self.prefix_to_strip.clone(),
+            flatten: self.flatten,
             base_path: self.base_path.clone(),
         }
     }
 
     async fn download_object(self, obj: S3Object) {
         let key = &obj.key;
-        let key_suffix = key
+        let mut key_suffix = key
             .strip_prefix(&self.prefix_to_strip)
-            .expect("all found objects will include the prefix");
+            .expect("all found objects will include the prefix")
+            .to_string();
+        if self.flatten {
+            key_suffix = key_suffix.replace(std::path::MAIN_SEPARATOR_STR, "-");
+        }
         let path = self.base_path.join(key_suffix);
         let dir = path.parent().unwrap();
         if let Err(e) = std::fs::create_dir_all(dir) {
@@ -691,10 +801,10 @@ impl Downloader {
     }
 }
 
-fn extract_prefix_to_strip(raw_pattern: &str, path_mode: PathType) -> String {
+fn extract_prefix_to_strip(raw_pattern: &str, path_mode: PathMode, keys: &[S3Object]) -> String {
     match path_mode {
-        PathType::Abs | PathType::Absolute => String::new(),
-        PathType::FromFirstGlob | PathType::G => {
+        PathMode::Abs | PathMode::Absolute => String::new(),
+        PathMode::FromFirstGlob | PathMode::G => {
             let up_to_glob: String = raw_pattern
                 .chars()
                 .take_while(|c| !GLOB_CHARS.contains(c))
@@ -704,6 +814,24 @@ fn extract_prefix_to_strip(raw_pattern: &str, path_mode: PathType) -> String {
                 Some(slash_idx) => up_to_glob[..slash_idx + 1].to_string(),
                 None => up_to_glob,
             }
+        }
+        PathMode::S | PathMode::Shortest => {
+            let Some(prefix) = keys.first() else {
+                return String::new();
+            };
+            let mut prefix = prefix.key.to_string();
+            for key_obj in &keys[1..] {
+                prefix = prefix
+                    .chars()
+                    .zip(key_obj.key.chars())
+                    .take_while(|(a, b)| a == b)
+                    .map(|(a, _)| a)
+                    .collect();
+            }
+            // get the prefix up to and including the last slash
+            let suffix = prefix.chars().rev().take_while(|c| *c != '/').count();
+            prefix.truncate(prefix.len() - suffix);
+            prefix
         }
     }
 }
@@ -904,7 +1032,10 @@ async fn list_matching_objects(
     Ok(())
 }
 
-fn log_directive(loglevel: u8) -> Option<&'static str> {
+fn log_directive(loglevel: u8, quiet: u8) -> Option<&'static str> {
+    if quiet >= 2 {
+        return Some("s3glob=error");
+    }
     match loglevel {
         0 => None,
         1 => Some("s3glob=debug"),
@@ -967,7 +1098,7 @@ mod tests {
 
     macro_rules! assert_extract_prefix_to_strip {
         ($pattern:expr, $path_mode:expr, $expected:expr) => {
-            let actual = extract_prefix_to_strip($pattern, $path_mode);
+            let actual = extract_prefix_to_strip($pattern, $path_mode, &[]);
             assert2::check!(
                 actual == $expected,
                 "input: {} path_mode: {:?}",
@@ -975,43 +1106,143 @@ mod tests {
                 $path_mode,
             );
         };
+        ($pattern:expr, $path_mode:expr, $expected:expr, $keys:expr) => {
+            let keys: &[S3Object] = $keys;
+            let actual = extract_prefix_to_strip($pattern, $path_mode, keys);
+            assert2::check!(
+                actual == $expected,
+                "input: {} path_mode: {:?} keys: {:?}",
+                $pattern,
+                $path_mode,
+                keys,
+            );
+        };
     }
 
     #[test]
     fn test_extract_prefix_to_strip() {
         // Test absolute path mode
-        assert_extract_prefix_to_strip!("prefix/path/to/*.txt", PathType::Absolute, "");
-        assert_extract_prefix_to_strip!("bucket/deep/path/*.txt", PathType::Abs, "");
+        assert_extract_prefix_to_strip!("prefix/path/to/*.txt", PathMode::Absolute, "");
+        assert_extract_prefix_to_strip!("bucket/deep/path/*.txt", PathMode::Abs, "");
 
         // Test from-first-glob path mode
         assert_extract_prefix_to_strip!(
             "prefix/path/to/*.txt",
-            PathType::FromFirstGlob,
+            PathMode::FromFirstGlob,
             "prefix/path/to/"
         );
         assert_extract_prefix_to_strip!(
             "prefix/path/*/more/*.txt",
-            PathType::FromFirstGlob,
+            PathMode::FromFirstGlob,
             "prefix/path/"
         );
-        assert_extract_prefix_to_strip!("prefix/*.txt", PathType::FromFirstGlob, "prefix/");
-        assert_extract_prefix_to_strip!("*.txt", PathType::FromFirstGlob, "");
-        assert_extract_prefix_to_strip!("prefix/a.txt", PathType::FromFirstGlob, "prefix/");
+        assert_extract_prefix_to_strip!("prefix/*.txt", PathMode::FromFirstGlob, "prefix/");
+        assert_extract_prefix_to_strip!("*.txt", PathMode::FromFirstGlob, "");
+        assert_extract_prefix_to_strip!("prefix/a.txt", PathMode::FromFirstGlob, "prefix/");
         // Test with different glob characters
         assert_extract_prefix_to_strip!(
             "prefix/path/to/[abc]/*.txt",
-            PathType::FromFirstGlob,
+            PathMode::FromFirstGlob,
             "prefix/path/to/"
         );
         assert_extract_prefix_to_strip!(
             "prefix/path/to/?/*.txt",
-            PathType::FromFirstGlob,
+            PathMode::FromFirstGlob,
             "prefix/path/to/"
         );
         assert_extract_prefix_to_strip!(
             "prefix/path/{a,b}/*.txt",
-            PathType::FromFirstGlob,
+            PathMode::FromFirstGlob,
             "prefix/path/"
+        );
+    }
+
+    #[test]
+    fn test_extract_prefix_to_strip_shortest() {
+        // Helper function to create S3Objects for testing
+        fn make_objects(keys: &[&str]) -> Vec<S3Object> {
+            keys.iter()
+                .map(|&key| S3Object {
+                    key: key.to_string(),
+                    size: 0,
+                    last_modified: DateTime::from_millis(0),
+                })
+                .collect()
+        }
+
+        // Different prefixes entirely - no common prefix
+        assert_extract_prefix_to_strip!(
+            "different/*/file*.txt",
+            PathMode::Shortest,
+            "",
+            &make_objects(&["different/path/file1.txt", "alternate/path/file2.txt",])
+        );
+
+        // Partial prefix overlap
+        assert_extract_prefix_to_strip!(
+            "shared-prefix/*/data/*.txt",
+            PathMode::Shortest,
+            "",
+            &make_objects(&[
+                "shared-prefix/abc/data/file1.txt",
+                "shared-prefix-extra/xyz/data/file2.txt",
+            ])
+        );
+
+        // One path is a prefix of another
+        assert_extract_prefix_to_strip!(
+            "deep/nested/*/file*.txt",
+            PathMode::Shortest,
+            "deep/nested/path/",
+            &make_objects(&[
+                "deep/nested/path/file1.txt",
+                "deep/nested/path/more/file2.txt",
+            ])
+        );
+
+        // Empty prefix case - files in root
+        assert_extract_prefix_to_strip!(
+            "*.txt",
+            PathMode::Shortest,
+            "",
+            &make_objects(&["file1.txt", "file2.txt",])
+        );
+
+        // Original test cases
+        assert_extract_prefix_to_strip!(
+            "prefix/2024-*/file*.txt",
+            PathMode::Shortest,
+            "prefix/",
+            &make_objects(&[
+                "prefix/2024-01/file1.txt",
+                "prefix/2024-01/file2.txt",
+                "prefix/2024-02/file2.txt",
+            ])
+        );
+
+        assert_extract_prefix_to_strip!(
+            "prefix/nested/*/file*.txt",
+            PathMode::Shortest,
+            "prefix/nested/",
+            &make_objects(&["prefix/nested/a/file1.txt", "prefix/nested/b/file2.txt",])
+        );
+
+        assert_extract_prefix_to_strip!(
+            "prefix/*/nested/*.txt",
+            PathMode::Shortest,
+            "prefix/a/nested/",
+            &make_objects(&["prefix/a/nested/file1.txt", "prefix/a/nested/file2.txt",])
+        );
+
+        // Edge case: empty keys list
+        assert_extract_prefix_to_strip!("any/pattern/*.txt", PathMode::Shortest, "", &[]);
+
+        // Edge case: single key
+        assert_extract_prefix_to_strip!(
+            "single/path/*.txt",
+            PathMode::Shortest,
+            "single/path/",
+            &make_objects(&["single/path/file.txt"])
         );
     }
 }

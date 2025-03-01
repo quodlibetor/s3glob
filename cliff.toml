@@ -14,7 +14,7 @@ header = """
 body = """
 {% if version %}\
     {% if previous.version %}\
-        ## [{{ version | trim_start_matches(pat="v") }}](<REPO>/compare/{{ previous.version }}..{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+        ## [{{ version | trim_start_matches(pat="v") }}](<REPO>/compare/{{ previous.version }}...{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
     {% else %}\
         ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
     {% endif %}\
@@ -38,16 +38,6 @@ body = """
         {% endif -%}
     {% endfor -%}
 {% endfor %}
-{% if github.contributors | filter(attribute="is_first_time", value=true) | length != 0 -%}
-### New Contributors
-{% for contributor in github.contributors | filter(attribute="is_first_time", value=true) %}
-  - @{{ contributor.username }} made their first contribution
-    {%- if contributor.pr_number %} in \
-      [#{{ contributor.pr_number }}](<REPO>/pull/{{ contributor.pr_number }})\
-    {% endif %}\
-{% endfor %}
-
-{% endif -%}
 {% macro commit(commit) -%}
 {% if commit.scope %}**({{commit.scope}})** {% endif -%}
 {% if commit.breaking %}**breaking** {% endif -%}

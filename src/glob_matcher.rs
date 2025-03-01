@@ -1,17 +1,20 @@
 //! A pattern is a glob that knows how to split itself into a prefix and join with a partial prefix
-#![allow(dead_code)]
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use glob::Glob;
 use globset::GlobMatcher;
 use itertools::Itertools as _;
 use regex::Regex;
-use tracing::{debug, trace};
+use tokio::sync::Semaphore;
+use tracing::{debug, trace, warn};
 
 mod engine;
 pub use engine::{Engine, S3Engine};
+
+use crate::{progress, progressln};
 
 mod glob;
 
@@ -36,11 +39,19 @@ pub struct S3GlobMatcher {
     delimiter: char,
     parts: Vec<glob::Glob>,
     glob: GlobMatcher,
+    max_parallelism: usize,
     min_prefixes: usize,
     /// True if no further listing needs to be done by the caller
     ///
     /// Generally anything that does not contain a ** will be complete
     is_complete: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct PrefixSearchResult {
+    pub prefixes: Vec<String>,
+    pub max_prefixes_observed: usize,
+    pub max_objects_observed: usize,
 }
 
 /// A scanner takes a glob pattern and can efficiently generate a list of S3
@@ -99,9 +110,16 @@ impl S3GlobMatcher {
             delimiter: delimiter.chars().next().unwrap(),
             parts: new_parts,
             glob: glob.compile_matcher(),
+            max_parallelism: 500,
             min_prefixes: DESIRED_MIN_PREFIXES,
             is_complete,
         })
+    }
+
+    // TODO: this should be a constructor argument, but I don't want to change
+    // all the tests right now
+    pub fn set_max_parallelism(&mut self, max_parallelism: usize) {
+        self.max_parallelism = max_parallelism;
     }
 
     /// Find all S3 prefixes that could match this pattern
@@ -128,7 +146,10 @@ impl S3GlobMatcher {
     /// 4. Search for all folders in ["foo/bar", "foo/baz"]
     /// 4. Append "qux" -> ["foo/bar/qux", "foo/baz/qux"]
     /// 5. Filter by "*" -> keep prefixes whose last component starts with "qux"
-    pub async fn find_prefixes(&self, mut engine: impl Engine + Clone) -> Result<Vec<String>> {
+    pub async fn find_prefixes(
+        &self,
+        mut engine: impl Engine + Clone,
+    ) -> Result<PrefixSearchResult> {
         debug!("finding prefixes for {}", self.raw);
         let mut prefixes = BTreeSet::new();
         prefixes.insert("".to_string());
@@ -136,22 +157,25 @@ impl S3GlobMatcher {
         let mut regex_so_far = "^".to_string();
         let mut prev_part = None;
         let mut part_iter = self.parts.iter().enumerate();
+        let mut max_prefixes_observed = 0;
+        let mut max_objects_observed = 0;
         for (part_idx, part) in &mut part_iter {
             if prefixes.len() >= MAX_PREFIXES {
-                debug!(
+                warn!(
                     new_prefix_count = prefixes.len(),
-                    "We have over {MAX_PREFIXES} prefixes, stopping."
+                    "We have over {MAX_PREFIXES} prefixes, stopping prefix generation"
                 );
                 break;
             }
+            max_prefixes_observed = max_prefixes_observed.max(prefixes.len());
             // only included prefixes in trace logs
             trace!(?prefixes, "scanning for part");
             debug!(%regex_so_far, new_part = %part.re_string(&delimiter), prefix_count = prefixes.len(), "scanning for part");
             if tracing::enabled!(tracing::Level::DEBUG) {
                 // don't overwrite log messages
-                eprintln!("Discovering prefixes: {:>6}", prefixes.len());
+                progressln!("Discovering prefixes: {:>6}", prefixes.len());
             } else {
-                eprint!("\rDiscovering prefixes: {:>6}", prefixes.len());
+                progress!("\rDiscovering prefixes: {:>6}", prefixes.len());
             }
             // We always want to scan for things including the last part,
             // finding more prefixes in it is guaranteed to be slower than
@@ -175,10 +199,12 @@ impl S3GlobMatcher {
                         let (tx, mut rx) = tokio::sync::mpsc::channel(prefixes.len());
 
                         let mut tasks = Vec::new();
+                        let semaphore = Arc::new(Semaphore::new(self.max_parallelism));
                         for prefix in &prefixes {
                             let client_prefix = prefix.clone();
                             let delimiter = delimiter.clone();
                             let tx = tx.clone();
+                            let permit = semaphore.clone().acquire_owned().await;
                             let mut engine = engine.clone();
                             let prefix = prefix.clone();
 
@@ -191,6 +217,7 @@ impl S3GlobMatcher {
                                         let _ = tx.send(Err(e)).await;
                                     }
                                 }
+                                drop(permit);
                             });
                             tasks.push(task);
                         }
@@ -226,6 +253,7 @@ impl S3GlobMatcher {
                             prefixes = new_prefixes;
                         }
                     }
+                    max_objects_observed = max_objects_observed.max(prefixes.len());
                     if part.is_negated() {
                         // if this part is a negated character class then we should filter
                         let matcher = Regex::new(&format!(
@@ -271,7 +299,14 @@ impl S3GlobMatcher {
                             );
                             break;
                         }
-                        prefixes = check_prefixes(&mut engine, &prefixes, new_prefixes).await?;
+                        max_objects_observed = max_objects_observed.max(new_prefixes.len());
+                        prefixes = check_prefixes(
+                            &mut engine,
+                            &prefixes,
+                            new_prefixes,
+                            self.max_parallelism,
+                        )
+                        .await?;
                     } else {
                         // Build up the filters and appends
                         let mut filters = BTreeSet::new();
@@ -369,7 +404,14 @@ impl S3GlobMatcher {
                                 break;
                             }
                             trace!(new_prefixes = ?new_prefixes, new_prefix_count = new_prefixes.len(), "checking appended prefixes");
-                            prefixes = check_prefixes(&mut engine, &prefixes, new_prefixes).await?;
+                            max_objects_observed = max_objects_observed.max(new_prefixes.len());
+                            prefixes = check_prefixes(
+                                &mut engine,
+                                &prefixes,
+                                new_prefixes,
+                                self.max_parallelism,
+                            )
+                            .await?;
                         } else if !new_prefixes.is_empty() {
                             debug!("no appends, using new prefixes");
                             prefixes = new_prefixes;
@@ -380,9 +422,26 @@ impl S3GlobMatcher {
                                 .take(part_idx + 1)
                                 .map(|p| p.raw())
                                 .join("");
+                            let max_prefixes = if tracing::enabled!(tracing::Level::DEBUG) {
+                                usize::MAX
+                            } else {
+                                20
+                            };
+                            let and_more = if prefixes.len() > max_prefixes {
+                                format!(
+                                    "\n  ...and {} more (run with --verbose to see all)",
+                                    prefixes.len() - max_prefixes
+                                )
+                            } else {
+                                String::new()
+                            };
+
                             bail!(
-                                "No existing prefixes matched the filter: {glob_so_far}\n  {}",
-                                prefixes.iter().join("\n  ")
+                                "Could not continue search in prefixes:\n  {}{}\
+                                \n\n\
+                                None of the above matched the pattern:\n  {glob_so_far}",
+                                prefixes.iter().take(max_prefixes).join("\n  "),
+                                and_more,
                             );
                         }
                     }
@@ -399,18 +458,31 @@ impl S3GlobMatcher {
             prev_part = Some(part);
         }
 
-        if prefixes.len() < self.min_prefixes {
+        if prefixes.len() < self.min_prefixes && !self.is_complete {
             let count = prefixes.len();
-            eprintln!("\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow");
+            progressln!(
+                "\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow"
+            );
+        } else if self.is_complete {
+            // clear the previous output
+            progressln!(
+                "\r                                          \
+                 \rDiscovered matches: {:>5}",
+                prefixes.len()
+            );
         } else {
             // clear the previous output
-            eprintln!(
+            progressln!(
                 "\r                                          \
                  \rDiscovered prefixes: {:>5}",
                 prefixes.len()
             );
         }
-        Ok(prefixes.into_iter().collect())
+        Ok(PrefixSearchResult {
+            prefixes: prefixes.into_iter().collect(),
+            max_prefixes_observed,
+            max_objects_observed,
+        })
     }
 
     /// True if no further listing needs to be done by the caller
@@ -432,11 +504,14 @@ async fn check_prefixes(
     engine: &mut (impl Engine + Clone),
     prefixes: &BTreeSet<String>,
     new_prefixes: BTreeSet<String>,
+    max_parallelism: usize,
 ) -> Result<BTreeSet<String>, anyhow::Error> {
     if prefixes.is_empty() || new_prefixes.is_empty() {
         bail!("Surprisingly, no prefixes to build off of and no prefixes found");
     }
-    let checked_prefixes = engine.check_prefixes(new_prefixes.clone()).await?;
+    let checked_prefixes = engine
+        .check_prefixes(new_prefixes.clone(), max_parallelism)
+        .await?;
     if checked_prefixes.is_empty() {
         let mut message = vec!["Searched for prefixes do not exist in the bucket:".to_string()];
         let new_prefixes = new_prefixes.iter().collect::<Vec<_>>();
@@ -463,14 +538,7 @@ async fn check_prefixes(
 }
 
 fn prefix_join(prefix: &str, alt: &str) -> String {
-    // minio doesn't support double forward slashes in the path
-    // https://github.com/minio/minio/issues/5874
-    // TODO: make this something the user can configure?
-    if prefix.ends_with('/') && alt.starts_with('/') {
-        format!("{prefix}{}", &alt[1..])
-    } else {
-        format!("{prefix}{alt}")
-    }
+    format!("{prefix}{alt}")
 }
 
 #[cfg(test)]
@@ -493,7 +561,7 @@ mod tests {
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec!["src/foo/bar".to_string()]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["src/foo/bar"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
@@ -511,7 +579,7 @@ mod tests {
             "src/qux/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["src/bar/baz", "src/foo/baz"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
@@ -531,7 +599,7 @@ mod tests {
             "src/qux/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         engine.assert_calls(&[("src/bar", "/"), ("src/foo", "/")]);
         assert!(prefixes == vec!["src/bar/baz", "src/foo-quux/baz", "src/foo/baz"]);
         Ok(())
@@ -549,7 +617,7 @@ mod tests {
         ]);
         info!(?engine.paths);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["src/bar/main.rs", "src/foo/main.rs"]);
         engine.assert_calls(&[("src/", "/")]);
         Ok(())
@@ -567,7 +635,7 @@ mod tests {
             "src/other.rs".to_string(),
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         // Should stop at src/ since ** matches anything after
         assert!(prefixes == vec!["src/"]);
         let e: &[(&str, &str)] = &[];
@@ -590,7 +658,7 @@ mod tests {
             "src/dog/zebra.rs".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         engine.assert_calls(&[("src/a", "/"), ("src/b", "/"), ("src/c", "/")]);
         assert!(prefixes == vec!["src/abc/zebra.rs", "src/baz/zebra.rs", "src/cat/zebra.rs"]);
         Ok(())
@@ -616,7 +684,7 @@ mod tests {
             "literal/other/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         engine.assert_calls(&[("literal/bar", "/"), ("literal/foo", "/")]);
         assert!(
             prefixes
@@ -651,7 +719,7 @@ mod tests {
             "literal/foo-quux-bar/baz".to_string(),
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["literal/bar-quux/baz", "literal/foo-quux/baz"]);
         engine.assert_calls(&[("literal/bar", "/"), ("literal/foo", "/")]);
         Ok(())
@@ -672,7 +740,7 @@ mod tests {
             "literal/not-match/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         engine.assert_calls(&[("literal/", "/")]);
         assert!(prefixes == vec!["literal/other-bar/baz", "literal/something-foo/baz"]);
         Ok(())
@@ -694,7 +762,7 @@ mod tests {
             "literal/quux-other/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         engine.assert_calls(&[("literal/quux", "/")]);
         assert!(prefixes == vec!["literal/quux-foo/baz", "literal/quux-something-bar/baz"]);
         Ok(())
@@ -716,7 +784,7 @@ mod tests {
             "literal/other/a.rs".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         engine.assert_calls(&[("literal/baz", "/")]);
         assert!(
             prefixes
@@ -745,7 +813,7 @@ mod tests {
             "literal/baz-c/1.rs".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         engine.assert_calls(&[("literal/baz", "/")]);
         assert!(prefixes == vec!["literal/baz-a/1.rs", "literal/baz-extra-b/1.rs"]);
         Ok(())
@@ -762,11 +830,8 @@ mod tests {
             "src/other/file".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
-        // TODO: there is a legitimate case that this should only be
-        // src/tmp/file, but we strip double forward slashes to work around
-        // minio
-        assert!(prefixes == vec!["src/file", "src/tmp/file"]);
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
+        assert!(prefixes == vec!["src/tmp/file"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
         Ok(())
@@ -783,7 +848,7 @@ mod tests {
             "src/other/file".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["src/file", "src/tmp/file"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
@@ -807,7 +872,7 @@ mod tests {
             "src/foo/baz/test".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["src/baz/test", "src/foo/bar/test"]);
         let e: &[(&str, &str)] = &[]; // No API calls needed since alternation is static
         engine.assert_calls(e);
@@ -826,7 +891,7 @@ mod tests {
             "a/foo".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["b/foo", "c/foo", "xyz/foo"]);
         engine.assert_calls(&[("", "/")]);
         Ok(())
@@ -844,7 +909,7 @@ mod tests {
             "something/foo/a".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["boo/a", "zoo/a"]);
         // TODO: this could be improved to only call the engine once
         Ok(())
@@ -863,7 +928,7 @@ mod tests {
             "other/baz".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["bar-def/baz", "foo-abc/baz"]);
         engine.assert_calls(&[("bar", "/"), ("foo", "/")]);
         Ok(())
@@ -883,7 +948,7 @@ mod tests {
             "c-b/foo".to_string(), // (second part starts with b)
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["c-x/foo", "d-y/foo"]);
         engine.assert_calls(&[("", "/")]);
         Ok(())
@@ -906,7 +971,7 @@ mod tests {
             "foo///bar".to_string(),   // Should be filtered out (the excluded char)
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["foo/a/bar", "foo/x/bar"]);
         engine.assert_calls(&[("foo/", "/")]);
         Ok(())
@@ -926,7 +991,7 @@ mod tests {
             "x-baz-a/baz".to_string(), // (middle not foo/bar)
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["x-foo-a/baz", "y-bar-b/baz"]);
         // TODO: this could be improved to only call the engine once
         Ok(())
@@ -943,7 +1008,7 @@ mod tests {
             "src/baz/3_zebra".to_string(),
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["src/bar/2_zebra", "src/baz/3_zebra", "src/foo/1_zebra"]);
         Ok(())
     }
@@ -959,7 +1024,7 @@ mod tests {
             "src/baz/3_zebra".to_string(),
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?;
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["src/foo/1_zebra"]);
         assert!(scanner.is_complete());
         Ok(())
