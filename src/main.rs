@@ -1,25 +1,25 @@
 use std::io::IsTerminal as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::Object;
-use aws_sdk_s3::{config::BehaviorVersion, config::Region, Client};
+use aws_sdk_s3::{Client, config::BehaviorVersion, config::Region};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use glob_matcher::{S3Engine, S3GlobMatcher, GLOB_CHARS};
-use humansize::{FormatSizeOptions, SizeFormatter, DECIMAL};
-use messaging::{MessageLevel, MESSAGE_LEVEL};
+use glob_matcher::{GLOB_CHARS, S3Engine, S3GlobMatcher};
+use humansize::{DECIMAL, FormatSizeOptions, SizeFormatter};
+use messaging::{MESSAGE_LEVEL, MessageLevel};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::io::AsyncWriteExt as _;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::{debug, trace, warn};
 
 mod glob_matcher;

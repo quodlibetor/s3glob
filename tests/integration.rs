@@ -1,14 +1,14 @@
 use assert_cmd::Command;
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 use predicates::prelude::*;
 use predicates::str::contains;
 use rstest::rstest;
-use testcontainers::core::logs::consumer::LogConsumer;
 use testcontainers::core::logs::LogFrame;
+use testcontainers::core::logs::consumer::LogConsumer;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::minio::MinIO;
@@ -490,7 +490,7 @@ fn print_s3glob_output(cmd: &mut Command) {
 
 use std::borrow::Cow;
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 
 /// A consumer that logs the output of container with the [`log`] crate.
 ///

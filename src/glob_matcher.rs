@@ -460,7 +460,9 @@ impl S3GlobMatcher {
 
         if prefixes.len() < self.min_prefixes && !self.is_complete {
             let count = prefixes.len();
-            progressln!("\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow");
+            progressln!(
+                "\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow"
+            );
         } else if self.is_complete {
             // clear the previous output
             progressln!(
