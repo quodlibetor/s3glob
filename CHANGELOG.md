@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.4.3](https://github.com/quodlibetor/s3glob/compare/v0.4.2...v0.4.3) - 2025-03-01
+
+### 🐛 Bug Fixes
+
+- LCP message needs a newline prepended by [@quodlibetor](https://github.com/quodlibetor) in [79bbe08](https://github.com/quodlibetor/s3glob/commit/79bbe08382f812d786dbee85c2307a76f9e72149)
+- Remove workaround for minio in tests by [@quodlibetor](https://github.com/quodlibetor) in [6e7777f](https://github.com/quodlibetor/s3glob/commit/6e7777f9749c43bfb8a60a88a32d8e7116f42cf2)
+- Get rid of Docker login in CI to get dependabot working by [@quodlibetor](https://github.com/quodlibetor) in [#23](https://github.com/quodlibetor/s3glob/pull/23)
+
+### 📚 Documentation
+
+- Improve error message for no matches found by [@quodlibetor](https://github.com/quodlibetor) in [36a4ef8](https://github.com/quodlibetor/s3glob/commit/36a4ef8dcc0e7fe0a4f3ef5638fe68bf842de916)
+
+### ⚙️ Miscellaneous Tasks
+
+- Remove dead code from early experimentation by [@quodlibetor](https://github.com/quodlibetor) in [e21bb7d](https://github.com/quodlibetor/s3glob/commit/e21bb7d413fc14aaf7e02ea69de47ca29770d0e1)
+- Update to edition 2024 by [@quodlibetor](https://github.com/quodlibetor) in [465f9f5](https://github.com/quodlibetor/s3glob/commit/465f9f53b696070ac7ba6d56902e19ff8dbba697)
+
 ## [0.4.2](https://github.com/quodlibetor/s3glob/compare/v0.4.1...v0.4.2) - 2025-02-28
 
 ### 🚀 Features
