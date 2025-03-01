@@ -493,7 +493,9 @@ async fn run(opts: Opts) -> Result<()> {
                     );
                 }
             }
-            debug!("closing downloader tx");
+            if !matcher.is_complete() {
+                progressln!();
+            }
             // close the tx so the downloaders know to finish
             drop(dl);
             drop(pools);
@@ -517,9 +519,9 @@ async fn run(opts: Opts) -> Result<()> {
                     pools.download_object(dl.fresh(), obj);
                 }
             } else {
+                progressln!();
                 drop(ntfctn_tx);
             }
-            progressln!();
             let start_time = Instant::now();
             let mut downloaded_matches = 0;
             let mut total_bytes = 0_usize;
