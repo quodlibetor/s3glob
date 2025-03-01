@@ -11,7 +11,10 @@ use testcontainers::core::logs::LogFrame;
 use testcontainers::core::logs::consumer::LogConsumer;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::minio::MinIO;
+
+mod minio_testcontainer;
+
+use minio_testcontainer::MinIO;
 
 #[rstest]
 #[case("prefix/2024-*/file*.txt", &[
@@ -415,8 +418,9 @@ async fn test_download_flatten() -> anyhow::Result<()> {
 //
 
 async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
-    let minio =
-        testcontainers_modules::minio::MinIO::default().with_log_consumer(LogPrinter::new());
+    let minio = MinIO::default()
+        .with_name("quay.io/minio/minio")
+        .with_log_consumer(LogPrinter::new());
     let node = match minio.start().await {
         Ok(node) => node,
         Err(e) => {
