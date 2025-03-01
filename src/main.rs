@@ -321,7 +321,7 @@ async fn run(opts: Opts) -> Result<()> {
 
     let client = create_s3_client(&opts, &bucket).await?;
 
-    let engine = S3Engine::new(client.clone(), bucket.clone(), opts.delimiter.to_string());
+    let engine = S3Engine::new(client.clone(), bucket.clone());
     let mut matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
     matcher.set_max_parallelism(opts.max_parallelism);
     let presult = match matcher.find_prefixes(engine).await {

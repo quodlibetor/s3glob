@@ -3,8 +3,6 @@ use itertools::Itertools as _;
 
 use super::prefix_join;
 
-use regex::Regex;
-
 /// A single part of a glob pattern
 ///
 /// Note that the compiled regexes are designed to match against an _entire_ path segment
@@ -57,11 +55,6 @@ impl Glob {
         matches!(self, Glob::Choice { .. })
     }
 
-    /// True if this is a `*`, `?`, or `[abc]`
-    pub(crate) fn is_any(&self) -> bool {
-        matches!(self, Glob::Any { .. })
-    }
-
     /// True if this is a negated character class `[!abc]`
     pub(crate) fn is_negated(&self) -> bool {
         matches!(self, Glob::Any { not: Some(_), .. })
@@ -100,10 +93,6 @@ impl Glob {
         }
     }
 
-    pub(crate) fn re(&self, delimiter: &str) -> Regex {
-        Regex::new(&self.re_string(delimiter)).unwrap()
-    }
-
     /// True if this glob is a literal part and ends with the delimiter
     pub(crate) fn ends_with(&self, delimiter: &str) -> bool {
         match self {
@@ -131,12 +120,11 @@ impl Glob {
         }
     }
 
-    pub(crate) fn may_have_delimiter(&self, delimiter: char) -> bool {
-        match self {
-            Glob::Any { .. } | Glob::SyntheticAny => false,
-            Glob::Choice { allowed, .. } => allowed.iter().any(|a| a.contains(delimiter)),
-            Glob::Recursive { .. } => true,
-        }
+    #[cfg(test)]
+    pub(crate) fn re(&self, delimiter: &str) -> regex::Regex {
+        use regex::Regex;
+
+        Regex::new(&self.re_string(delimiter)).unwrap()
     }
 }
 

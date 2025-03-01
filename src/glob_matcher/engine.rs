@@ -30,16 +30,11 @@ pub trait Engine: Send + Sync + 'static {
 pub struct S3Engine {
     client: Client,
     bucket: String,
-    delimiter: String,
 }
 
 impl S3Engine {
-    pub fn new(client: Client, bucket: String, delimiter: String) -> Self {
-        Self {
-            client,
-            bucket,
-            delimiter,
-        }
+    pub fn new(client: Client, bucket: String) -> Self {
+        Self { client, bucket }
     }
 }
 

@@ -1,10 +1,9 @@
 //! A pattern is a glob that knows how to split itself into a prefix and join with a partial prefix
-#![allow(dead_code)]
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use glob::Glob;
 use globset::GlobMatcher;
 use itertools::Itertools as _;
