@@ -1,17 +1,20 @@
 use assert_cmd::Command;
-use assert_fs::prelude::*;
 use assert_fs::TempDir;
+use assert_fs::prelude::*;
+use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client;
 use predicates::prelude::*;
 use predicates::str::contains;
 use rstest::rstest;
-use testcontainers::core::logs::consumer::LogConsumer;
 use testcontainers::core::logs::LogFrame;
+use testcontainers::core::logs::consumer::LogConsumer;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::minio::MinIO;
+
+mod minio_testcontainer;
+
+use minio_testcontainer::MinIO;
 
 #[rstest]
 #[case("prefix/2024-*/file*.txt", &[
@@ -251,13 +254,173 @@ async fn test_patterns_in_file_not_path_component(
     Ok(())
 }
 
+#[rstest]
+#[case( // 1 Keep different subdirs
+    &[
+        "prefix/2024-01/file1.txt",
+        "prefix/2024-01/file2.txt",
+        "prefix/2024-02/file2.txt",
+    ],
+    &[
+        "2024-01/file1.txt",
+        "2024-01/file2.txt",
+        "2024-02/file2.txt",
+    ]
+)]
+#[case( // 2 Slightly deeper nesting
+    &[
+        "prefix/nested/a/file1.txt",
+        "prefix/nested/b/file2.txt",
+    ],
+    &[
+        "a/file1.txt",
+        "b/file2.txt",
+    ]
+)]
+#[case( // 3 Strip nested prefix
+    &[
+        "prefix/a/nested/file1.txt",
+        "prefix/a/nested/file2.txt",
+    ],
+    &[
+        "file1.txt",
+        "file2.txt",
+    ]
+)]
+#[case( // 4 Empty prefix case - when files are in root of bucket
+    &[
+        "file1.txt",
+        "file2.txt",
+    ],
+    &[
+        "file1.txt",
+        "file2.txt",
+    ]
+)]
+#[case( // 5 Different prefixes entirely - shortest should find no common prefix
+    &[
+        "different/path/file1.txt",
+        "alternate/path/file2.txt",
+    ],
+    &[
+        "different/path/file1.txt",
+        "alternate/path/file2.txt",
+    ]
+)]
+#[case( // 6 Partial prefix overlap - shortest should break on path boundaries
+    &[
+        "shared-prefix/abc/data/file1.txt",
+        "shared-prefix-extra/xyz/data/file2.txt",
+    ],
+    &[
+        "shared-prefix/abc/data/file1.txt",
+        "shared-prefix-extra/xyz/data/file2.txt",
+    ]
+)]
+#[case( // 7 One path is a prefix of another - shortest should preserve uniqueness
+
+    &[
+        "deep/nested/path/file1.txt",
+        "deep/nested/path/more/file2.txt",
+    ],
+    &[
+        "file1.txt",
+        "more/file2.txt",
+    ]
+)]
+#[tokio::test]
+async fn test_download_prefix_shortest(
+    #[case] source_files: &[&str],
+    #[case] expected_paths: &[&str],
+) -> anyhow::Result<()> {
+    let glob = "**";
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    for key in source_files {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let tempdir = TempDir::new()?;
+
+    let mut cmd = run_s3glob(
+        port,
+        &[
+            "dl",
+            "-p",
+            "shortest",
+            format!("s3://{}/{}", bucket, glob).as_str(),
+            tempdir.path().to_str().unwrap(),
+        ],
+    )?;
+
+    let _ = cmd.assert().success();
+
+    for path in expected_paths {
+        tempdir.child(path).assert(predicate::path::exists());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_download_flatten() -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    // Create some nested test files
+    let source_files = [
+        "prefix/nested/deep/file1.txt",
+        "prefix/other/path/file2.txt",
+        "prefix/file3.txt",
+    ];
+    for key in &source_files {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let tempdir = TempDir::new()?;
+
+    // Run s3glob with flatten flag
+    let mut cmd = run_s3glob(
+        port,
+        &[
+            "dl",
+            "--flatten",
+            format!("s3://{}/prefix/**/*.txt", bucket).as_str(),
+            tempdir.path().to_str().unwrap(),
+        ],
+    )?;
+
+    let _ = cmd.assert().success();
+
+    // Expected flattened filenames
+    let expected_files = ["nested-deep-file1.txt", "other-path-file2.txt", "file3.txt"];
+
+    // Verify that files exist with flattened names
+    for expected in &expected_files {
+        tempdir.child(expected).assert(predicate::path::exists());
+    }
+
+    // Verify original paths don't exist
+    for source in &source_files {
+        tempdir.child(source).assert(predicate::path::missing());
+    }
+
+    Ok(())
+}
+
 //
 // Helpers
 //
 
 async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
-    let minio =
-        testcontainers_modules::minio::MinIO::default().with_log_consumer(LogPrinter::new());
+    let minio = MinIO::default()
+        .with_name("quay.io/minio/minio")
+        .with_log_consumer(LogPrinter::new());
     let node = match minio.start().await {
         Ok(node) => node,
         Err(e) => {
@@ -323,7 +486,7 @@ fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
 fn print_s3glob_output(cmd: &mut Command) {
     let output = cmd.output().unwrap();
     println!(
-        "s3glob output:\n{}\n{}",
+        "==== s3glob stdout ====\n{}\n==== s3glob stderr ====\n{}\n==== end s3glob output ====\n",
         String::from_utf8(output.stdout).unwrap(),
         String::from_utf8(output.stderr).unwrap()
     );
@@ -331,7 +494,7 @@ fn print_s3glob_output(cmd: &mut Command) {
 
 use std::borrow::Cow;
 
-use futures::{future::BoxFuture, FutureExt};
+use futures::{FutureExt, future::BoxFuture};
 
 /// A consumer that logs the output of container with the [`log`] crate.
 ///

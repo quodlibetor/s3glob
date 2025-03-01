@@ -1,6 +1,35 @@
 # Changelog
 
-## [0.4.0](https://github.com/quodlibetor/s3glob/compare/v0.3.1..0.4.0) - 2025-02-26
+## [0.4.2](https://github.com/quodlibetor/s3glob/compare/v0.4.1...v0.4.2) - 2025-02-28
+
+### 🚀 Features
+
+- Add a --quiet/-q flag to suppress progress messages by [@quodlibetor](https://github.com/quodlibetor) in [1730ef8](https://github.com/quodlibetor/s3glob/commit/1730ef8603695e10e50297982bb129243dc1c495)
+- Add a --max-parallelism flag, defaulting to 10,000 by [@quodlibetor](https://github.com/quodlibetor) in [eb86ae4](https://github.com/quodlibetor/s3glob/commit/eb86ae49d71a293a3e9ddff2a92b5633ffc13d4a)
+
+### 📚 Documentation
+
+- Add a gif of s3glob in action to the README by [@quodlibetor](https://github.com/quodlibetor) in [27f8dbe](https://github.com/quodlibetor/s3glob/commit/27f8dbe0d203ec6185ae0dec73d31a17efbbc226)
+
+### ⚙️ Miscellaneous Tasks
+
+- Keep track of the max prefixes seen for better messaging by [@quodlibetor](https://github.com/quodlibetor) in [a7ebb41](https://github.com/quodlibetor/s3glob/commit/a7ebb4158fc3d9f34500dd534cbe7990df6df4b5)
+
+## [0.4.1](https://github.com/quodlibetor/s3glob/compare/v0.4.0...v0.4.1) - 2025-02-26
+
+### 🚀 Features
+
+- **breaking** Prefix prefix display with PRE prefix by [@quodlibetor](https://github.com/quodlibetor) in [f99adf1](https://github.com/quodlibetor/s3glob/commit/f99adf1e2b37fa2a44e33b48de2b21dff668818e)
+- Add a "shortest" algorithm for --path-mode by [@quodlibetor](https://github.com/quodlibetor) in [14c1376](https://github.com/quodlibetor/s3glob/commit/14c13762679acba0600be39b74ece515a620aaa0)
+- Add a --flatten download arg that replaces / with - by [@quodlibetor](https://github.com/quodlibetor) in [bc9ae52](https://github.com/quodlibetor/s3glob/commit/bc9ae52451f8196df5832ec20958ce2f031bedf6)
+
+### ⚙️ Miscellaneous Tasks
+
+- Fix link in CHANGELOG.md by [@quodlibetor](https://github.com/quodlibetor) in [6813927](https://github.com/quodlibetor/s3glob/commit/6813927f5cdee1a42b44481a060c682fbbacd9e4)
+- Split unit and integration test jobs by [@quodlibetor](https://github.com/quodlibetor) in [de6e56f](https://github.com/quodlibetor/s3glob/commit/de6e56feddad0be98d35c40ae7585feab2ffbae5)
+- Fix changelog template by [@quodlibetor](https://github.com/quodlibetor) in [09e3e80](https://github.com/quodlibetor/s3glob/commit/09e3e8069b22d4f8ac4b76d139a7109943220bd3)
+
+## [0.4.0](https://github.com/quodlibetor/s3glob/compare/v0.3.1...v0.4.0) - 2025-02-26
 
 ### 🚀 Features
 
@@ -19,19 +48,19 @@
 
 - Improve changelog generation with github links by [@quodlibetor](https://github.com/quodlibetor) in [9f7f93b](https://github.com/quodlibetor/s3glob/commit/9f7f93bca87d3d74a0f127f1602a6ab4151e688e)
 
-## [0.3.1](https://github.com/quodlibetor/s3glob/compare/v0.3.0..v0.3.1) - 2025-02-22
+## [0.3.1](https://github.com/quodlibetor/s3glob/compare/v0.3.0...v0.3.1) - 2025-02-22
 
 ### ⚡ Performance
 
 - Download objects in parallel for (potentially) huge speedups by [@quodlibetor](https://github.com/quodlibetor) in [#13](https://github.com/quodlibetor/s3glob/pull/13)
 
-## [0.3.0](https://github.com/quodlibetor/s3glob/compare/v0.2.7..v0.3.0) - 2025-02-20
+## [0.3.0](https://github.com/quodlibetor/s3glob/compare/v0.2.7...v0.3.0) - 2025-02-20
 
 ### 🚀 Features
 
 - Add --path-mode and change default download behavior to only keep paths after glob patterns by [@quodlibetor](https://github.com/quodlibetor) in [958fc6e](https://github.com/quodlibetor/s3glob/commit/958fc6e26e44755b42d83b07316525250561e1c5)
 
-## [0.2.7](https://github.com/quodlibetor/s3glob/compare/v0.2.6..v0.2.7) - 2025-02-19
+## [0.2.7](https://github.com/quodlibetor/s3glob/compare/v0.2.6...v0.2.7) - 2025-02-19
 
 ### 🚀 Features
 
@@ -51,13 +80,13 @@
 - Reduce toomanyrequests Docker Hub errors in CI by [@quodlibetor](https://github.com/quodlibetor) in [#9](https://github.com/quodlibetor/s3glob/pull/9)
 - Add github attestations to dist release config by [@quodlibetor](https://github.com/quodlibetor) in [#11](https://github.com/quodlibetor/s3glob/pull/11)
 
-## [0.2.6](https://github.com/quodlibetor/s3glob/compare/v0.2.5..v0.2.6) - 2025-02-17
+## [0.2.6](https://github.com/quodlibetor/s3glob/compare/v0.2.5...v0.2.6) - 2025-02-17
 
 ### 🐛 Bug Fixes
 
 - Support character ranges [a-c] in prefix generation by [@quodlibetor](https://github.com/quodlibetor) in [f3b1393](https://github.com/quodlibetor/s3glob/commit/f3b139351ce22c3065b4ba804a881147bf7a0bc6)
 
-## [0.2.5](https://github.com/quodlibetor/s3glob/compare/v0.2.4..v0.2.5) - 2025-02-15
+## [0.2.5](https://github.com/quodlibetor/s3glob/compare/v0.2.4...v0.2.5) - 2025-02-15
 
 ### 🚀 Features
 
@@ -68,7 +97,7 @@
 
 - Support actual aws cli option --no-sign-request by [@quodlibetor](https://github.com/quodlibetor) in [04b718a](https://github.com/quodlibetor/s3glob/commit/04b718a54f0170ad7f660d5d70f80e066e10460d)
 
-## [0.2.4](https://github.com/quodlibetor/s3glob/compare/v0.2.3..v0.2.4) - 2025-02-14
+## [0.2.4](https://github.com/quodlibetor/s3glob/compare/v0.2.3...v0.2.4) - 2025-02-14
 
 ### 🐛 Bug Fixes
 
@@ -78,7 +107,7 @@
 
 - Point out the parallelism help when few prefixes are found by [@quodlibetor](https://github.com/quodlibetor) in [f07d3b1](https://github.com/quodlibetor/s3glob/commit/f07d3b129df0b8c20fab9428163b399830ea8ff1)
 
-## [0.2.3](https://github.com/quodlibetor/s3glob/compare/v0.2.2..v0.2.3) - 2025-02-13
+## [0.2.3](https://github.com/quodlibetor/s3glob/compare/v0.2.2...v0.2.3) - 2025-02-13
 
 ### 🐛 Bug Fixes
 
@@ -89,7 +118,7 @@
 
 - Add an s3glob help parallelism command by [@quodlibetor](https://github.com/quodlibetor) in [d0c5a65](https://github.com/quodlibetor/s3glob/commit/d0c5a6590eb419a3961e6fa1502c3c59ebb8e0ac)
 
-## [0.2.2](https://github.com/quodlibetor/s3glob/compare/v0.2.1..v0.2.2) - 2025-02-13
+## [0.2.2](https://github.com/quodlibetor/s3glob/compare/v0.2.1...v0.2.2) - 2025-02-13
 
 ### 🐛 Bug Fixes
 
@@ -105,7 +134,7 @@
 
 - Add cargo nextest test timeouts by [@quodlibetor](https://github.com/quodlibetor) in [626c6c3](https://github.com/quodlibetor/s3glob/commit/626c6c339eefbc2e28a8cf9f04954639e56034ee)
 
-## [0.2.1](https://github.com/quodlibetor/s3glob/compare/v0.2.0..v0.2.1) - 2025-02-12
+## [0.2.1](https://github.com/quodlibetor/s3glob/compare/v0.2.0...v0.2.1) - 2025-02-12
 
 ### 🚀 Features
 
@@ -117,7 +146,7 @@
 
 - Add mise config for dev tools by [@quodlibetor](https://github.com/quodlibetor) in [09115f0](https://github.com/quodlibetor/s3glob/commit/09115f08c0dad7699c5eef5e131218e7b3fb9b92)
 
-## [0.2.0](https://github.com/quodlibetor/s3glob/compare/v0.1.1..v0.2.0) - 2025-02-11
+## [0.2.0](https://github.com/quodlibetor/s3glob/compare/v0.1.1...v0.2.0) - 2025-02-11
 
 ### 🚀 Features
 
@@ -130,7 +159,7 @@
 - Recognize more release comments in cliff by [@quodlibetor](https://github.com/quodlibetor) in [179e750](https://github.com/quodlibetor/s3glob/commit/179e7501c38c113b3baf7d024440cda3069c5fd9)
 - Use cargo-nextest in CI by [@quodlibetor](https://github.com/quodlibetor) in [13c56b9](https://github.com/quodlibetor/s3glob/commit/13c56b9b89d3ab2677bc9ff13e57e716471c2780)
 
-## [0.1.1](https://github.com/quodlibetor/s3glob/compare/v0.1.0..v0.1.1) - 2025-01-20
+## [0.1.1](https://github.com/quodlibetor/s3glob/compare/v0.1.0...v0.1.1) - 2025-01-20
 
 ### 🚀 Features
 
@@ -139,9 +168,5 @@
 ### 🐛 Bug Fixes
 
 - Ensure that globs in the file part still get searched by [@quodlibetor](https://github.com/quodlibetor) in [25179a4](https://github.com/quodlibetor/s3glob/commit/25179a47e84772bf272187b75c4a6a00ca1e42d7)
-
-### New Contributors
-
-- @quodlibetor made their first contribution
 
 <!-- generated by git-cliff -->
