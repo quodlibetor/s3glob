@@ -57,16 +57,24 @@ brew install quodlibetor/tap/s3glob
 
 Glob syntax supported:
 
-- `*` matches any number of characters. Note that unlike extglob, `*` is
-  not limited to a single "directory" level (it matches `/` characters), so it
-  is strictly more general than `**`.
+- `*` matches any number of non-delimiter characters. The default delimiter is `/`.
 - `?` matches any single character.
 - `[abc]`/`[!abc]` matches any single character in/not in the set.
 - `[a-z]`/`[!a-z]` matches any single character in/not in the range.
 - `{a,b,c}` matches any of the comma-separated options (but nested globs are not
   supported).
+- `**` matches any number of characters. This will immediately force
+  `s3glob` to scan all objects starting where it appears.
 
 ### Algorithm and performance implications
+
+The tl;dr is that, up until the point a pattern has a `**` in it, `s3glob` will
+search within directories filtering by any constants in the pattern to reduce
+the number of objects that need to be scanned:
+
+- fastest: `bucket/a*/b*/**`
+- fast: `bucket/*a*/*b*/**`
+- full scan: `bucket/**a**/b**`
 
 AWS S3 allows us to enumerate objects within a prefix, but it does not natively
 allow any filtering. `s3glob` works around this by enumerating prefixes and
