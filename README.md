@@ -30,7 +30,8 @@ You can also download objects:
 s3glob dl "s3://my-bucket/a*/something/1*/other/*" my-local-dir
 ```
 
-This will create a directory structure that mirrors the s3 object hierarchy.
+Local files will always be unique (two objects with the same filename won't stomp on each other).
+See `s3glob dl --help` to configure exactly how local paths are created.
 
 ### Installation
 
