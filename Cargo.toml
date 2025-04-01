@@ -40,7 +40,7 @@ assert_fs = { version = "1.1.2", features = ["color"] }
 assert_cmd = "2.0"
 predicates = "3.1"
 assert2 = "0.3"
-rstest = "0.24"
+rstest = "0.25"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["minio"] }
 
