@@ -182,7 +182,7 @@ impl S3GlobMatcher {
             // just searching because we have to do an api call to check each
             // prefix, instead of allowing aws to list them for us.
             match part {
-                glob::Glob::Recursive { .. } => {
+                glob::Glob::Recursive => {
                     // we can also skip the last part if it's not a negated character class
                     debug!("found recursive glob, stopping prefix generation");
                     break;

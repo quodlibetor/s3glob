@@ -25,7 +25,7 @@ impl Glob {
     pub(crate) fn display(&self) -> String {
         match self {
             Glob::Any { raw, .. } => format!("Any({raw})"),
-            Glob::Recursive { .. } => "Recursive(**)".to_string(),
+            Glob::Recursive => "Recursive(**)".to_string(),
             Glob::Choice { raw, .. } => format!("Choice({raw})"),
             Glob::SyntheticAny => "SyntheticAny".to_string(),
         }
@@ -34,7 +34,7 @@ impl Glob {
     pub(crate) fn raw(&self) -> &str {
         match self {
             Glob::Any { raw, .. } => raw,
-            Glob::Recursive { .. } => "**",
+            Glob::Recursive => "**",
             Glob::Choice { raw, .. } => raw,
             Glob::SyntheticAny => "",
         }
@@ -43,7 +43,7 @@ impl Glob {
     pub(crate) fn pattern_len(&self) -> usize {
         match self {
             Glob::Any { raw, .. } => raw.len(),
-            Glob::Recursive { .. } => 2,
+            Glob::Recursive => 2,
             Glob::Choice { raw, .. } => raw.len(),
             Glob::SyntheticAny => 0,
         }
@@ -61,7 +61,7 @@ impl Glob {
     }
 
     pub(crate) fn is_recursive(&self) -> bool {
-        matches!(self, Glob::Recursive { .. })
+        matches!(self, Glob::Recursive)
     }
 
     pub(crate) fn re_string(&self, delimiter: &str) -> String {
@@ -88,7 +88,7 @@ impl Glob {
                     format!("({})", re_alts)
                 }
             }
-            Glob::Recursive { .. } => ".*".to_string(),
+            Glob::Recursive => ".*".to_string(),
             Glob::SyntheticAny => format!("[^{delimiter}]*"),
         }
     }
