@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.4](https://github.com/quodlibetor/s3glob/compare/v0.4.3...v0.4.4) - 2025-05-03
+
+### 📚 Documentation
+
+- Fix dl description in README by [@quodlibetor](https://github.com/quodlibetor) in [8cc2052](https://github.com/quodlibetor/s3glob/commit/8cc2052870dd9e602490de3d225b87e298ec01ac)
+- Fix README description of glob rules by [@quodlibetor](https://github.com/quodlibetor) in [7b76d0c](https://github.com/quodlibetor/s3glob/commit/7b76d0cb69afcb203c0181187c65ddbd077b47d1)
+
+### ⚡ Performance
+
+- Don't double check or scan literal objects by [@quodlibetor](https://github.com/quodlibetor) in [#38](https://github.com/quodlibetor/s3glob/pull/38)
+
+### ⚙️ Miscellaneous Tasks
+
+- Remove unnecessary struct pattern in match by [@quodlibetor](https://github.com/quodlibetor) in [ffb3fed](https://github.com/quodlibetor/s3glob/commit/ffb3fed9c5821343ee911f80238b553ecc1416d4)
+- Update release github runners to 22.04 by [@quodlibetor](https://github.com/quodlibetor) in [#35](https://github.com/quodlibetor/s3glob/pull/35)
+
 ## [0.4.3](https://github.com/quodlibetor/s3glob/compare/v0.4.2...v0.4.3) - 2025-03-01
 
 ### 🐛 Bug Fixes
