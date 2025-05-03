@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context as _, Result};
 use aws_sdk_s3::Client;
+use aws_sdk_s3::types::Object;
 use globset::GlobMatcher;
 use num_format::{Locale, ToFormattedString as _};
 use tokio::sync::Semaphore;
@@ -21,7 +22,7 @@ use super::{LiveStatus, PrefixResult, PrefixSearchResult};
 
 #[async_trait::async_trait]
 pub trait Engine: Send + Sync + 'static {
-    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>>;
+    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<ScanResult>;
     async fn check_prefixes<P>(
         &mut self,
         prefixes: P,
@@ -69,16 +70,25 @@ impl S3Engine {
                 Ok::<_, anyhow::Error>(())
             });
         }
+        tx.send(
+            presult
+                .objects
+                .into_iter()
+                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+                .map(|o| PrefixResult::Object(S3Object::from(o)))
+                .collect(),
+        )?;
         Ok(())
     }
 
     pub(crate) async fn get_exact(
         &self,
-        presult: &PrefixSearchResult,
+        presult: PrefixSearchResult,
         status: &LiveStatus,
+        matcher: &GlobMatcher,
         tx: &tokio::sync::mpsc::UnboundedSender<Vec<PrefixResult>>,
         permit: Arc<Semaphore>,
-    ) {
+    ) -> Result<()> {
         for prefix in &presult.prefixes {
             // just get the object info for each prefix
             let permit = permit.clone().acquire_owned().await;
@@ -104,6 +114,15 @@ impl S3Engine {
                 }
             });
         }
+        tx.send(
+            presult
+                .objects
+                .into_iter()
+                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+                .map(|o| PrefixResult::Object(S3Object::from(o)))
+                .collect(),
+        )?;
+        Ok(())
     }
 }
 
@@ -145,11 +164,26 @@ async fn list_matching_objects(
     Ok(())
 }
 
+#[derive(Debug)]
+pub struct ScanResult {
+    pub prefixes: Vec<String>,
+    pub objects: Vec<Object>,
+}
+
+impl ScanResult {
+    pub fn len(&self) -> usize {
+        self.prefixes.len() + self.objects.len()
+    }
+}
+
 #[async_trait::async_trait]
 impl Engine for S3Engine {
-    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
+    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<ScanResult> {
         trace!(prefix, "scanning for prefixes within");
-        let mut prefixes = Vec::new();
+        let mut result = ScanResult {
+            prefixes: Vec::new(),
+            objects: Vec::new(),
+        };
         let mut paginator = self
             .client
             .list_objects_v2()
@@ -163,13 +197,14 @@ impl Engine for S3Engine {
         let mut warning_inc = 50_000;
         while let Some(page) = paginator.next().await {
             let page = page?;
-            if prefixes.len() >= warning_count + warning_inc {
+            if result.len() >= warning_count + warning_inc {
                 if warning_count == 0 {
                     progressln!(); // create a new line after the "discovering.." message
                 }
                 warn!(
-                    "found {} objects in {prefix} and still discovering more",
-                    prefixes.len().to_formatted_string(&Locale::en)
+                    "found {} objects and {} prefixes in {prefix} and still discovering more",
+                    result.objects.len().to_formatted_string(&Locale::en),
+                    result.prefixes.len().to_formatted_string(&Locale::en),
                 );
                 warning_count += warning_inc;
                 if warning_count >= 100_000 {
@@ -177,13 +212,15 @@ impl Engine for S3Engine {
                 }
             }
             if let Some(common_prefixes) = page.common_prefixes {
-                prefixes.extend(common_prefixes.into_iter().filter_map(|p| p.prefix));
+                result
+                    .prefixes
+                    .extend(common_prefixes.into_iter().filter_map(|p| p.prefix));
             }
             if let Some(contents) = page.contents {
-                prefixes.extend(contents.into_iter().filter_map(|c| c.key));
+                result.objects.extend(contents);
             }
         }
-        Ok(prefixes)
+        Ok(result)
     }
 
     // TODO: convert this to take &mut prefixes so that we don't have to
@@ -256,7 +293,7 @@ pub(super) struct MockS3Engine {
 #[cfg(test)]
 #[async_trait::async_trait]
 impl Engine for MockS3Engine {
-    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
+    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<ScanResult> {
         self.calls
             .lock()
             .unwrap()
@@ -265,7 +302,10 @@ impl Engine for MockS3Engine {
 
         info!(prefix, ?found, "MockS3 found prefixes");
 
-        found
+        Ok(ScanResult {
+            prefixes: found?,
+            objects: Vec::new(),
+        })
     }
 
     async fn check_prefixes<P>(

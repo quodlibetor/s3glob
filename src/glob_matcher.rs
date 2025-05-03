@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use anyhow::{Context as _, Result, bail};
+use aws_sdk_s3::types::Object;
 use glob::Glob;
 use globset::GlobMatcher;
 use itertools::Itertools as _;
@@ -52,6 +53,7 @@ pub struct S3GlobMatcher {
 #[derive(Debug)]
 pub(crate) struct PrefixSearchResult {
     pub prefixes: Vec<String>,
+    pub objects: Vec<Object>,
     pub max_prefixes_observed: usize,
     pub max_objects_observed: usize,
 }
@@ -155,6 +157,7 @@ impl S3GlobMatcher {
         debug!("finding prefixes for {}", self.raw);
         let mut prefixes = BTreeSet::new();
         prefixes.insert("".to_string());
+        let mut objects: Vec<Object> = Vec::new();
         let delimiter = self.delimiter.to_string();
         let mut regex_so_far = "^".to_string();
         let mut prev_part = None;
@@ -237,7 +240,8 @@ impl S3GlobMatcher {
                                 scanned_results = ?results,
                                 "Scanning for any, got result from task"
                             );
-                            new_prefixes.extend(results);
+                            new_prefixes.extend(results.prefixes);
+                            objects.extend(results.objects);
                             new_prefix_count = new_prefixes.len();
                             if new_prefix_count >= MAX_PREFIXES {
                                 debug!(
@@ -482,6 +486,7 @@ impl S3GlobMatcher {
         }
         Ok(PrefixSearchResult {
             prefixes: prefixes.into_iter().collect(),
+            objects,
             max_prefixes_observed,
             max_objects_observed,
         })
@@ -512,7 +517,9 @@ impl S3GlobMatcher {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
         if self.is_complete() {
             let permit = Arc::new(Semaphore::new(self.max_parallelism));
-            engine.get_exact(&presult, &status, &tx, permit).await;
+            engine
+                .get_exact(presult, &status, &self.glob, &tx, permit)
+                .await?;
         } else {
             let permit = Arc::new(Semaphore::new(self.max_parallelism));
             engine
