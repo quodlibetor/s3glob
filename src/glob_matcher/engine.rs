@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::{S3Object, add_atomic, progressln};
 
-use super::{LiveStatus, PrefixResult, PrefixSearchResult, S3GlobMatcher};
+use super::{LiveStatus, PrefixResult, PrefixSearchResult};
 
 #[async_trait::async_trait]
 pub trait Engine: Send + Sync + 'static {
