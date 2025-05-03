@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use anyhow::{Context as _, Result, bail};
 use glob::Glob;
@@ -9,12 +10,13 @@ use globset::GlobMatcher;
 use itertools::Itertools as _;
 use regex::Regex;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, trace, warn};
 
 mod engine;
 pub use engine::{Engine, S3Engine};
 
-use crate::{progress, progressln};
+use crate::{S3Object, progress, progressln};
 
 mod glob;
 
@@ -485,13 +487,53 @@ impl S3GlobMatcher {
         })
     }
 
+    pub(crate) async fn get_objects(&self, engine: S3Engine) -> Result<ListResult> {
+        let presult = match self.find_prefixes(engine.clone()).await {
+            Ok(prefixes) => prefixes,
+            Err(err) => {
+                // the matcher prints some progress info to stderr, if there's an
+                // error we should make sure to add a newline
+                progressln!();
+                return Err(err);
+            }
+        };
+        trace!(?presult.prefixes, "matcher generated prefixes");
+        debug!(
+            prefix_count = presult.prefixes.len(),
+            "matcher generated prefixes"
+        );
+        let max_objects_observed = presult.max_objects_observed;
+        let max_prefixes_observed = presult.max_prefixes_observed;
+        let status = LiveStatus {
+            total_objects: Arc::new(AtomicUsize::new(0)),
+            seen_prefixes: Arc::new(AtomicUsize::new(0)),
+        };
+        let total_prefixes = presult.prefixes.len();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
+        if self.is_complete() {
+            let permit = Arc::new(Semaphore::new(self.max_parallelism));
+            engine.get_exact(&presult, &status, &tx, permit).await;
+        } else {
+            let permit = Arc::new(Semaphore::new(self.max_parallelism));
+            engine
+                .get_all_children(presult, Arc::new(self.glob.clone()), &status, &tx, permit)
+                .await?;
+        }
+        drop(tx);
+        Ok(ListResult {
+            totals: Totals {
+                max_objects_observed,
+                max_prefixes_observed,
+                total_prefixes,
+            },
+            status,
+            rx,
+        })
+    }
+
     /// True if no further listing needs to be done by the caller
     pub fn is_complete(&self) -> bool {
         self.is_complete
-    }
-
-    pub fn is_match(&self, path: &str) -> bool {
-        self.glob.is_match(path)
     }
 
     #[cfg(test)]
@@ -539,6 +581,39 @@ async fn check_prefixes(
 
 fn prefix_join(prefix: &str, alt: &str) -> String {
     format!("{prefix}{alt}")
+}
+// Final listing code
+
+#[derive(Debug)]
+pub(crate) enum PrefixResult {
+    Object(S3Object),
+    Prefix(String),
+}
+
+impl PrefixResult {
+    pub(crate) fn key(&self) -> &str {
+        match self {
+            Self::Object(obj) => &obj.key,
+            Self::Prefix(prefix) => prefix,
+        }
+    }
+}
+
+pub(crate) struct ListResult {
+    pub(crate) status: LiveStatus,
+    pub(crate) totals: Totals,
+    pub(crate) rx: UnboundedReceiver<Vec<PrefixResult>>,
+}
+
+pub(crate) struct Totals {
+    pub(crate) total_prefixes: usize,
+    pub(crate) max_objects_observed: usize,
+    pub(crate) max_prefixes_observed: usize,
+}
+
+pub(crate) struct LiveStatus {
+    pub(crate) total_objects: Arc<AtomicUsize>,
+    pub(crate) seen_prefixes: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]

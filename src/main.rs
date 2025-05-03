@@ -11,16 +11,15 @@ use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::Object;
 use aws_sdk_s3::{Client, config::BehaviorVersion, config::Region};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
-use glob_matcher::{GLOB_CHARS, S3Engine, S3GlobMatcher};
+use glob_matcher::{GLOB_CHARS, ListResult, PrefixResult, S3Engine, S3GlobMatcher};
 use humansize::{DECIMAL, FormatSizeOptions, SizeFormatter};
 use messaging::{MESSAGE_LEVEL, MessageLevel};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
 use tokio::io::AsyncWriteExt as _;
 use tokio::runtime::Runtime;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 mod glob_matcher;
 mod messaging;
@@ -324,74 +323,11 @@ async fn run(opts: Opts) -> Result<()> {
     let engine = S3Engine::new(client.clone(), bucket.clone());
     let mut matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
     matcher.set_max_parallelism(opts.max_parallelism);
-    let presult = match matcher.find_prefixes(engine).await {
-        Ok(prefixes) => prefixes,
-        Err(err) => {
-            // the matcher prints some progress info to stderr, if there's an
-            // error we should make sure to add a newline
-            progressln!();
-            return Err(err);
-        }
-    };
-    trace!(?presult.prefixes, "matcher generated prefixes");
-    debug!(
-        prefix_count = presult.prefixes.len(),
-        "matcher generated prefixes"
-    );
-
-    let total_objects = Arc::new(AtomicUsize::new(0));
-    let seen_prefixes = Arc::new(AtomicUsize::new(0));
-    let total_prefixes = presult.prefixes.len();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
-    if matcher.is_complete() {
-        let permit = Arc::new(Semaphore::new(opts.max_parallelism));
-        for prefix in presult.prefixes {
-            // just get the object info for each prefix
-            let client = client.clone();
-            let bucket = bucket.clone();
-            let prefix = prefix.clone();
-            let tx = tx.clone();
-            let permit = permit.clone().acquire_owned().await;
-
-            total_objects.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                let r = client
-                    .head_object()
-                    .bucket(bucket)
-                    .key(prefix.clone())
-                    .send()
-                    .await;
-                drop(permit);
-                match r {
-                    Ok(o) => tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
-                        prefix, o,
-                    ))]),
-                    Err(_) => tx.send(vec![PrefixResult::Prefix(prefix)]),
-                }
-            });
-        }
-    } else {
-        let permit = Arc::new(Semaphore::new(opts.max_parallelism));
-        for prefix in presult.prefixes {
-            let client = client.clone();
-            let total_objects = Arc::clone(&total_objects);
-            let seen_prefixes = Arc::clone(&seen_prefixes);
-            let matcher = matcher.clone();
-            let bucket = bucket.clone();
-            let tx = tx.clone();
-            let permit = permit.clone().acquire_owned().await;
-
-            tokio::spawn(async move {
-                list_matching_objects(&client, &bucket, &prefix, &matcher, total_objects, tx)
-                    .await?;
-                drop(permit);
-
-                add_atomic(&seen_prefixes, 1);
-                Ok::<_, anyhow::Error>(())
-            });
-        }
-    }
-    drop(tx);
+    let ListResult {
+        status,
+        totals,
+        mut rx,
+    } = matcher.get_objects(engine).await?;
 
     match opts.command {
         Command::List { format, stream, .. } => {
@@ -400,7 +336,7 @@ async fn run(opts: Opts) -> Result<()> {
             } else {
                 None
             };
-            let mut matching_objects = Vec::new();
+            let mut matching_objects: Vec<PrefixResult> = Vec::new();
             let mut match_count = 0;
             let decimal = decimal_format();
             while let Some(results) = rx.recv().await {
@@ -416,11 +352,12 @@ async fn run(opts: Opts) -> Result<()> {
                         progress!(
                             "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
                             match_count.to_formatted_string(&Locale::en),
-                            total_objects
+                            status
+                                .total_objects
                                 .load(Ordering::Relaxed)
                                 .to_formatted_string(&Locale::en),
-                            seen_prefixes.load(Ordering::Relaxed),
-                            total_prefixes
+                            status.seen_prefixes.load(Ordering::Relaxed),
+                            totals.total_prefixes
                         );
                     }
                 }
@@ -434,10 +371,11 @@ async fn run(opts: Opts) -> Result<()> {
             progressln!(
                 "Matched {}/{} objects across {} prefixes in {:?}",
                 match_count,
-                total_objects
+                status
+                    .total_objects
                     .load(Ordering::Relaxed)
-                    .max(presult.max_objects_observed),
-                presult.max_prefixes_observed,
+                    .max(totals.max_objects_observed),
+                totals.max_prefixes_observed,
                 Duration::from_millis(start.elapsed().as_millis() as u64)
             );
         }
@@ -485,11 +423,12 @@ async fn run(opts: Opts) -> Result<()> {
                     progress!(
                         "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
                         total_matches.to_formatted_string(&Locale::en),
-                        total_objects
+                        status
+                            .total_objects
                             .load(Ordering::Relaxed)
                             .to_formatted_string(&Locale::en),
-                        seen_prefixes.load(Ordering::Relaxed),
-                        total_prefixes
+                        status.seen_prefixes.load(Ordering::Relaxed),
+                        totals.total_prefixes
                     );
                 }
             }
@@ -837,21 +776,6 @@ fn extract_prefix_to_strip(raw_pattern: &str, path_mode: PathMode, keys: &[S3Obj
 }
 
 #[derive(Debug)]
-enum PrefixResult {
-    Object(S3Object),
-    Prefix(String),
-}
-
-impl PrefixResult {
-    fn key(&self) -> &str {
-        match self {
-            Self::Object(obj) => &obj.key,
-            Self::Prefix(prefix) => prefix,
-        }
-    }
-}
-
-#[derive(Debug)]
 struct S3Object {
     key: String,
     size: i64,
@@ -992,44 +916,6 @@ fn format_user(bucket: &str, obj: &S3Object, tokens: &[FormatToken]) -> String {
 fn add_atomic(atomic: &AtomicUsize, value: usize) -> usize {
     atomic.fetch_add(value, Ordering::Relaxed);
     atomic.load(Ordering::Relaxed)
-}
-
-async fn list_matching_objects(
-    client: &Client,
-    bucket: &str,
-    prefix: &str,
-    matcher: &S3GlobMatcher,
-    total_objects: Arc<AtomicUsize>,
-    tx: UnboundedSender<Vec<PrefixResult>>,
-) -> Result<()> {
-    let mut paginator = client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(prefix)
-        .into_paginator()
-        .send();
-
-    while let Some(page) = paginator.next().await {
-        let page = page?;
-        if let Some(contents) = page.contents {
-            let mut matching_objects = Vec::new();
-            total_objects.fetch_add(contents.len(), Ordering::Relaxed);
-            for obj in contents {
-                if let Some(key) = &obj.key {
-                    if matcher.is_match(key) {
-                        matching_objects.push(obj);
-                    }
-                }
-            }
-            tx.send(
-                matching_objects
-                    .into_iter()
-                    .map(|o| PrefixResult::Object(S3Object::from(o)))
-                    .collect::<Vec<_>>(),
-            )?;
-        }
-    }
-    Ok(())
 }
 
 fn log_directive(loglevel: u8, quiet: u8) -> Option<&'static str> {
