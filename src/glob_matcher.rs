@@ -158,6 +158,7 @@ impl S3GlobMatcher {
         let mut prefixes = BTreeSet::new();
         prefixes.insert("".to_string());
         let mut objects: Vec<Object> = Vec::new();
+        let mut objects_updated = false;
         let delimiter = self.delimiter.to_string();
         let mut regex_so_far = "^".to_string();
         let mut prev_part = None;
@@ -199,7 +200,8 @@ impl S3GlobMatcher {
                     // never scan if the previous part was an any, because the last scan will have
                     // already found all of the prefixes that match the any
                     let scan_might_help = !matches!(prev_part, Some(&Glob::Any { .. }));
-                    if scan_might_help {
+                    // might have no prefixes if we only found objects before any prefixes
+                    if scan_might_help && !prefixes.is_empty() {
                         debug!(part = %part.display(), "scanning for keys in an Any");
                         let (tx, mut rx) = tokio::sync::mpsc::channel(prefixes.len());
 
@@ -241,6 +243,9 @@ impl S3GlobMatcher {
                                 "Scanning for any, got result from task"
                             );
                             new_prefixes.extend(results.prefixes);
+                            if !objects_updated {
+                                objects_updated = !results.objects.is_empty();
+                            }
                             objects.extend(results.objects);
                             new_prefix_count = new_prefixes.len();
                             if new_prefix_count >= MAX_PREFIXES {
@@ -442,13 +447,17 @@ impl S3GlobMatcher {
                                 String::new()
                             };
 
-                            bail!(
-                                "Could not continue search in prefixes:\n  {}{}\
+                            if !objects_updated {
+                                bail!(
+                                    "Could not continue search in prefixes:\n  {}{}\
                                 \n\n\
                                 None of the above matched the pattern:\n  {glob_so_far}",
-                                prefixes.iter().take(max_prefixes).join("\n  "),
-                                and_more,
-                            );
+                                    prefixes.iter().take(max_prefixes).join("\n  "),
+                                    and_more,
+                                );
+                            } else {
+                                objects_updated = false;
+                            }
                         }
                     }
                 }
