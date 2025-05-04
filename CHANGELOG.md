@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.5-prerelease1](https://github.com/quodlibetor/s3glob/compare/v0.4.4...v0.4.5-prerelease1) - 2025-05-04
+
+### 🐛 Bug Fixes
+
+- **(release)** Attempt to fix the brew publish command by [@quodlibetor](https://github.com/quodlibetor) in [#39](https://github.com/quodlibetor/s3glob/pull/39)
+
 ## [0.4.4](https://github.com/quodlibetor/s3glob/compare/v0.4.3...v0.4.4) - 2025-05-03
 
 ### 📚 Documentation
