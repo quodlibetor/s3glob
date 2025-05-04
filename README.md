@@ -8,6 +8,11 @@ in about 5 seconds, where I gave up on `aws s3 ls` after 5 minutes.
 
 ![s3glob in action](./static/s3glob.gif)
 
+## Status
+
+s3glob is basically complete. It does all the things I need. If you have any
+feature requests or bug reports please open an issue.
+
 ## Usage
 
 These two commands are equivalent:
