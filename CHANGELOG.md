@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.5-prerelease.2](https://github.com/quodlibetor/s3glob/compare/v0.4.5-prerelease1...v0.4.5-prerelease.2) - 2025-05-04
+
+### 📚 Documentation
+
+- Mention the status of the project in the README by Brandon W Maister in [659d7c3](https://github.com/quodlibetor/s3glob/commit/659d7c3714e1180f48c7b751c2c48a45cd9911db)
+
 ## [0.4.5-prerelease1](https://github.com/quodlibetor/s3glob/compare/v0.4.4...v0.4.5-prerelease1) - 2025-05-04
 
 ### 🐛 Bug Fixes
