@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Context as _, Result};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::types::Object;
-use globset::GlobMatcher;
 use num_format::{Locale, ToFormattedString as _};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
@@ -47,7 +46,7 @@ impl S3Engine {
     pub(crate) async fn get_all_children(
         &self,
         presult: PrefixSearchResult,
-        matcher: Arc<GlobMatcher>,
+        matcher: Arc<regex::Regex>,
         status: &LiveStatus,
         tx: &tokio::sync::mpsc::UnboundedSender<Vec<PrefixResult>>,
         permit: Arc<Semaphore>,
@@ -85,10 +84,11 @@ impl S3Engine {
         &self,
         presult: PrefixSearchResult,
         status: &LiveStatus,
-        matcher: &GlobMatcher,
+        matcher: &regex::Regex,
         tx: &tokio::sync::mpsc::UnboundedSender<Vec<PrefixResult>>,
         permit: Arc<Semaphore>,
     ) -> Result<()> {
+        let mut filtered_prefixes = 0;
         for prefix in &presult.prefixes {
             // just get the object info for each prefix
             let permit = permit.clone().acquire_owned().await;
@@ -96,9 +96,17 @@ impl S3Engine {
             let bucket = self.bucket.clone();
             let prefix = prefix.clone();
             let tx = tx.clone();
+            // Annoyingly I can't seem to write a test that shows that this is required.
+            // this query gives the wrong result without this check though:
+            // ls --no-sign-request s3://fah-public-data-covid19-cryptic-pockets/SARS-CoV-1/*/*RUN0/*CLONE997
+            if !matcher.is_match(prefix.as_ref()) {
+                filtered_prefixes += 1;
+                continue;
+            }
 
             status.total_objects.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
+                // Check if the "prefix" is a real object
                 let r = client
                     .head_object()
                     .bucket(bucket)
@@ -106,6 +114,7 @@ impl S3Engine {
                     .send()
                     .await;
                 drop(permit);
+
                 match r {
                     Ok(o) => tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
                         prefix, o,
@@ -114,6 +123,11 @@ impl S3Engine {
                 }
             });
         }
+        debug!(
+            filtered_prefixes,
+            total_prefixes = presult.prefixes.len(),
+            "filtered prefixes from the result set"
+        );
         tx.send(
             presult
                 .objects
@@ -130,7 +144,7 @@ async fn list_matching_objects(
     client: Client,
     bucket: String,
     prefix: String,
-    matcher: Arc<GlobMatcher>,
+    matcher: Arc<regex::Regex>,
     total_objects: Arc<AtomicUsize>,
     tx: UnboundedSender<Vec<PrefixResult>>,
 ) -> Result<()> {

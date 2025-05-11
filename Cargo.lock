@@ -2459,7 +2459,6 @@ dependencies = [
  "aws-sdk-s3",
  "clap",
  "futures",
- "globset",
  "humansize",
  "itertools",
  "num-format",

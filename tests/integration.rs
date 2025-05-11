@@ -1,9 +1,13 @@
+use std::borrow::Cow;
+use std::env;
+
 use assert_cmd::Command;
 use assert_fs::TempDir;
 use assert_fs::prelude::*;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
+use futures::{FutureExt, future::BoxFuture};
 use predicates::prelude::*;
 use predicates::str::contains;
 use rstest::rstest;
@@ -472,11 +476,12 @@ async fn create_object_with_size(
 
 fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
     let mut command = Command::cargo_bin("s3glob")?;
+    let log_directive = env::var("S3GLOB_LOG").unwrap_or_else(|_| "s3glob=trace".to_string());
     command
         .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
-        .env("S3GLOB_LOG", "s3glob=trace")
+        .env("S3GLOB_LOG", log_directive)
         .args(args);
 
     print_s3glob_output(&mut command);
@@ -491,10 +496,6 @@ fn print_s3glob_output(cmd: &mut Command) {
         String::from_utf8(output.stderr).unwrap()
     );
 }
-
-use std::borrow::Cow;
-
-use futures::{FutureExt, future::BoxFuture};
 
 /// A consumer that logs the output of container with the [`log`] crate.
 ///
