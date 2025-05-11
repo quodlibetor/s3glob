@@ -7,7 +7,6 @@ use std::sync::atomic::AtomicUsize;
 use anyhow::{Context as _, Result, bail};
 use aws_sdk_s3::types::Object;
 use glob::Glob;
-use globset::GlobMatcher;
 use itertools::Itertools as _;
 use regex::Regex;
 use tokio::sync::Semaphore;
@@ -41,7 +40,6 @@ pub struct S3GlobMatcher {
     raw: String,
     delimiter: char,
     parts: Vec<glob::Glob>,
-    glob: GlobMatcher,
     max_parallelism: usize,
     min_prefixes: usize,
     /// True if no further listing needs to be done by the caller
@@ -106,14 +104,12 @@ impl S3GlobMatcher {
         }
 
         debug!(pattern = %raw, parsed = ?new_parts, "parsed pattern");
-        let glob = globset::Glob::new(&raw)?;
         let is_complete = new_parts.iter().all(|p| !p.is_recursive());
 
         Ok(S3GlobMatcher {
             raw,
             delimiter: delimiter.chars().next().unwrap(),
             parts: new_parts,
-            glob: glob.compile_matcher(),
             max_parallelism: 500,
             min_prefixes: DESIRED_MIN_PREFIXES,
             is_complete,
@@ -124,6 +120,22 @@ impl S3GlobMatcher {
     // all the tests right now
     pub fn set_max_parallelism(&mut self, max_parallelism: usize) {
         self.max_parallelism = max_parallelism;
+    }
+
+    pub fn full_regex(&self) -> String {
+        let mut regex = "^".to_string();
+        for (i, part) in self.parts.iter().enumerate() {
+            // TODO: This is the existing behavior, should it be kept?
+            // the delimiter is optional if the previous part is recursive, so **/*.txt is equivalent to **.txt
+            if i > 0 && self.parts[i - 1].is_recursive() && part.is(&self.delimiter.to_string()) {
+                regex.push(self.delimiter);
+                regex.push('?');
+            } else {
+                regex.push_str(&part.re_string(&self.delimiter.to_string()));
+            }
+        }
+        regex.push('$');
+        regex
     }
 
     /// Find all S3 prefixes that could match this pattern
@@ -524,15 +536,15 @@ impl S3GlobMatcher {
         };
         let total_prefixes = presult.prefixes.len();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
+        let re = regex::Regex::new(&self.full_regex()).expect("can only generate valid regexes");
+        debug!(regex = %re.as_str(), "full regex");
         if self.is_complete() {
             let permit = Arc::new(Semaphore::new(self.max_parallelism));
-            engine
-                .get_exact(presult, &status, &self.glob, &tx, permit)
-                .await?;
+            engine.get_exact(presult, &status, &re, &tx, permit).await?;
         } else {
             let permit = Arc::new(Semaphore::new(self.max_parallelism));
             engine
-                .get_all_children(presult, Arc::new(self.glob.clone()), &status, &tx, permit)
+                .get_all_children(presult, Arc::new(re), &status, &tx, permit)
                 .await?;
         }
         drop(tx);

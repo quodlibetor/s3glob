@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.6](https://github.com/quodlibetor/s3glob/compare/v0.4.5...v0.4.6) - 2025-05-11
+
+### 🐛 Bug Fixes
+
+- Ensure that no non-matching prefixes are emitted by Brandon W Maister in [c289b8c](https://github.com/quodlibetor/s3glob/commit/c289b8c724a57c9d26f9a1fb715e2f4f028ad9cf)
+
 ## [0.4.5-prerelease.2](https://github.com/quodlibetor/s3glob/compare/v0.4.5-prerelease1...v0.4.5-prerelease.2) - 2025-05-04
 
 ### 📚 Documentation

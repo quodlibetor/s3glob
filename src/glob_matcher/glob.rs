@@ -55,6 +55,10 @@ impl Glob {
         matches!(self, Glob::Choice { .. })
     }
 
+    pub(crate) fn is(&self, val: &str) -> bool {
+        matches!(self, Glob::Choice { allowed: alts, .. } if alts.len() == 1 && alts[0] == val)
+    }
+
     /// True if this is a negated character class `[!abc]`
     pub(crate) fn is_negated(&self) -> bool {
         matches!(self, Glob::Any { not: Some(_), .. })
