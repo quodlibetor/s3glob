@@ -41,7 +41,7 @@ predicates = "3.1"
 assert2 = "0.3"
 rstest = "0.25"
 testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["minio"] }
+testcontainers-modules = { version = "0.12", features = ["minio"] }
 
 # The profile that 'dist' will build with
 [profile.dist]
