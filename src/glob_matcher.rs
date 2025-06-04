@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicUsize;
 
 use anyhow::{Context as _, Result, bail};
 use aws_sdk_s3::types::Object;
+use engine::ScanResult;
 use glob::Glob;
 use itertools::Itertools as _;
 use regex::Regex;
@@ -40,6 +41,7 @@ pub struct S3GlobMatcher {
     raw: String,
     delimiter: char,
     parts: Vec<glob::Glob>,
+    regex: Regex,
     max_parallelism: usize,
     min_prefixes: usize,
     /// True if no further listing needs to be done by the caller
@@ -105,11 +107,16 @@ impl S3GlobMatcher {
 
         debug!(pattern = %raw, parsed = ?new_parts, "parsed pattern");
         let is_complete = new_parts.iter().all(|p| !p.is_recursive());
-
+        let regex = Regex::new(&Self::build_full_regex(
+            &new_parts,
+            delimiter.chars().next().unwrap(),
+        ))
+        .unwrap();
         Ok(S3GlobMatcher {
             raw,
             delimiter: delimiter.chars().next().unwrap(),
             parts: new_parts,
+            regex,
             max_parallelism: 500,
             min_prefixes: DESIRED_MIN_PREFIXES,
             is_complete,
@@ -122,20 +129,20 @@ impl S3GlobMatcher {
         self.max_parallelism = max_parallelism;
     }
 
-    pub fn full_regex(&self) -> String {
+    fn build_full_regex(parts: &[glob::Glob], delimiter: char) -> String {
         let mut regex = "^".to_string();
-        for (i, part) in self.parts.iter().enumerate() {
+        for (i, part) in parts.iter().enumerate() {
             // TODO: This is the existing behavior, should it be kept?
             // the delimiter is optional if the previous part is recursive, so **/*.txt is equivalent to **.txt
-            if i > 0 && self.parts[i - 1].is_recursive() && part.is(&self.delimiter.to_string()) {
-                regex.push(self.delimiter);
+            if i > 0 && parts[i - 1].is_recursive() && part.is(&delimiter.to_string()) {
+                regex.push(delimiter);
                 regex.push('?');
             } else {
-                regex.push_str(&part.re_string(&self.delimiter.to_string()));
+                regex.push_str(&part.re_string(&delimiter.to_string()));
             }
         }
         // prefixes end with the delimiter
-        regex.push(self.delimiter);
+        regex.push(delimiter);
         regex.push_str("?$");
         regex
     }
@@ -228,6 +235,16 @@ impl S3GlobMatcher {
                             let permit = semaphore.clone().acquire_owned().await;
                             let mut engine = engine.clone();
                             let prefix = prefix.clone();
+
+                            // if the prefix matches the regex, we can return it immediately
+                            if self.regex.is_match(&client_prefix) {
+                                tx.send(Ok((
+                                    prefix.clone(),
+                                    ScanResult::for_prefix(prefix.clone()),
+                                )))
+                                .await
+                                .unwrap();
+                            }
 
                             let task = tokio::spawn(async move {
                                 match engine.scan_prefixes(&client_prefix, &delimiter).await {
@@ -538,7 +555,7 @@ impl S3GlobMatcher {
         };
         let total_prefixes = presult.prefixes.len();
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
-        let re = regex::Regex::new(&self.full_regex()).expect("can only generate valid regexes");
+        let re = self.regex.clone();
         debug!(regex = %re.as_str(), "full regex");
         if self.is_complete() {
             let permit = Arc::new(Semaphore::new(self.max_parallelism));

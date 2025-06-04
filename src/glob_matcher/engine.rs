@@ -188,6 +188,13 @@ impl ScanResult {
     pub fn len(&self) -> usize {
         self.prefixes.len() + self.objects.len()
     }
+
+    pub fn for_prefix(prefix: String) -> Self {
+        Self {
+            prefixes: vec![prefix],
+            objects: vec![],
+        }
+    }
 }
 
 #[async_trait::async_trait]
