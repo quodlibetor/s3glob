@@ -10,6 +10,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use futures::{FutureExt, future::BoxFuture};
 use predicates::prelude::*;
 use predicates::str::contains;
+use regex::RegexBuilder;
 use rstest::rstest;
 use testcontainers::core::logs::LogFrame;
 use testcontainers::core::logs::consumer::LogConsumer;
@@ -253,6 +254,50 @@ async fn test_patterns_in_file_not_path_component(
                 tempdir.child(object).assert(predicate::path::missing());
             }
         }
+    }
+
+    Ok(())
+}
+
+#[rstest]
+#[case("prefix/", &["prefix/2024-01-01/$", "prefix/2024-01-02/$", "prefix/2024-01-03/$"])]
+#[case("prefix/*", &["prefix/2024-01-01/$", "prefix/2024-01-02/$", "prefix/2024-01-03/$"])]
+#[case("prefix/2024*/", &["prefix/2024-01-01/1.txt$", "prefix/2024-01-02/2.txt$", "prefix/2024-01-03/3.txt$"])]
+#[case("prefix/2024*/*", &["prefix/2024-01-01/1.txt$", "prefix/2024-01-02/2.txt$", "prefix/2024-01-03/3.txt$"])]
+#[trace]
+#[tokio::test]
+async fn test_glob_prefixes(#[case] glob: &str, #[case] expected: &[&str]) -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let test_objects = &[
+        "prefix/2024-01-01/1.txt",
+        "prefix/2024-01-02/2.txt",
+        "prefix/2024-01-03/3.txt",
+    ];
+    for key in test_objects {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let needle = format!("s3://{}/{}", bucket, glob);
+
+    let mut cmd = run_s3glob(port, &["ls", needle.as_str()])?;
+    let res = cmd.assert().success();
+    let output = std::str::from_utf8(&res.get_output().stdout).unwrap();
+    // let is_expected = RegexSet::new(expected).unwrap();
+    let expected_regexes = expected
+        .iter()
+        .map(|s| RegexBuilder::new(s).multi_line(true).build().unwrap())
+        .collect::<Vec<_>>();
+    for re in expected_regexes {
+        assert!(
+            re.is_match(output),
+            "expected regex {:?} to match output {:?}",
+            re,
+            output
+        );
     }
 
     Ok(())

@@ -134,7 +134,9 @@ impl S3GlobMatcher {
                 regex.push_str(&part.re_string(&self.delimiter.to_string()));
             }
         }
-        regex.push('$');
+        // prefixes end with the delimiter
+        regex.push(self.delimiter);
+        regex.push_str("?$");
         regex
     }
 
