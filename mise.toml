@@ -1,10 +1,13 @@
 [tasks.test]
+env = { CLICOLOR = "1" }
 run = "cargo nextest run --no-fail-fast"
 
 [tasks.test-unit]
+env = { CLICOLOR = "1" }
 run = "cargo nextest run --no-fail-fast -E 'not binary(integration)'"
 
 [tasks.test-int]
+env = { CLICOLOR = "1" }
 run = "cargo nextest run --no-fail-fast -E 'binary(integration)'"
 
 [tools]
