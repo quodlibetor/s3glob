@@ -308,6 +308,52 @@ async fn test_glob_prefixes(#[case] glob: &str, #[case] expected: &[&str]) -> an
 }
 
 #[rstest]
+// TODO: negative case test
+// #[case("SARS-CoV-1/*/*RUN0/*CLONE997", &["Error: Could not continue search in prefixes:$"])]
+#[case("SARS-CoV-1/*/*/*RUN0/*CLONE997", &["SARS-CoV-1/spike/PROJ14583/RUN0/CLONE997/$"])]
+#[trace]
+#[tokio::test]
+async fn test_glob_prefixes_specific(
+    #[case] glob: &str,
+    #[case] expected: &[&str],
+) -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    let test_objects = &[
+        "SARS-CoV-1/spike/PROJ14583/RUN0/CLONE997/results97/frame97.xtc",
+        "SARS-CoV-1/spike/PROJ14216/RUN4/CLONE4/results7/frame7.xtc",
+        "SARS-CoV-1/nsp9/PROJ13850/RUN0/CLONE133/results99/frame99.xtc",
+    ];
+    for key in test_objects {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let needle = format!("s3://{}/{}", bucket, glob);
+
+    let mut cmd = run_s3glob(port, &["ls", needle.as_str()])?;
+    let res = cmd.assert().success();
+    let output = std::str::from_utf8(&res.get_output().stdout).unwrap();
+    // let is_expected = RegexSet::new(expected).unwrap();
+    let expected_regexes = expected
+        .iter()
+        .map(|s| RegexBuilder::new(s).multi_line(true).build().unwrap())
+        .collect::<Vec<_>>();
+    for re in expected_regexes {
+        assert!(
+            re.is_match(output),
+            "expected regex {:?} to match output {:?}",
+            re,
+            output
+        );
+    }
+
+    Ok(())
+}
+
+#[rstest]
 #[case( // 1 Keep different subdirs
     &[
         "prefix/2024-01/file1.txt",

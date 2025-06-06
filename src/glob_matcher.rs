@@ -196,8 +196,8 @@ impl S3GlobMatcher {
             }
             max_prefixes_observed = max_prefixes_observed.max(prefixes.len());
             // only included prefixes in trace logs
-            trace!(?prefixes, "scanning for part");
-            debug!(%regex_so_far, new_part = %part.re_string(&delimiter), prefix_count = prefixes.len(), "scanning for part");
+            trace!(?prefixes, objects = ?objects.iter().map(|o| o.key().unwrap()).collect::<Vec<_>>(), "scanning for part");
+            debug!(%regex_so_far, new_part = %part.re_string(&delimiter), prefix_count = prefixes.len(), object_count = objects.len(), "scanning for part");
             if tracing::enabled!(tracing::Level::DEBUG) {
                 // don't overwrite log messages
                 progressln!("Discovering prefixes: {:>6}", prefixes.len());
@@ -277,7 +277,9 @@ impl S3GlobMatcher {
                             if !objects_updated {
                                 objects_updated = !results.objects.is_empty();
                             }
-                            objects.extend(results.objects);
+                            objects.extend(results.objects.into_iter().filter(|obj| {
+                                obj.key.as_ref().is_some_and(|key| self.regex.is_match(key))
+                            }));
                             new_prefix_count = new_prefixes.len();
                             if new_prefix_count >= MAX_PREFIXES {
                                 debug!(
@@ -436,6 +438,7 @@ impl S3GlobMatcher {
                         };
 
                         if !appends.is_empty() {
+                            debug!("validating appends and filters");
                             if new_prefixes.len() >= MAX_PREFIXES {
                                 // checking prefixes is significantly slower
                                 // than scanning existing prefixes.
@@ -447,17 +450,27 @@ impl S3GlobMatcher {
                             }
                             trace!(new_prefixes = ?new_prefixes, new_prefix_count = new_prefixes.len(), "checking appended prefixes");
                             max_objects_observed = max_objects_observed.max(new_prefixes.len());
-                            prefixes = check_prefixes(
+                            match check_prefixes(
                                 &mut engine,
                                 &prefixes,
                                 new_prefixes,
                                 self.max_parallelism,
                             )
-                            .await?;
+                            .await
+                            {
+                                Ok(new_prefixes) => prefixes = new_prefixes,
+                                Err(e) => {
+                                    if objects.is_empty() {
+                                        debug!("no prefixes matched and no objects exist");
+                                        return Err(e);
+                                    }
+                                }
+                            };
                         } else if !new_prefixes.is_empty() {
                             debug!("no appends, using new prefixes");
                             prefixes = new_prefixes;
                         } else {
+                            debug!("everything was filtered out");
                             let glob_so_far = self
                                 .parts
                                 .iter()
@@ -478,12 +491,15 @@ impl S3GlobMatcher {
                                 String::new()
                             };
 
-                            if !objects_updated {
+                            if !objects_updated || objects.is_empty() {
+                                let debug_prefixes =
+                                    prefixes.iter().take(max_prefixes).join("\n  ");
+                                prefixes.clear();
                                 bail!(
                                     "Could not continue search in prefixes:\n  {}{}\
                                 \n\n\
                                 None of the above matched the pattern:\n  {glob_so_far}",
-                                    prefixes.iter().take(max_prefixes).join("\n  "),
+                                    debug_prefixes,
                                     and_more,
                                 );
                             } else {
@@ -1031,9 +1047,14 @@ mod tests {
             "something/foo/a".to_string(), // Should be filtered out
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
-        assert!(prefixes == vec!["boo/a", "zoo/a"]);
-        // TODO: this could be improved to only call the engine once
+        let objects = scanner
+            .find_prefixes(engine.clone())
+            .await?
+            .objects
+            .into_iter()
+            .map(|o| o.key.unwrap())
+            .collect::<Vec<_>>();
+        assert!(objects == vec!["boo/a", "zoo/a"]);
         Ok(())
     }
 
@@ -1113,9 +1134,14 @@ mod tests {
             "x-baz-a/baz".to_string(), // (middle not foo/bar)
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
-        assert!(prefixes == vec!["x-foo-a/baz", "y-bar-b/baz"]);
-        // TODO: this could be improved to only call the engine once
+        let objects = scanner
+            .find_prefixes(engine.clone())
+            .await?
+            .objects
+            .into_iter()
+            .map(|obj| obj.key.unwrap())
+            .collect::<Vec<_>>();
+        assert!(objects == vec!["x-foo-a/baz", "y-bar-b/baz"]);
         Ok(())
     }
 
@@ -1130,8 +1156,14 @@ mod tests {
             "src/baz/3_zebra".to_string(),
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
-        assert!(prefixes == vec!["src/bar/2_zebra", "src/baz/3_zebra", "src/foo/1_zebra"]);
+        let objects = scanner
+            .find_prefixes(engine.clone())
+            .await?
+            .objects
+            .into_iter()
+            .map(|o| o.key.unwrap())
+            .collect::<Vec<_>>();
+        assert!(objects == vec!["src/bar/2_zebra", "src/baz/3_zebra", "src/foo/1_zebra"]);
         Ok(())
     }
 
@@ -1146,8 +1178,13 @@ mod tests {
             "src/baz/3_zebra".to_string(),
         ]);
 
-        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
-        assert!(prefixes == vec!["src/foo/1_zebra"]);
+        let objects = scanner
+            .find_prefixes(engine.clone())
+            .await?
+            .objects
+            .into_iter()
+            .map(|obj| obj.key.unwrap());
+        assert!(objects.collect::<Vec<_>>() == vec!["src/foo/1_zebra"]);
         assert!(scanner.is_complete());
         Ok(())
     }

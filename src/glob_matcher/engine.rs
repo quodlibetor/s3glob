@@ -88,7 +88,6 @@ impl S3Engine {
         tx: &tokio::sync::mpsc::UnboundedSender<Vec<PrefixResult>>,
         permit: Arc<Semaphore>,
     ) -> Result<()> {
-        let mut filtered_prefixes = 0;
         for prefix in &presult.prefixes {
             // just get the object info for each prefix
             let permit = permit.clone().acquire_owned().await;
@@ -96,13 +95,6 @@ impl S3Engine {
             let bucket = self.bucket.clone();
             let prefix = prefix.clone();
             let tx = tx.clone();
-            // Annoyingly I can't seem to write a test that shows that this is required.
-            // this query gives the wrong result without this check though:
-            // ls --no-sign-request s3://fah-public-data-covid19-cryptic-pockets/SARS-CoV-1/*/*RUN0/*CLONE997
-            if !matcher.is_match(prefix.as_ref()) {
-                filtered_prefixes += 1;
-                continue;
-            }
 
             status.total_objects.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
@@ -116,15 +108,18 @@ impl S3Engine {
                 drop(permit);
 
                 match r {
-                    Ok(o) => tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
-                        prefix, o,
-                    ))]),
+                    Ok(o) => {
+                        trace!(prefix, "prefix is actually an object");
+
+                        tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
+                            prefix, o,
+                        ))])
+                    }
                     Err(_) => tx.send(vec![PrefixResult::Prefix(prefix)]),
                 }
             });
         }
         debug!(
-            filtered_prefixes,
             total_prefixes = presult.prefixes.len(),
             "filtered prefixes from the result set"
         );
@@ -178,10 +173,26 @@ async fn list_matching_objects(
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Default)]
 pub struct ScanResult {
     pub prefixes: Vec<String>,
     pub objects: Vec<Object>,
+}
+
+impl std::fmt::Debug for ScanResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanResult")
+            .field("prefixes", &self.prefixes)
+            .field(
+                "objects",
+                &self
+                    .objects
+                    .iter()
+                    .map(|o| o.key.as_ref().unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl ScanResult {
@@ -323,10 +334,7 @@ impl Engine for MockS3Engine {
 
         info!(prefix, ?found, "MockS3 found prefixes");
 
-        Ok(ScanResult {
-            prefixes: found?,
-            objects: Vec::new(),
-        })
+        Ok(found?)
     }
 
     async fn check_prefixes<P>(
@@ -346,7 +354,9 @@ impl Engine for MockS3Engine {
             // Use ListObjectsV2 with max-keys=1 to efficiently check existence
             let response = self.scan_prefixes_inner(prefix, "/")?;
 
-            if !response.is_empty() {
+            if !response.prefixes.is_empty() {
+                valid_prefixes.insert(prefix.to_string());
+            } else if !response.objects.is_empty() {
                 valid_prefixes.insert(prefix.to_string());
             }
         }
@@ -398,22 +408,26 @@ impl MockS3Engine {
         );
     }
 
-    pub fn scan_prefixes_inner(&mut self, prefix: &str, delimiter: &str) -> Result<Vec<String>> {
-        let result = self
-            .paths
+    pub fn scan_prefixes_inner(&mut self, prefix: &str, delimiter: &str) -> Result<ScanResult> {
+        let mut result = ScanResult::default();
+        self.paths
             .iter()
             .filter(|p| p.starts_with(prefix))
-            .map(|p| {
-                if let Some(end) = p[prefix.len()..].find(delimiter) {
+            .for_each(|p| {
+                let matched_prefix = if let Some(end) = p[prefix.len()..].find(delimiter) {
                     // only return the prefix up to the delimiter
                     p[..prefix.len() + end + 1].to_string()
                 } else {
                     p.to_string()
+                };
+                if matched_prefix.len() == p.len() {
+                    result
+                        .objects
+                        .push(Object::builder().key(matched_prefix).build());
+                } else {
+                    result.prefixes.push(matched_prefix);
                 }
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+            });
 
         Ok(result)
     }
