@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.7](https://github.com/quodlibetor/s3glob/compare/v0.4.6...v0.4.7) - 2025-06-06
+
+### 🐛 Bug Fixes
+
+- Prefixes end with their delimiter by [@quodlibetor](https://github.com/quodlibetor) in [6ca0080](https://github.com/quodlibetor/s3glob/commit/6ca0080a695596ea68700a57f5937dfb32254d33)
+- Include prefixes when an Any terminates a prefix by [@quodlibetor](https://github.com/quodlibetor) in [6df864b](https://github.com/quodlibetor/s3glob/commit/6df864b957c8e447079b4078c31cbdbc6db15ba4)
+- handle objects and prefixes more consistently by [@quodlibetor](https://github.com/quodlibetor) in [f153df6](https://github.com/quodlibetor/s3glob/commit/f153df6bbcafc463c6a234047269b118c4ae8d7e)
+
+### ⚙️ Miscellaneous Tasks
+
+- Add cli color to tests run under mise by [@quodlibetor](https://github.com/quodlibetor) in [33eba8c](https://github.com/quodlibetor/s3glob/commit/33eba8cdfe5fd6a461645f52368b2b223fc0db35)
+
 ## [0.4.6](https://github.com/quodlibetor/s3glob/compare/v0.4.5...v0.4.6) - 2025-05-11
 
 ### 🐛 Bug Fixes
