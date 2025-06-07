@@ -16,10 +16,7 @@ use testcontainers::core::logs::LogFrame;
 use testcontainers::core::logs::consumer::LogConsumer;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
-
-mod minio_testcontainer;
-
-use minio_testcontainer::MinIO;
+use testcontainers_modules::minio::MinIO;
 
 #[rstest]
 #[case("prefix/2024-*/file*.txt", &[
