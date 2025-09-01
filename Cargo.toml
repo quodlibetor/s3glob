@@ -30,7 +30,7 @@ humansize = { version = "2.0.0", features = ["no_alloc"] }
 itertools = "0.14.0"
 num-format = "0.4"
 regex = "1.10"
-tokio = { version = "1.45", features = ["full"] }
+tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
