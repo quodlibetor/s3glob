@@ -569,7 +569,7 @@ impl S3Object {
 /// Create a new S3 client with region auto-detection
 async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     let region = RegionProviderChain::first_try(Region::new(opts.region.clone()));
-    let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
+    let mut config = aws_config::defaults(BehaviorVersion::v2025_08_07()).region(region);
     if opts.no_sign_request {
         config = config.no_credentials();
     }
@@ -589,7 +589,7 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
 
     let region = Region::new(bucket_region);
 
-    let mut config = aws_config::defaults(BehaviorVersion::v2024_03_28()).region(region);
+    let mut config = aws_config::defaults(BehaviorVersion::v2025_08_07()).region(region);
     if opts.no_sign_request {
         config = config.no_credentials();
     }

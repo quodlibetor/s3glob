@@ -526,7 +526,7 @@ async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
     let port = node.get_host_port_ipv4(9000).await.expect("can get port");
 
     let config = aws_sdk_s3::Config::builder()
-        .behavior_version(BehaviorVersion::v2024_03_28())
+        .behavior_version(BehaviorVersion::v2025_08_07())
         .region(Region::new("us-east-1"))
         .endpoint_url(format!("http://127.0.0.1:{}", port))
         .credentials_provider(Credentials::new(
