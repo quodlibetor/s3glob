@@ -156,10 +156,10 @@ async fn list_matching_objects(
             let mut matching_objects = Vec::new();
             total_objects.fetch_add(contents.len(), Ordering::Relaxed);
             for obj in contents {
-                if let Some(key) = &obj.key {
-                    if matcher.is_match(key) {
-                        matching_objects.push(obj);
-                    }
+                if let Some(key) = &obj.key
+                    && matcher.is_match(key)
+                {
+                    matching_objects.push(obj);
                 }
             }
             tx.send(
