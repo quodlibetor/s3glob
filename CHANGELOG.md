@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.8](https://github.com/quodlibetor/s3glob/compare/v0.4.7...v0.4.8) - 2025-09-07
+
+### 🐛 Bug Fixes
+
+- Handle invalid RUST_LOG directives without panicking by [@quodlibetor](https://github.com/quodlibetor) in [#59](https://github.com/quodlibetor/s3glob/pull/59)
+
+### ⚙️ Miscellaneous Tasks
+
+- **(clippy)** Fix clippy::collapsible_if by [@quodlibetor](https://github.com/quodlibetor) in [#57](https://github.com/quodlibetor/s3glob/pull/57)
+
 ## [0.4.7](https://github.com/quodlibetor/s3glob/compare/v0.4.6...v0.4.7) - 2025-06-06
 
 ### 🐛 Bug Fixes
