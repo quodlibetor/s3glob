@@ -270,7 +270,7 @@ fn main() {
     }
     debug!(?opts, "parsed options");
 
-    let rt = Runtime::new().unwrap();
+    let rt = Runtime::new().expect("tokio runtime should create successfully");
     rt.block_on(async {
         if let Err(err) = run(opts).await {
             // TODO: Separate user error from internal error?
@@ -305,7 +305,7 @@ async fn run(opts: Opts) -> Result<()> {
             return Ok(());
         }
     };
-    let s3re = Regex::new(r"^(?:s3://)?([^/]+)/(.*)").unwrap();
+    let s3re = Regex::new(r"^(?:s3://)?([^/]+)/(.*)").expect("Static regex is valid");
     let matches = s3re.captures(pat);
     let (bucket, raw_pattern) = if let Some(m) = matches {
         (
@@ -547,7 +547,7 @@ struct S3Object {
 impl From<Object> for S3Object {
     fn from(obj: Object) -> Self {
         Self {
-            key: obj.key.unwrap(),
+            key: obj.key.expect("Object key is always present"),
             size: obj.size.unwrap_or(0),
             last_modified: obj
                 .last_modified
@@ -560,7 +560,7 @@ impl S3Object {
     fn from_head_object(key: String, obj: HeadObjectOutput) -> Self {
         Self {
             key,
-            size: obj.content_length().unwrap(),
+            size: obj.content_length().expect("Content length is present"),
             last_modified: obj.last_modified.unwrap(),
         }
     }
@@ -694,13 +694,14 @@ fn log_directive(loglevel: u8, quiet: u8) -> Option<&'static str> {
 
 pub(crate) fn setup_logging(directive: Option<&str>) {
     let mut env_filter = tracing_subscriber::EnvFilter::new("s3glob=warn");
-    if let Ok(env) = std::env::var("S3GLOB_LOG") {
-        env_filter = env_filter.add_directive(env.parse().unwrap());
-    } else if let Ok(env) = std::env::var("RUST_LOG") {
-        env_filter = env_filter.add_directive(env.parse().unwrap());
-    }
-    if let Some(directive) = directive {
-        env_filter = env_filter.add_directive(directive.parse().unwrap());
+    let env_var = std::env::var("S3GLOB_LOG")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .ok();
+    if let Some(directive) = directive.or(env_var.as_deref()) {
+        match directive.parse() {
+            Ok(d) => env_filter = env_filter.add_directive(d),
+            Err(e) => eprintln!("ERROR: failed to parse logging directive '{directive}': {e}"),
+        }
     }
 
     let use_ansi = std::io::stderr().is_terminal()
