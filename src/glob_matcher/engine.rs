@@ -351,12 +351,9 @@ impl Engine for MockS3Engine {
         let mut valid_prefixes = BTreeSet::new();
 
         for prefix in &prefixes {
-            // Use ListObjectsV2 with max-keys=1 to efficiently check existence
             let response = self.scan_prefixes_inner(prefix, "/")?;
 
-            if !response.prefixes.is_empty() {
-                valid_prefixes.insert(prefix.to_string());
-            } else if !response.objects.is_empty() {
+            if !response.prefixes.is_empty() || !response.objects.is_empty() {
                 valid_prefixes.insert(prefix.to_string());
             }
         }
