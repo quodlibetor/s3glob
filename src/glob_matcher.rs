@@ -654,10 +654,16 @@ pub(crate) enum PrefixResult {
 }
 
 impl PrefixResult {
-    pub(crate) fn key(&self) -> &str {
+    pub(crate) fn kind(&self) -> String {
         match self {
-            Self::Object(obj) => &obj.key,
-            Self::Prefix(prefix) => prefix,
+            Self::Object(_) => "OBJ".to_owned(),
+            Self::Prefix(_) => "PRE".to_owned(),
+        }
+    }
+    pub(crate) fn key(&self) -> String {
+        match self {
+            Self::Object(obj) => obj.key.clone(),
+            Self::Prefix(prefix) => prefix.clone(),
         }
     }
 }

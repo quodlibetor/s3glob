@@ -44,7 +44,10 @@ enum Command {
         ///
         /// The format string can use the following variables:
         ///
+        /// - `{kind}`: the kind of the result.
+        ///   Either "OBJ" (if it is an object) or "PRE" (if it is a prefix)
         /// - `{key}`: the key of the object
+        /// - `{bucket}`: the bucket name
         /// - `{uri}`: the s3 uri of the object, e.g. s3://my-bucket/my-object.txt
         /// - `{size_bytes}`: the size of the object in bytes, with no suffix
         /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
@@ -522,17 +525,12 @@ fn print_prefix_result(
     decimal: FormatSizeOptions,
     result: PrefixResult,
 ) {
-    match result {
-        PrefixResult::Object(obj) => {
-            if let Some(user_fmt) = user_format {
-                print_user(bucket, &obj, user_fmt);
-            } else {
-                print_default(&obj, decimal);
-            }
-        }
-        PrefixResult::Prefix(prefix) => {
-            // TODO: support user-customizable prefix formatting too?
-            println!("PRE     {prefix}");
+    if let Some(user_fmt) = user_format {
+        print_user(bucket, &result, user_fmt);
+    } else {
+        match result {
+            PrefixResult::Object(obj) => print_default(&obj, decimal),
+            PrefixResult::Prefix(prefix) => println!("PRE     {prefix}"),
         }
     }
 }
@@ -607,7 +605,7 @@ fn decimal_format() -> FormatSizeOptions {
 #[derive(Debug)]
 enum FormatToken {
     Literal(String),
-    Variable(fn(&str, &S3Object) -> String),
+    Variable(fn(&str, &PrefixResult) -> String),
 }
 
 fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
@@ -628,18 +626,32 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
                 var.push(c);
             }
             match var.as_str() {
-                "key" => tokens.push(FormatToken::Variable(|_, obj| obj.key.clone())),
+                "kind" => tokens.push(FormatToken::Variable(|_, obj| obj.kind())),
+                "bucket" => tokens.push(FormatToken::Variable(|bucket, _| bucket.to_owned())),
+                "key" => tokens.push(FormatToken::Variable(|_, obj| obj.key())),
                 "uri" => tokens.push(FormatToken::Variable(|bucket, obj| {
-                    format!("s3://{}/{}", bucket, obj.key)
+                    format!("s3://{}/{}", bucket, obj.key())
                 })),
-                "size_bytes" => tokens.push(FormatToken::Variable(|_, obj| obj.size.to_string())),
-                "size_human" => tokens.push(FormatToken::Variable(|_, obj| {
-                    SizeFormatter::new(obj.size as u64, decimal_format()).to_string()
+                "size_bytes" => tokens.push(FormatToken::Variable(|_, obj| match obj {
+                    PrefixResult::Object(obj) => obj.size.to_string(),
+                    PrefixResult::Prefix(_) => "-1".to_owned(),
                 })),
-                "last_modified" => tokens.push(FormatToken::Variable(|_, obj| {
-                    obj.last_modified.to_string()
+                "size_human" => tokens.push(FormatToken::Variable(|_, obj| match obj {
+                    PrefixResult::Object(obj) => {
+                        SizeFormatter::new(obj.size as u64, decimal_format()).to_string()
+                    }
+                    PrefixResult::Prefix(_) => "-1".to_owned(),
                 })),
-                _ => return Err(anyhow::anyhow!("unknown variable: {}", var)),
+                "last_modified" => tokens.push(FormatToken::Variable(|_, obj| match obj {
+                    PrefixResult::Object(obj) => obj.last_modified.to_string(),
+                    PrefixResult::Prefix(_) => "-1".to_owned(),
+                })),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "unknown variable (see --help for options): {}",
+                        var
+                    ));
+                }
             }
         } else {
             current_literal.push(char);
@@ -660,11 +672,11 @@ fn print_default(obj: &S3Object, format: FormatSizeOptions) {
     );
 }
 
-fn print_user(bucket: &str, obj: &S3Object, tokens: &[FormatToken]) {
+fn print_user(bucket: &str, obj: &PrefixResult, tokens: &[FormatToken]) {
     println!("{}", format_user(bucket, obj, tokens));
 }
 
-fn format_user(bucket: &str, obj: &S3Object, tokens: &[FormatToken]) -> String {
+fn format_user(bucket: &str, obj: &PrefixResult, tokens: &[FormatToken]) -> String {
     let mut result = String::new();
     for token in tokens {
         match token {
@@ -730,13 +742,25 @@ mod tests {
     #[case("Size: {size_bytes}, Name: {key}", "Size: 1234, Name: test/file.txt")]
     #[case("s: {size_human}\t{key}", "s: 1.2kB\ttest/file.txt")]
     #[case("uri: {uri}", "uri: s3://bkt/test/file.txt")]
+    #[case("{kind} {key}", "OBJ test/file.txt")]
     #[trace]
     fn test_compile_format(#[case] format: &str, #[case] expected: &str) {
         let fmt = compile_format(format).unwrap();
 
         let object = Object::builder().key("test/file.txt").size(1234).build();
 
-        let result = format_user("bkt", &S3Object::from(object), &fmt);
+        let result = format_user("bkt", &PrefixResult::Object(S3Object::from(object)), &fmt);
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
+    #[case("{kind} {bucket}/{key}", "PRE bkt/test/")]
+    #[case("{kind} {uri}", "PRE s3://bkt/test/")]
+    #[trace]
+    fn test_compile_prefix_format(#[case] format: &str, #[case] expected: &str) {
+        let fmt = compile_format(format).unwrap();
+        let prefix = "test/";
+        let result = format_user("bkt", &PrefixResult::Prefix(prefix.to_owned()), &fmt);
         assert_eq!(result, expected);
     }
 
