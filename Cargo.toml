@@ -1,6 +1,6 @@
 [package]
 name = "s3glob"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2024"
 authors = ["Brandon W Maister <quodlibetor@gmail.com>"]
 license = "MIT, APACHE-2.0"
@@ -23,12 +23,12 @@ eula = false
 anyhow = "1.0"
 async-trait = "0.1.88"
 aws-config = { version = "1.0", default-features = false, features = [
-    "default-https-client",
-    "rt-tokio",
+  "default-https-client",
+  "rt-tokio",
 ] }
 aws-sdk-s3 = { version = "1.0", default-features = false, features = [
-    "default-https-client",
-    "rt-tokio",
+  "default-https-client",
+  "rt-tokio",
 ] }
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
 futures = "0.3"

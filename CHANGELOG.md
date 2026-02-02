@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.9](https://github.com/quodlibetor/s3glob/compare/v0.4.8...v0.4.9) - 2026-02-02
+
+### 🚀 Features
+
+- Handle --format for prefixes, add a new {kind} format by [@quodlibetor](https://github.com/quodlibetor) in [#68](https://github.com/quodlibetor/s3glob/pull/68)
+
+### ⚙️ Miscellaneous Tasks
+
+- Use BehaviorVersion::latest for aws client by [@quodlibetor](https://github.com/quodlibetor) in [#77](https://github.com/quodlibetor/s3glob/pull/77)
+
 ## [0.4.8](https://github.com/quodlibetor/s3glob/compare/v0.4.7...v0.4.8) - 2025-09-07
 
 ### 🐛 Bug Fixes
