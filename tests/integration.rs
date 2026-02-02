@@ -526,7 +526,7 @@ async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
     let port = node.get_host_port_ipv4(9000).await.expect("can get port");
 
     let config = aws_sdk_s3::Config::builder()
-        .behavior_version(BehaviorVersion::v2025_08_07())
+        .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .endpoint_url(format!("http://127.0.0.1:{}", port))
         .credentials_provider(Credentials::new(
@@ -567,7 +567,7 @@ async fn create_object_with_size(
 }
 
 fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
-    let mut command = Command::cargo_bin("s3glob")?;
+    let mut command = assert_cmd::cargo::cargo_bin_cmd!("s3glob");
     let log_directive = env::var("S3GLOB_LOG").unwrap_or_else(|_| "s3glob=trace".to_string());
     command
         .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
