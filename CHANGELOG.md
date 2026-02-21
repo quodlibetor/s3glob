@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.4.10](https://github.com/quodlibetor/s3glob/compare/v0.4.9...v0.4.10) - 2026-02-21
+
+### 🐛 Bug Fixes
+
+- Re-enable AWS SSO after the recent upgrade by [@quodlibetor](https://github.com/quodlibetor) in [#80](https://github.com/quodlibetor/s3glob/pull/80)
+
+### ⚙️ Miscellaneous Tasks
+
+- upgrade cargo dist to back to axodotdev by [@quodlibetor](https://github.com/quodlibetor) in [#81](https://github.com/quodlibetor/s3glob/pull/81)
+
 ## [0.4.9](https://github.com/quodlibetor/s3glob/compare/v0.4.8...v0.4.9) - 2026-02-02
 
 ### 🚀 Features

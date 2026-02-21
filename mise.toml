@@ -13,5 +13,5 @@ run = "cargo nextest run --no-fail-fast -E 'binary(integration)'"
 [tools]
 "cargo:cargo-nextest" = "latest"
 "cargo:cargo-release" = "latest"
-"ubi:astral-sh/cargo-dist" = { version = "0.28.3", exe = "dist" }
+"github:axodotdev/cargo-dist" = { version = "0.30.4", exe = "dist" }
 git-cliff = "latest"
