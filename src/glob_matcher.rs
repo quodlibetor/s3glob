@@ -700,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_literal() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/foo/bar".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec!["src/foo/bar".to_string()]);
@@ -714,7 +714,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_alternation_no_any() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/{foo,bar}/baz".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -732,7 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_alternation_with_any() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/{foo,bar}*/baz".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         println!("scanner_parts for {}:\n{:?}", scanner.raw, scanner.parts);
@@ -751,7 +751,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_star() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/*/main.rs".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -769,7 +769,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_recursive() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/**/test.rs".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -789,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_character_class() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/[abc]*/zebra.rs".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["src/a", "src/b", "src/c"]));
@@ -843,7 +843,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_alternation_any_literal() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("literal/{foo,bar}*quux/baz".to_string(), "/")?;
         scanner.set_min_prefixes(0);
 
@@ -892,7 +892,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_literal_any_alternation() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("literal/quux*{foo,bar}/baz".to_string(), "/")?;
         scanner.set_min_prefixes(0);
 
@@ -943,7 +943,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_any_and_character_class() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("literal/baz*[ab]/1.rs".to_string(), "/")?;
         scanner.set_min_prefixes(0);
 
@@ -965,7 +965,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_empty_alternative() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/{,tmp}/file".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -983,7 +983,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_empty_alternative_with_delimiter() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/{,tmp/}file".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -1025,7 +1025,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_negative_class_start() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("[!a]*/foo".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -1043,7 +1043,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_negative_class_after_wildcard() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("*[!f]oo/*".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -1066,7 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_negative_class_between_alternations() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("{foo,bar}[!z]*/baz".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -1085,7 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_multiple_negative_classes() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("[!a]*[!b]/foo".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_negative_class_with_delimiter() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("foo/[!/]/bar".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         assert_scanner_part!(&scanner.parts[0], OneChoice("foo/"));
@@ -1128,7 +1128,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_complex_negative_pattern() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("*{foo,bar}*[!Z]/baz".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_file_any_then_constant() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/*/*zebra".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![
@@ -1175,7 +1175,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_prefixes_sep_const_file_any_constant() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let mut scanner = S3GlobMatcher::parse("src/*/1*zebra".to_string(), "/")?;
         scanner.set_min_prefixes(0);
         let engine = MockS3Engine::new(vec![

@@ -46,6 +46,46 @@ jobs:
         run: cargo nextest run --verbose --no-run
 
       - name: Run integration tests
+        env:
+          S3GLOB_LOG: trace
+          S3GLOB_LOG_DIR: ${{ github.workspace }}/integration-logs
+          S3GLOB_TRACE_CHROME_DIR: ${{ github.workspace }}/trace-chrome
+        run: cargo nextest run --no-fail-fast -E 'binary(integration)'
+
+      - name: Upload integration logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs
+          path: integration-logs/
+          if-no-files-found: ignore
+
+      - name: Upload Chrome trace artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-trace-chrome
+          path: trace-chrome/
+          if-no-files-found: ignore
+
+  test-integration-no-artifacts:
+    name: Integration Test (no log/trace output)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Compile tests
+        run: cargo nextest run --verbose --no-run
+
+      - name: Run integration tests
         run: cargo nextest run --no-fail-fast -E 'binary(integration)'
 
   test-unit:

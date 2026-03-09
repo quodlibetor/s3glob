@@ -1,10 +1,11 @@
 use std::io::IsTerminal as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use aws_config::meta::region::RegionProviderChain;
+use aws_config::timeout::TimeoutConfig;
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::primitives::DateTime;
 use aws_sdk_s3::types::Object;
@@ -261,11 +262,28 @@ struct Opts {
     /// concurrent requests.
     #[clap(short = 'M', long, global = true, default_value = "10000")]
     max_parallelism: usize,
+
+    /// Timeout in seconds for each AWS SDK operation (including retries)
+    ///
+    /// If set, S3 API calls will fail with a timeout error after this many
+    /// seconds instead of hanging. Useful for debugging or limiting run time.
+    #[clap(long, global = true, value_name = "SECS")]
+    timeout_secs: Option<u64>,
+
+    /// Write a Chrome trace file for debugging
+    ///
+    /// Writes tracing spans and events to a JSON file that can be opened in
+    /// chrome://tracing or ui.perfetto.dev to inspect where time is spent.
+    #[clap(long, global = true, value_name = "PATH")]
+    trace_chrome: Option<PathBuf>,
 }
 
 fn main() {
     let opts = Opts::parse();
-    setup_logging(log_directive(opts.verbose, opts.quiet));
+    let _trace_guard = setup_logging(
+        log_directive(opts.verbose, opts.quiet),
+        opts.trace_chrome.as_deref(),
+    );
     if opts.quiet == 1 {
         MESSAGE_LEVEL.get_or_init(|| MessageLevel::Quiet);
     } else if opts.quiet >= 2 {
@@ -566,10 +584,19 @@ impl S3Object {
 
 /// Create a new S3 client with region auto-detection
 async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
+    let timeout_config = opts.timeout_secs.map(|secs| {
+        TimeoutConfig::builder()
+            .operation_timeout(Duration::from_secs(secs))
+            .build()
+    });
+
     let region = RegionProviderChain::first_try(Region::new(opts.region.clone()));
     let mut config = aws_config::defaults(BehaviorVersion::latest()).region(region);
     if opts.no_sign_request {
         config = config.no_credentials();
+    }
+    if let Some(ref tc) = timeout_config {
+        config = config.timeout_config(tc.clone());
     }
     let config = config.load().await;
     let client = Client::new(&config);
@@ -590,6 +617,9 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     let mut config = aws_config::defaults(BehaviorVersion::latest()).region(region);
     if opts.no_sign_request {
         config = config.no_credentials();
+    }
+    if let Some(ref tc) = timeout_config {
+        config = config.timeout_config(tc.clone());
     }
     let config = config.load().await;
     let client = Client::new(&config);
@@ -704,7 +734,12 @@ fn log_directive(loglevel: u8, quiet: u8) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn setup_logging(directive: Option<&str>) {
+/// Set up tracing/logging. If trace_chrome is Some(path), writes a Chrome trace
+/// JSON to that path and returns a guard that must be kept alive until exit.
+pub(crate) fn setup_logging(
+    directive: Option<&str>,
+    trace_chrome: Option<&Path>,
+) -> Option<tracing_chrome::FlushGuard> {
     let mut env_filter = tracing_subscriber::EnvFilter::new("s3glob=warn");
     let env_var = std::env::var("S3GLOB_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
@@ -720,14 +755,33 @@ pub(crate) fn setup_logging(directive: Option<&str>) {
         || std::env::var("CLICOLOR").is_ok_and(|v| ["1", "true"].contains(&v.as_str()))
         || std::env::var("CLICOLOR_FORCE").is_ok_and(|v| ["1", "true"].contains(&v.as_str()));
 
-    tracing_subscriber::fmt()
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_file(true)
         .with_line_number(true)
         .with_ansi(use_ansi)
-        .with_env_filter(env_filter)
-        .with_writer(std::io::stderr)
-        .init();
+        .with_writer(std::io::stderr);
+
+    if let Some(path) = trace_chrome {
+        use tracing_subscriber::prelude::*;
+        let (chrome_layer, guard) = tracing_chrome::ChromeLayerBuilder::new().file(path).build();
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(chrome_layer)
+            .init();
+        Some(guard)
+    } else {
+        tracing_subscriber::fmt()
+            .with_target(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_ansi(use_ansi)
+            .with_env_filter(env_filter)
+            .with_writer(std::io::stderr)
+            .init();
+        None
+    }
 }
 
 #[cfg(test)]

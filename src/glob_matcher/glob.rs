@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_parse_negated_character_class() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let scanner = S3GlobMatcher::parse("test[!a]file".to_string(), "/")?;
 
         assert_scanner_part!(&scanner.parts[1], Any("[!a]"), &["/", "B"], !&["a"]);
@@ -382,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_parse_literal_after_any_with_delimiter() -> Result<()> {
-        setup_logging(Some("s3glob=trace"));
+        setup_logging(Some("s3glob=trace"), None);
         let scanner = S3GlobMatcher::parse("literal/*foo/baz".to_string(), "/")?;
         check!(scanner.parts.len() == 3);
 

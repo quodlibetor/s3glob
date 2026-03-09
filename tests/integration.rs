@@ -1,5 +1,7 @@
 use std::borrow::Cow;
 use std::env;
+use std::io::Write;
+use std::path::PathBuf;
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
@@ -566,6 +568,31 @@ async fn create_object_with_size(
     Ok(())
 }
 
+/// Sanitized current test name for use in file paths.
+fn test_name_for_path() -> String {
+    std::thread::current()
+        .name()
+        .unwrap_or("unknown")
+        .replace("::", "_")
+        .replace(['/', '\\', ' '], "_")
+}
+
+/// Build a trace file path for the current test when S3GLOB_TRACE_CHROME_DIR is set.
+fn trace_file_path_for_test() -> Option<PathBuf> {
+    let dir = env::var("S3GLOB_TRACE_CHROME_DIR").ok()?;
+    let path = PathBuf::from(dir.clone()).join(format!("{}.json", test_name_for_path()));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(path)
+}
+
+/// Build a log file path for the current test when S3GLOB_LOG_DIR is set.
+fn log_file_path_for_test() -> Option<PathBuf> {
+    let dir = env::var("S3GLOB_LOG_DIR").ok()?;
+    let path = PathBuf::from(dir.clone()).join(format!("{}.log", test_name_for_path()));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(path)
+}
+
 fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
     let mut command = assert_cmd::cargo::cargo_bin_cmd!("s3glob");
     let log_directive = env::var("S3GLOB_LOG").unwrap_or_else(|_| "s3glob=trace".to_string());
@@ -573,8 +600,17 @@ fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
         .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
         .env("AWS_ACCESS_KEY_ID", "minioadmin")
         .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
-        .env("S3GLOB_LOG", log_directive)
-        .args(args);
+        .env("S3GLOB_LOG", log_directive);
+
+    let args: Vec<String> = if let Some(trace_path) = trace_file_path_for_test() {
+        let path_str = trace_path.to_string_lossy().into_owned();
+        let mut a = vec!["--trace-chrome".to_string(), path_str];
+        a.extend(args.iter().map(|s| s.to_string()));
+        a
+    } else {
+        args.iter().map(|s| s.to_string()).collect()
+    };
+    command.args(&args);
 
     print_s3glob_output(&mut command);
     Ok(command)
@@ -582,10 +618,22 @@ fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
 
 fn print_s3glob_output(cmd: &mut Command) {
     let output = cmd.output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    if let Some(log_path) = log_file_path_for_test() {
+        let content = format!(
+            "==== s3glob stdout ====\n{}\n==== s3glob stderr ====\n{}\n==== end s3glob output ====\n",
+            stdout, stderr
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .and_then(|mut f| f.write_all(content.as_bytes()));
+    }
     println!(
         "==== s3glob stdout ====\n{}\n==== s3glob stderr ====\n{}\n==== end s3glob output ====\n",
-        String::from_utf8(output.stdout).unwrap(),
-        String::from_utf8(output.stderr).unwrap()
+        stdout, stderr
     );
 }
 

@@ -111,6 +111,37 @@ Some example approximate numbers:
 | `s3glob ls 2000_01_01/[!xyz]/*/OBJECT_ID.txt` | 23,026 | (list all of a-z) = 26 => (filter out x,y,z) => 23 * 1,000 = 23,000 |
 | `s3glob ls 2000_01_*/*/*/OBJECT_ID.txt` | 806,000 | 01-31 * a-z * 0-999 = 31 * 26 * 1000 |
 
+## Debugging with Chrome traces
+
+s3glob can write [Chrome trace](https://www.chromium.org/developers/how-tos/trace-event-profiling-tool/) JSON files so you can see where time is spent (e.g. when debugging timeouts).
+
+### Generating traces
+
+**When running s3glob yourself** — pass a file path to write one trace for the whole run:
+
+```bash
+s3glob ls --trace-chrome ./trace.json "s3://my-bucket/prefix/*"
+```
+
+**When running integration tests** — set a directory; each test writes its own trace file (and optionally its own log file):
+
+```bash
+mkdir -p ./trace-chrome ./integration-logs
+S3GLOB_TRACE_CHROME_DIR=./trace-chrome S3GLOB_LOG_DIR=./integration-logs cargo nextest run --no-fail-fast -E 'binary(integration)'
+```
+
+- `S3GLOB_TRACE_CHROME_DIR` — each test writes a Chrome trace `.json` into this directory.
+- `S3GLOB_LOG_DIR` — each test appends s3glob stdout/stderr to a `.log` file named after the test in this directory.
+
+In CI (e.g. GitHub Actions), when these are set, trace files and log files are uploaded as the `integration-trace-chrome` and `integration-logs` artifacts after the run.
+
+### Viewing traces
+
+- **Chrome:** Open `chrome://tracing` in Chrome, click “Load”, and select the `.json` file.
+- **Firefox or any browser:** Open [Perfetto UI](https://ui.perfetto.dev), click “Open trace file”, and select the `.json` file. Perfetto supports the same trace format and works in Firefox, Chrome, and other modern browsers.
+
+Use the timeline to see which spans (e.g. S3 calls, glob matching) took the most time.
+
 ## Copying
 
 All code is available under the MIT or Apache 2.0 license, at your option.
