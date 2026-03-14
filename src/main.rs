@@ -710,9 +710,11 @@ pub(crate) fn setup_logging(directive: Option<&str>) {
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok();
     if let Some(directive) = directive.or(env_var.as_deref()) {
-        match directive.parse() {
-            Ok(d) => env_filter = env_filter.add_directive(d),
-            Err(e) => eprintln!("ERROR: failed to parse logging directive '{directive}': {e}"),
+        for d in directive.split(',') {
+            match d.parse() {
+                Ok(d) => env_filter = env_filter.add_directive(d),
+                Err(e) => eprintln!("ERROR: failed to parse logging directive '{d}': {e:#}"),
+            }
         }
     }
 
