@@ -21,7 +21,29 @@ use super::{LiveStatus, PrefixResult, PrefixSearchResult};
 
 #[async_trait::async_trait]
 pub trait Engine: Send + Sync + 'static {
-    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<ScanResult>;
+    /// List the immediate children of `prefix` using `delimiter`.
+    ///
+    /// If `max_prefixes` is `Some(n)`, pagination may stop early —
+    /// either once at least `n` common prefixes have accumulated, or
+    /// once the implementation concludes the parent is flat-dense and
+    /// further pagination is unlikely to yield prefixes. Both
+    /// early-exit paths set `ScanResult::truncated`; callers should
+    /// treat a truncated result as "fall back to listing this prefix"
+    /// rather than relying on a partial expansion.
+    async fn scan_prefixes(
+        &mut self,
+        prefix: &str,
+        delimiter: &str,
+        max_prefixes: Option<usize>,
+    ) -> Result<ScanResult>;
+
+    /// Single-page delimiter-less list of `prefix`, capped at `max_keys`.
+    ///
+    /// Returns up to `max_keys` objects under `prefix`. `truncated` is true
+    /// if S3 indicates more results exist. When `truncated` is false the
+    /// returned objects are the complete content under `prefix`.
+    async fn probe_prefix(&mut self, prefix: &str, max_keys: i32) -> Result<ScanResult>;
+
     async fn check_prefixes<P>(
         &mut self,
         prefixes: P,
@@ -116,6 +138,10 @@ async fn list_matching_objects(
 pub struct ScanResult {
     pub prefixes: Vec<String>,
     pub objects: Vec<Object>,
+    /// True if pagination was halted before the underlying listing was
+    /// exhausted. The caller should not assume `prefixes`/`objects` is
+    /// the complete content under the scanned prefix.
+    pub truncated: bool,
 }
 
 impl std::fmt::Debug for ScanResult {
@@ -130,6 +156,7 @@ impl std::fmt::Debug for ScanResult {
                     .map(|o| o.key.as_ref().unwrap())
                     .collect::<Vec<_>>(),
             )
+            .field("truncated", &self.truncated)
             .finish()
     }
 }
@@ -143,18 +170,21 @@ impl ScanResult {
         Self {
             prefixes: vec![prefix],
             objects: vec![],
+            truncated: false,
         }
     }
 }
 
 #[async_trait::async_trait]
 impl Engine for S3Engine {
-    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<ScanResult> {
-        trace!(prefix, "scanning for prefixes within");
-        let mut result = ScanResult {
-            prefixes: Vec::new(),
-            objects: Vec::new(),
-        };
+    async fn scan_prefixes(
+        &mut self,
+        prefix: &str,
+        delimiter: &str,
+        max_prefixes: Option<usize>,
+    ) -> Result<ScanResult> {
+        trace!(prefix, ?max_prefixes, "scanning for prefixes within");
+        let mut result = ScanResult::default();
         let mut paginator = self
             .client
             .list_objects_v2()
@@ -166,8 +196,11 @@ impl Engine for S3Engine {
 
         let mut warning_count = 0;
         let mut warning_inc = 50_000;
+        let mut pages_seen = 0usize;
         while let Some(page) = paginator.next().await {
             let page = page?;
+            pages_seen += 1;
+            let page_is_truncated = page.is_truncated.unwrap_or(false);
             if result.len() >= warning_count + warning_inc {
                 if warning_count == 0 {
                     progressln!(); // create a new line after the "discovering.." message
@@ -190,8 +223,44 @@ impl Engine for S3Engine {
             if let Some(contents) = page.contents {
                 result.objects.extend(contents);
             }
+            if let Some(max) = max_prefixes {
+                if result.prefixes.len() >= max {
+                    result.prefixes.truncate(max);
+                    result.truncated = true;
+                    break;
+                }
+                // Bail out of flat-dense parents: if we've paged through
+                // enough entries to plausibly surface `max` prefixes and
+                // none have appeared, further pagination won't help.
+                // Only fire when S3 still has more pages — if `page` was
+                // the last page, this is the complete listing and the
+                // caller can use `result.objects` directly.
+                let plausible_pages = max.div_ceil(1000);
+                if page_is_truncated && result.prefixes.is_empty() && pages_seen >= plausible_pages
+                {
+                    result.truncated = true;
+                    break;
+                }
+            }
         }
         Ok(result)
+    }
+
+    async fn probe_prefix(&mut self, prefix: &str, max_keys: i32) -> Result<ScanResult> {
+        trace!(prefix, max_keys, "probing prefix for direct content");
+        let response = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .max_keys(max_keys)
+            .send()
+            .await?;
+        Ok(ScanResult {
+            prefixes: Vec::new(),
+            objects: response.contents.unwrap_or_default(),
+            truncated: response.is_truncated.unwrap_or(false),
+        })
     }
 
     // TODO: convert this to take &mut prefixes so that we don't have to
@@ -379,21 +448,75 @@ impl Engine for S3Engine {
 pub(super) struct MockS3Engine {
     pub paths: Arc<Vec<String>>,
     pub calls: Arc<Mutex<Vec<(String, String)>>>, // (prefix, delimiter) pairs
+    pub probe_calls: Arc<Mutex<Vec<(String, i32)>>>, // (prefix, max_keys) pairs
+    /// Prefixes for which `scan_prefixes` should simulate the real
+    /// `S3Engine`'s page-budget guard firing — i.e. return
+    /// `truncated=true` with no sub-prefixes, as if the engine had
+    /// paged through enough flat content to give up.
+    pub force_truncate_prefixes: Arc<BTreeSet<String>>,
 }
 
 #[cfg(test)]
 #[async_trait::async_trait]
 impl Engine for MockS3Engine {
-    async fn scan_prefixes(&mut self, prefix: &str, delimiter: &str) -> Result<ScanResult> {
+    async fn scan_prefixes(
+        &mut self,
+        prefix: &str,
+        delimiter: &str,
+        max_prefixes: Option<usize>,
+    ) -> Result<ScanResult> {
         self.calls
             .lock()
             .unwrap()
             .push((prefix.to_string(), delimiter.to_string()));
-        let found = self.scan_prefixes_inner(prefix, delimiter);
+        if self.force_truncate_prefixes.contains(prefix) {
+            // Simulate the real engine's flat-dense page-budget guard:
+            // empty sub-prefix list with `truncated=true`.
+            let result = ScanResult {
+                prefixes: Vec::new(),
+                objects: Vec::new(),
+                truncated: true,
+            };
+            info!(prefix, ?result, "MockS3 forced truncated scan");
+            return Ok(result);
+        }
+        let mut found = self.scan_prefixes_inner(prefix, delimiter)?;
+        if let Some(max) = max_prefixes
+            && found.prefixes.len() > max
+        {
+            found.prefixes.truncate(max);
+            found.truncated = true;
+        }
 
         info!(prefix, ?found, "MockS3 found prefixes");
 
-        Ok(found?)
+        Ok(found)
+    }
+
+    async fn probe_prefix(&mut self, prefix: &str, max_keys: i32) -> Result<ScanResult> {
+        self.probe_calls
+            .lock()
+            .unwrap()
+            .push((prefix.to_string(), max_keys));
+        let max = max_keys as usize;
+        let mut matched: Vec<&String> = self
+            .paths
+            .iter()
+            .filter(|p| p.starts_with(prefix))
+            .collect();
+        let truncated = matched.len() > max;
+        matched.truncate(max);
+        let objects = matched
+            .into_iter()
+            .map(|k| Object::builder().key(k).build())
+            .collect();
+        let result = ScanResult {
+            prefixes: Vec::new(),
+            objects,
+            truncated,
+        };
+        info!(prefix, max_keys, ?result, "MockS3 probed prefix");
+        Ok(result)
     }
 
     async fn check_prefixes<P>(
@@ -505,7 +628,38 @@ impl MockS3Engine {
         Self {
             paths: Arc::new(paths),
             calls: Arc::new(Mutex::new(Vec::new())),
+            probe_calls: Arc::new(Mutex::new(Vec::new())),
+            force_truncate_prefixes: Arc::new(BTreeSet::new()),
         }
+    }
+
+    /// Make `scan_prefixes` return `truncated=true` with no sub-prefixes
+    /// for any of `prefixes`, simulating the real `S3Engine`'s
+    /// flat-dense page-budget early exit.
+    pub fn with_forced_truncation<I>(mut self, prefixes: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        self.force_truncate_prefixes = Arc::new(prefixes.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// Assert the unordered set of (prefix, delimiter) calls equals
+    /// `expected`. Use when calls happen in parallel within a round and
+    /// ordering is not part of the contract.
+    pub fn assert_call_set(&self, expected: &[(impl AsRef<str>, impl AsRef<str>)]) {
+        let mut actual: Vec<(String, String)> = self.calls.lock().unwrap().clone();
+        actual.sort();
+        let mut expected_sorted: Vec<(String, String)> = expected
+            .iter()
+            .map(|(p, d)| (p.as_ref().to_string(), d.as_ref().to_string()))
+            .collect();
+        expected_sorted.sort();
+        assert!(
+            actual == expected_sorted,
+            "call set mismatch:\n  got:      {actual:?}\n  expected: {expected_sorted:?}",
+        );
     }
 
     pub fn assert_calls(&self, expected: &[(impl AsRef<str>, impl AsRef<str>)]) {
@@ -541,7 +695,10 @@ impl MockS3Engine {
     }
 
     pub fn scan_prefixes_inner(&mut self, prefix: &str, delimiter: &str) -> Result<ScanResult> {
-        let mut result = ScanResult::default();
+        let mut objects = Vec::new();
+        // Real S3 returns each `CommonPrefix` once; multiple keys
+        // sharing a parent dir don't multiply the listing.
+        let mut prefix_set: BTreeSet<String> = BTreeSet::new();
         self.paths
             .iter()
             .filter(|p| p.starts_with(prefix))
@@ -553,14 +710,16 @@ impl MockS3Engine {
                     p.to_string()
                 };
                 if matched_prefix.len() == p.len() {
-                    result
-                        .objects
-                        .push(Object::builder().key(matched_prefix).build());
+                    objects.push(Object::builder().key(matched_prefix).build());
                 } else {
-                    result.prefixes.push(matched_prefix);
+                    prefix_set.insert(matched_prefix);
                 }
             });
 
-        Ok(result)
+        Ok(ScanResult {
+            prefixes: prefix_set.into_iter().collect(),
+            objects,
+            truncated: false,
+        })
     }
 }
