@@ -580,6 +580,24 @@ fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
     Ok(command)
 }
 
+#[tokio::test]
+async fn test_platform_tls_env_var() -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "platform-tls-test";
+    client.create_bucket().bucket(bucket).send().await?;
+    create_object(&client, bucket, "hello/world.txt").await?;
+
+    // Run with EXPERIMENTAL_PLATFORM_TLS=true — MinIO is HTTP so https_or_http() covers it.
+    // The key thing being tested: the binary doesn't crash or error out when the env var is set,
+    // and it still successfully lists objects.
+    let mut cmd = run_s3glob(port, &["ls", &format!("s3://{}/hello/*", bucket)])?;
+    cmd.env("EXPERIMENTAL_PLATFORM_TLS", "true");
+    cmd.assert().success().stdout(contains("hello/world.txt"));
+
+    Ok(())
+}
+
 fn print_s3glob_output(cmd: &mut Command) {
     let output = cmd.output().unwrap();
     println!(

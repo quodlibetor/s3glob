@@ -21,6 +21,7 @@ use tracing::debug;
 mod download;
 mod glob_matcher;
 mod messaging;
+mod platform_tls;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -571,6 +572,11 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     if opts.no_sign_request {
         config = config.no_credentials();
     }
+    if std::env::var("EXPERIMENTAL_PLATFORM_TLS")
+        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    {
+        config = config.http_client(platform_tls::build());
+    }
     let config = config.load().await;
     let client = Client::new(&config);
 
@@ -590,6 +596,11 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     let mut config = aws_config::defaults(BehaviorVersion::latest()).region(region);
     if opts.no_sign_request {
         config = config.no_credentials();
+    }
+    if std::env::var("EXPERIMENTAL_PLATFORM_TLS")
+        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    {
+        config = config.http_client(platform_tls::build());
     }
     let config = config.load().await;
     let client = Client::new(&config);
