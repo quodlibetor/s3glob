@@ -580,6 +580,48 @@ fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
     Ok(command)
 }
 
+/// Verifies that --force-path-style allows s3glob to work with a hostname
+/// endpoint, and that without it the command fails (because the SDK uses
+/// virtual-hosted-style, prepending the bucket name to the hostname, e.g.
+/// bucket.localhost, which does not resolve).
+#[tokio::test]
+async fn test_force_path_style() -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "path-style-test";
+    client.create_bucket().bucket(bucket).send().await?;
+    create_object(&client, bucket, "test/object.txt").await?;
+
+    let pattern = format!("s3://{}/test/*", bucket);
+    let localhost_endpoint = format!("http://localhost:{}", port);
+
+    // With --force-path-style the SDK uses http://localhost:{port}/bucket/key
+    // and MinIO responds correctly.
+    let mut cmd =
+        s3glob_with_endpoint(&localhost_endpoint, &["ls", "--force-path-style", &pattern])?;
+    cmd.assert().success().stdout(contains("test/object.txt"));
+
+    // Without --force-path-style the SDK tries to reach
+    // http://path-style-test.localhost:{port}/test/* which does not resolve.
+    let mut cmd = s3glob_with_endpoint(&localhost_endpoint, &["ls", &pattern])?;
+    cmd.assert().failure();
+
+    Ok(())
+}
+
+fn s3glob_with_endpoint(endpoint: &str, args: &[&str]) -> anyhow::Result<Command> {
+    let mut command = assert_cmd::cargo::cargo_bin_cmd!("s3glob");
+    let log_directive = env::var("S3GLOB_LOG").unwrap_or_else(|_| "s3glob=trace".to_string());
+    command
+        .env("AWS_ENDPOINT_URL", endpoint)
+        .env("AWS_ACCESS_KEY_ID", "minioadmin")
+        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .env("S3GLOB_LOG", log_directive)
+        .args(args);
+    print_s3glob_output(&mut command);
+    Ok(command)
+}
+
 #[tokio::test]
 async fn test_platform_tls_env_var() -> anyhow::Result<()> {
     let (_node, port, client) = minio_and_client().await;

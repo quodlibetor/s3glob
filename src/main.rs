@@ -262,6 +262,18 @@ struct Opts {
     /// concurrent requests.
     #[clap(short = 'M', long, global = true, default_value = "10000")]
     max_parallelism: usize,
+
+    /// Use path-style S3 addressing
+    ///
+    /// By default s3glob uses the standard virtualhost-style addressing,
+    /// where the bucket name is prepended to the endpoint hostname
+    /// (e.g. http://bucket.host/key).
+    ///
+    /// Use this flag when connecting to S3-compatible servers accessed by
+    /// hostname (e.g. MinIO at http://my.local.server:9000) that do not
+    /// support virtualhost-style addressing.
+    #[clap(long, global = true)]
+    force_path_style: bool,
 }
 
 fn main() {
@@ -578,7 +590,7 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
         config = config.http_client(platform_tls::build());
     }
     let config = config.load().await;
-    let client = Client::new(&config);
+    let client = build_s3_client(&config, opts.force_path_style);
 
     let res = client.head_bucket().bucket(bucket).send().await;
 
@@ -603,8 +615,16 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
         config = config.http_client(platform_tls::build());
     }
     let config = config.load().await;
-    let client = Client::new(&config);
+    let client = build_s3_client(&config, opts.force_path_style);
     Ok(client)
+}
+
+fn build_s3_client(config: &aws_config::SdkConfig, force_path_style: bool) -> Client {
+    Client::from_conf(
+        aws_sdk_s3::config::Builder::from(config)
+            .force_path_style(force_path_style)
+            .build(),
+    )
 }
 
 fn decimal_format() -> FormatSizeOptions {
