@@ -22,7 +22,7 @@ eula = false
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1.88"
-aws-config = { version = "1.0", default-features = false, features = [
+aws-config = { version = "1.8", default-features = false, features = [
   "sso",
   "default-https-client",
   "rt-tokio",
