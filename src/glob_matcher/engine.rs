@@ -30,6 +30,33 @@ pub trait Engine: Send + Sync + 'static {
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static;
+
+    /// Verify and categorize objects in `presult`.
+    ///
+    /// For each prefix in `presult`, emit either an Object (if it is a real
+    /// key) or a Prefix (if it is a logical prefix only). Already-matched
+    /// objects in `presult.objects` are filtered through `matcher` and
+    /// emitted as Objects. Used when the pattern is "complete" (no `**`).
+    async fn get_exact(
+        &self,
+        presult: PrefixSearchResult,
+        status: &LiveStatus,
+        matcher: &regex::Regex,
+        tx: &UnboundedSender<Vec<PrefixResult>>,
+        permit: Arc<Semaphore>,
+    ) -> Result<()>;
+
+    /// List all objects under each `presult` prefix which match matcher.
+    ///
+    ///  Used when the pattern contains `**`.
+    async fn get_all_children(
+        &self,
+        presult: PrefixSearchResult,
+        matcher: Arc<regex::Regex>,
+        status: &LiveStatus,
+        tx: &UnboundedSender<Vec<PrefixResult>>,
+        permit: Arc<Semaphore>,
+    ) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -41,97 +68,6 @@ pub struct S3Engine {
 impl S3Engine {
     pub fn new(client: Client, bucket: String) -> Self {
         Self { client, bucket }
-    }
-
-    pub(crate) async fn get_all_children(
-        &self,
-        presult: PrefixSearchResult,
-        matcher: Arc<regex::Regex>,
-        status: &LiveStatus,
-        tx: &tokio::sync::mpsc::UnboundedSender<Vec<PrefixResult>>,
-        permit: Arc<Semaphore>,
-    ) -> Result<()> {
-        for prefix in presult.prefixes {
-            let client = self.client.clone();
-            let total_objects = Arc::clone(&status.total_objects);
-            let seen_prefixes = Arc::clone(&status.seen_prefixes);
-            let matcher = matcher.clone();
-            let bucket = self.bucket.clone();
-            let tx = tx.clone();
-            let permit = permit.clone().acquire_owned().await;
-
-            tokio::spawn(async move {
-                list_matching_objects(client, bucket, prefix.clone(), matcher, total_objects, tx)
-                    .await?;
-                drop(permit);
-
-                add_atomic(&seen_prefixes, 1);
-                Ok::<_, anyhow::Error>(())
-            });
-        }
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
-        Ok(())
-    }
-
-    pub(crate) async fn get_exact(
-        &self,
-        presult: PrefixSearchResult,
-        status: &LiveStatus,
-        matcher: &regex::Regex,
-        tx: &tokio::sync::mpsc::UnboundedSender<Vec<PrefixResult>>,
-        permit: Arc<Semaphore>,
-    ) -> Result<()> {
-        for prefix in &presult.prefixes {
-            // just get the object info for each prefix
-            let permit = permit.clone().acquire_owned().await;
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
-            let prefix = prefix.clone();
-            let tx = tx.clone();
-
-            status.total_objects.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                // Check if the "prefix" is a real object
-                let r = client
-                    .head_object()
-                    .bucket(bucket)
-                    .key(prefix.clone())
-                    .send()
-                    .await;
-                drop(permit);
-
-                match r {
-                    Ok(o) => {
-                        trace!(prefix, "prefix is actually an object");
-
-                        tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
-                            prefix, o,
-                        ))])
-                    }
-                    Err(_) => tx.send(vec![PrefixResult::Prefix(prefix)]),
-                }
-            });
-        }
-        debug!(
-            total_prefixes = presult.prefixes.len(),
-            "filtered prefixes from the result set"
-        );
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
-        Ok(())
     }
 }
 
@@ -312,6 +248,97 @@ impl Engine for S3Engine {
 
         Ok(new_prefixes)
     }
+
+    async fn get_exact(
+        &self,
+        presult: PrefixSearchResult,
+        status: &LiveStatus,
+        matcher: &regex::Regex,
+        tx: &UnboundedSender<Vec<PrefixResult>>,
+        permit: Arc<Semaphore>,
+    ) -> Result<()> {
+        for prefix in &presult.prefixes {
+            // just get the object info for each prefix
+            let permit = permit.clone().acquire_owned().await;
+            let client = self.client.clone();
+            let bucket = self.bucket.clone();
+            let prefix = prefix.clone();
+            let tx = tx.clone();
+
+            status.total_objects.fetch_add(1, Ordering::Relaxed);
+            tokio::spawn(async move {
+                // Check if the "prefix" is a real object
+                let r = client
+                    .head_object()
+                    .bucket(bucket)
+                    .key(prefix.clone())
+                    .send()
+                    .await;
+                drop(permit);
+
+                match r {
+                    Ok(o) => {
+                        trace!(prefix, "prefix is actually an object");
+
+                        tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
+                            prefix, o,
+                        ))])
+                    }
+                    Err(_) => tx.send(vec![PrefixResult::Prefix(prefix)]),
+                }
+            });
+        }
+        debug!(
+            total_prefixes = presult.prefixes.len(),
+            "filtered prefixes from the result set"
+        );
+        tx.send(
+            presult
+                .objects
+                .into_iter()
+                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+                .map(|o| PrefixResult::Object(S3Object::from(o)))
+                .collect(),
+        )?;
+        Ok(())
+    }
+
+    async fn get_all_children(
+        &self,
+        presult: PrefixSearchResult,
+        matcher: Arc<regex::Regex>,
+        status: &LiveStatus,
+        tx: &UnboundedSender<Vec<PrefixResult>>,
+        permit: Arc<Semaphore>,
+    ) -> Result<()> {
+        for prefix in presult.prefixes {
+            let client = self.client.clone();
+            let total_objects = Arc::clone(&status.total_objects);
+            let seen_prefixes = Arc::clone(&status.seen_prefixes);
+            let matcher = matcher.clone();
+            let bucket = self.bucket.clone();
+            let tx = tx.clone();
+            let permit = permit.clone().acquire_owned().await;
+
+            tokio::spawn(async move {
+                list_matching_objects(client, bucket, prefix.clone(), matcher, total_objects, tx)
+                    .await?;
+                drop(permit);
+
+                add_atomic(&seen_prefixes, 1);
+                Ok::<_, anyhow::Error>(())
+            });
+        }
+        tx.send(
+            presult
+                .objects
+                .into_iter()
+                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+                .map(|o| PrefixResult::Object(S3Object::from(o)))
+                .collect(),
+        )?;
+        Ok(())
+    }
 }
 
 /// A test engine that simulates a real S3 bucket with a set of paths
@@ -361,6 +388,61 @@ impl Engine for MockS3Engine {
         info!(requested = ?prefixes, existing = ?valid_prefixes, "mocks3 checked prefixes for existence");
 
         Ok(valid_prefixes)
+    }
+
+    async fn get_exact(
+        &self,
+        presult: PrefixSearchResult,
+        _status: &LiveStatus,
+        matcher: &regex::Regex,
+        tx: &UnboundedSender<Vec<PrefixResult>>,
+        _permit: Arc<Semaphore>,
+    ) -> Result<()> {
+        for prefix in &presult.prefixes {
+            let item = if self.paths.iter().any(|k| k == prefix) {
+                PrefixResult::Object(S3Object::from(Object::builder().key(prefix).build()))
+            } else {
+                PrefixResult::Prefix(prefix.clone())
+            };
+            tx.send(vec![item])?;
+        }
+        tx.send(
+            presult
+                .objects
+                .into_iter()
+                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+                .map(|o| PrefixResult::Object(S3Object::from(o)))
+                .collect(),
+        )?;
+        Ok(())
+    }
+
+    async fn get_all_children(
+        &self,
+        presult: PrefixSearchResult,
+        matcher: Arc<regex::Regex>,
+        _status: &LiveStatus,
+        tx: &UnboundedSender<Vec<PrefixResult>>,
+        _permit: Arc<Semaphore>,
+    ) -> Result<()> {
+        for prefix in &presult.prefixes {
+            let matching: Vec<PrefixResult> = self
+                .paths
+                .iter()
+                .filter(|k| k.starts_with(prefix.as_str()) && matcher.is_match(k))
+                .map(|k| PrefixResult::Object(S3Object::from(Object::builder().key(k).build())))
+                .collect();
+            tx.send(matching)?;
+        }
+        tx.send(
+            presult
+                .objects
+                .into_iter()
+                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+                .map(|o| PrefixResult::Object(S3Object::from(o)))
+                .collect(),
+        )?;
+        Ok(())
     }
 }
 

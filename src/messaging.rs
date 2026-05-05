@@ -46,6 +46,17 @@ pub(crate) fn louder_than(level: MessageLevel) -> bool {
     current > level
 }
 
+/// Suppress progress!/progressln! output from the calling test process.
+///
+/// Intended for proptest cases that would otherwise spam stderr. Safe to
+/// call multiple times. The first caller in a process wins — subsequent
+/// callers (and any unrelated MESSAGE_LEVEL initializer) silently no-op.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn silence_for_tests() {
+    let _ = MESSAGE_LEVEL.set(MessageLevel::VeryQuiet);
+}
+
 #[test]
 fn test_message_level_ordering() {
     assert2::assert!(MessageLevel::Quiet < MessageLevel::Normal);
