@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 use aws_sdk_s3::types::Object;
 use engine::ScanResult;
 use glob::Glob;
@@ -449,22 +449,23 @@ impl S3GlobMatcher {
                             }
                             trace!(new_prefixes = ?new_prefixes, new_prefix_count = new_prefixes.len(), "checking appended prefixes");
                             max_objects_observed = max_objects_observed.max(new_prefixes.len());
-                            match check_prefixes(
+                            let new_prefixes = check_prefixes(
                                 &mut engine,
                                 &prefixes,
                                 new_prefixes,
                                 self.max_parallelism,
                             )
-                            .await
-                            {
-                                Ok(new_prefixes) => prefixes = new_prefixes,
-                                Err(e) => {
-                                    if objects.is_empty() {
-                                        debug!("no prefixes matched and no objects exist");
-                                        return Err(e);
-                                    }
+                            .await?;
+                            if new_prefixes.is_empty() {
+                                if objects.is_empty() {
+                                    debug!("no prefixes matched and no objects exist");
+                                    prefixes.clear();
+                                    break;
                                 }
-                            };
+                                // keep prior prefixes — we already have matched objects
+                            } else {
+                                prefixes = new_prefixes;
+                            }
                         } else if !new_prefixes.is_empty() {
                             debug!("no appends, using new prefixes");
                             prefixes = new_prefixes;
@@ -493,14 +494,15 @@ impl S3GlobMatcher {
                             if !objects_updated || objects.is_empty() {
                                 let debug_prefixes =
                                     prefixes.iter().take(max_prefixes).join("\n  ");
-                                prefixes.clear();
-                                bail!(
+                                progressln!(
                                     "Could not continue search in prefixes:\n  {}{}\
                                 \n\n\
                                 None of the above matched the pattern:\n  {glob_so_far}",
                                     debug_prefixes,
                                     and_more,
                                 );
+                                prefixes.clear();
+                                break;
                             } else {
                                 objects_updated = false;
                             }
@@ -547,7 +549,7 @@ impl S3GlobMatcher {
         })
     }
 
-    pub(crate) async fn get_objects(&self, engine: S3Engine) -> Result<ListResult> {
+    pub(crate) async fn get_objects<E: Engine + Clone>(&self, engine: E) -> Result<ListResult> {
         let presult = match self.find_prefixes(engine.clone()).await {
             Ok(prefixes) => prefixes,
             Err(err) => {
@@ -611,7 +613,8 @@ async fn check_prefixes(
     max_parallelism: usize,
 ) -> Result<BTreeSet<String>, anyhow::Error> {
     if prefixes.is_empty() || new_prefixes.is_empty() {
-        bail!("Surprisingly, no prefixes to build off of and no prefixes found");
+        debug!("check_prefixes called with no prefixes to build off of or none to check");
+        return Ok(BTreeSet::new());
     }
     let checked_prefixes = engine
         .check_prefixes(new_prefixes.clone(), max_parallelism)
@@ -636,7 +639,7 @@ async fn check_prefixes(
             }
         }
 
-        bail!("{}", message.join("\n"));
+        progressln!("{}", message.join("\n"));
     }
     Ok(checked_prefixes)
 }
