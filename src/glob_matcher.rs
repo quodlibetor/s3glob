@@ -264,7 +264,7 @@ impl S3GlobMatcher {
 
                             let task = tokio::spawn(async move {
                                 // if the prefix matches the regex, we can return it immediately
-                                if regex.is_match(&client_prefix) {
+                                if !client_prefix.is_empty() && regex.is_match(&client_prefix) {
                                     tx.send(Ok((
                                         prefix.clone(),
                                         ScanResult::for_prefix(prefix.clone()),
@@ -450,13 +450,21 @@ impl S3GlobMatcher {
                             let mut new_prefixes = BTreeSet::new();
                             for prefix in &prefixes {
                                 if filter.is_match(prefix) {
-                                    // we only need to add alts if it's not already matched
+                                    // Keep the prefix as-is if it already
+                                    // matches the appended-form regex. We
+                                    // *also* try appending each alt: when the
+                                    // alt set includes both a delim-only alt
+                                    // (which the prefix satisfies via the
+                                    // empty-after-delim path) and other alts
+                                    // that add real content, the additional
+                                    // appends surface keys the empty-alt path
+                                    // would otherwise miss (e.g. `*{,:b}`
+                                    // against `["a:b"]`).
                                     if append_matcher.is_match(prefix) {
                                         new_prefixes.insert(prefix.clone());
-                                    } else {
-                                        for alt in &appends {
-                                            new_prefixes.insert(prefix_join(prefix, alt));
-                                        }
+                                    }
+                                    for alt in &appends {
+                                        new_prefixes.insert(prefix_join(prefix, alt));
                                     }
                                 }
                             }
@@ -569,6 +577,13 @@ impl S3GlobMatcher {
                 prefixes.len()
             );
         }
+        // For complete patterns, every prefix in the final result must
+        // match the full regex (including the trailing `[delim]?$`). The
+        // Any handler scans subprefixes and adds them all without
+        // verifying, this is the last place we check.
+        if self.is_complete {
+            prefixes.retain(|p| self.regex.is_match(p));
+        }
         Ok(PrefixSearchResult {
             prefixes: prefixes.into_iter().collect(),
             objects,
@@ -604,7 +619,9 @@ impl S3GlobMatcher {
         debug!(regex = %re.as_str(), "full regex");
         if self.is_complete() {
             let permit = Arc::new(Semaphore::new(self.max_parallelism));
-            engine.get_exact(presult, &status, &re, &tx, permit).await?;
+            engine
+                .get_exact(presult, self.delimiter, &status, &re, &tx, permit)
+                .await?;
         } else {
             let permit = Arc::new(Semaphore::new(self.max_parallelism));
             engine
