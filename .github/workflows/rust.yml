@@ -2,9 +2,9 @@ name: Rust CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +14,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -32,38 +32,132 @@ jobs:
     name: Integration Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          components: llvm-tools-preview
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Compile tests
-        run: cargo nextest run --verbose --no-run
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Run integration tests
-        run: cargo nextest run --no-fail-fast -E 'binary(integration)'
+      - name: Run integration tests with coverage
+        run: cargo llvm-cov nextest --no-report --no-fail-fast -E 'binary(integration)'
+
+      # Only upload the inputs `cargo llvm-cov report` actually needs:
+      # the .profraw files and the instrumented test binaries (which have no
+      # extension under debug/deps/). Skips ~2.5G of .rlib/.rmeta/.o/.d cargo
+      # build artifacts that aren't needed downstream.
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-data-integration
+          path: |
+            target/llvm-cov-target/*.profraw
+            target/llvm-cov-target/debug/deps/*
+            !target/llvm-cov-target/debug/deps/*.*
+          if-no-files-found: error
 
   test-unit:
     name: Unit Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          components: llvm-tools-preview
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Compile tests
-        run: cargo nextest run --verbose --no-run
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
-      - name: Run unit tests
-        run: cargo nextest run --no-fail-fast -E 'not binary(integration)'
+      - name: Run unit tests with coverage
+        run: cargo llvm-cov nextest --no-report --no-fail-fast -E 'not binary(integration)'
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-data-unit
+          path: |
+            target/llvm-cov-target/*.profraw
+            target/llvm-cov-target/debug/deps/*
+            !target/llvm-cov-target/debug/deps/*.*
+          if-no-files-found: error
+
+      # `mise run proptest-replay-ci <url>` pulls this artifact and
+      # replays proptest deterministically.
+      - name: Upload proptest regression seeds (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: proptest-regressions
+          path: proptest-regressions/
+          if-no-files-found: ignore
+
+  coverage:
+    name: Coverage report
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-integration]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Download unit coverage data
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-data-unit
+          path: coverage-staging/unit/
+
+      - name: Download integration coverage data
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-data-integration
+          path: coverage-staging/integration/
+
+      # Each artifact contains only .profraw files and the no-extension test
+      # binaries from debug/deps/. Profraws have unique names per test run so
+      # they accumulate; test binaries are uniquely named per test crate so
+      # they don't collide between jobs.
+      - name: Combine coverage data
+        run: |
+          mkdir -p target/llvm-cov-target
+          cp -a coverage-staging/unit/. target/llvm-cov-target/
+          cp -a coverage-staging/integration/. target/llvm-cov-target/
+          rm -rf coverage-staging
+          # actions/upload-artifact strips Unix permissions, so the test
+          # binaries arrive non-executable and cargo-llvm-cov skips them
+          # when collecting object files. Restore +x.
+          find target/llvm-cov-target/debug/deps -maxdepth 1 -type f ! -name '*.*' -exec chmod +x {} +
+          echo "profraw files merged: $(find target/llvm-cov-target -name '*.profraw' | wc -l)"
+          echo "test binaries merged:"
+          find target/llvm-cov-target/debug/deps -maxdepth 1 -type f ! -name '*.*' -exec ls -l {} +
+
+      - name: Generate coverage report
+        run: |
+          cargo llvm-cov report --color=always --ignore-filename-regex 'tests/'
+          cargo llvm-cov report --html --ignore-filename-regex 'tests/'
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: |
+            target/llvm-cov/html/

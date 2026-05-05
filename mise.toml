@@ -1,17 +1,99 @@
+[settings]
+lockfile = true
+
+[tools]
+"cargo:cargo-llvm-cov" = "latest"
+"cargo:cargo-nextest" = "latest"
+"cargo:cargo-release" = "latest"
+"github:axodotdev/cargo-dist" = { version = "0.31", exe = "dist" }
+gh = "latest"
+git-cliff = "latest"
+
 [tasks.test]
+description = "Run the full test suite (unit + integration)"
 env = { CLICOLOR = "1" }
 run = "cargo nextest run --no-fail-fast"
 
 [tasks.test-unit]
+description = "Run unit tests only (excludes the integration binary)"
 env = { CLICOLOR = "1" }
 run = "cargo nextest run --no-fail-fast -E 'not binary(integration)'"
 
 [tasks.test-int]
+description = "Run integration tests only (requires Docker for MinIO)"
 env = { CLICOLOR = "1" }
 run = "cargo nextest run --no-fail-fast -E 'binary(integration)'"
 
-[tools]
-"cargo:cargo-nextest" = "latest"
-"cargo:cargo-release" = "latest"
-"github:axodotdev/cargo-dist" = { version = "0.31", exe = "dist" }
-git-cliff = "latest"
+[tasks.cov-proptest]
+description = """
+Coverage of the matcher under the proptest module (text + missing lines).
+"""
+env = { CLICOLOR = "1" }
+run = "cargo llvm-cov nextest --no-fail-fast --show-missing-lines --ignore-filename-regex 'proptests\\.rs|tests/' -E 'binary(s3glob) and test(proptests)'"
+
+[tasks.cov-unit]
+description = """
+Coverage of all unit tests (no integration).
+"""
+env = { CLICOLOR = "1" }
+run = """
+cargo llvm-cov nextest --no-fail-fast --ignore-filename-regex 'tests/' -E 'not binary(integration)'
+cargo llvm-cov report --color=always
+cargo llvm-cov report --html
+"""
+
+[tasks.cov-all]
+description = """
+Coverage of unit + integration tests (requires Docker for MinIO).
+"""
+env = { CLICOLOR = "1" }
+run = """
+cargo llvm-cov nextest --no-fail-fast --show-missing-lines --ignore-filename-regex 'tests/'
+cargo llvm-cov report --color=always
+cargo llvm-cov report --html
+"""
+
+[tasks.proptest-fetch-seeds]
+description = """
+Download proptest regression seeds from a failed CI run.
+
+Argument is either a bare GitHub Actions run ID or any URL containing
+`/runs/<id>` (e.g. the URL of a failed check on a PR — both the run
+URL and a deeper /runs/<id>/jobs/<jobid> URL work; the run ID is
+extracted, the job ID ignored). The artifact is extracted into
+`proptest-regressions/` so the next test run replays the seed.
+"""
+env = { CLICOLOR = "1" }
+run = '''
+set -euo pipefail
+arg="${1:-}"
+if [ -z "$arg" ]; then
+  echo "usage: mise run proptest-fetch-seeds <github-actions-run-url-or-id>" >&2
+  exit 1
+fi
+run_id=$(printf '%s' "$arg" | grep -oE '(runs/|^)[0-9]+' | tail -n1 | grep -oE '[0-9]+')
+if [ -z "$run_id" ]; then
+  echo "could not extract a numeric run ID from: $arg" >&2
+  exit 1
+fi
+echo "Downloading proptest-regressions artifact from run $run_id..."
+gh run download "$run_id" -n proptest-regressions
+echo "Saved to proptest-regressions/"
+'''
+
+[tasks.proptest-replay-ci]
+description = """
+Fetch seeds from a CI run (same arg as proptest-fetch-seeds) and
+replay proptests locally.
+
+Proptest auto-loads seeds from `proptest-regressions/glob_matcher/proptests.txt`,
+so the just-downloaded counter-example is replayed before any new
+cases. Once a maintainer confirms the seed reproduces the failure,
+commit `proptest-regressions/` so future runs always replay it.
+"""
+env = { CLICOLOR = "1" }
+run = '''
+set -euo pipefail
+mise run proptest-fetch-seeds "$@"
+cargo nextest run --no-fail-fast -E 'binary(s3glob) and test(proptests)'
+'''
