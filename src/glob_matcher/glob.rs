@@ -68,7 +68,7 @@ impl Glob {
         matches!(self, Glob::Recursive)
     }
 
-    pub(crate) fn re_string(&self, delimiter: &str) -> String {
+    pub(crate) fn re_string(&self, delimiter: &str, cross_delim: bool) -> String {
         match self {
             Glob::Any {
                 raw,
@@ -76,9 +76,19 @@ impl Glob {
             } => match (&**raw, alternatives) {
                 (_, Some(alts)) => {
                     let chars = alts.iter().collect::<String>();
-                    format!("[^{}]", chars)
+                    if cross_delim {
+                        format!("[^{chars}]")
+                    } else {
+                        format!("[^{chars}{delimiter}]")
+                    }
                 }
-                ("?", _) => ".".to_string(),
+                ("?", _) => {
+                    if cross_delim {
+                        ".".to_string()
+                    } else {
+                        format!("[^{delimiter}]")
+                    }
+                }
                 ("*", _) => format!("[^{delimiter}]*"),
                 (_, _) => panic!("invalid any pattern: {raw}"),
             },
@@ -128,7 +138,11 @@ impl Glob {
     pub(crate) fn re(&self, delimiter: &str) -> regex::Regex {
         use regex::Regex;
 
-        Regex::new(&self.re_string(delimiter)).unwrap()
+        // Tests historically asserted the strict per-segment behavior; keep
+        // that here so the existing assertions don't shift. The user-facing
+        // default is `cross_delim = true`, but the test helper preserves
+        // the stricter semantics it was originally written against.
+        Regex::new(&self.re_string(delimiter, false)).unwrap()
     }
 }
 
@@ -264,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_parse_basic() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("hello*world".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("hello*world".to_string(), "/", false)?;
 
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["hello"]));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
@@ -276,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_parse_multiple_glob() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("/{a,b}*/".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("/{a,b}*/".to_string(), "/", false)?;
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["/a", "/b"]));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
         assert_scanner_part!(&scanner.parts[2], OneChoice("/"));
@@ -288,7 +302,7 @@ mod tests {
 
     #[test]
     fn test_parse_alternation() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("src/{foo,bar}/test".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("src/{foo,bar}/test".to_string(), "/", false)?;
 
         assert_scanner_part!(
             &scanner.parts[0],
@@ -300,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_parse_character_class() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("test[abc]file".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("test[abc]file".to_string(), "/", false)?;
 
         assert_scanner_part!(
             &scanner.parts[0],
@@ -313,7 +327,7 @@ mod tests {
 
     #[test]
     fn test_parse_recursive_glob() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
         println!("scanner_parts for {}:\n{:?}", scanner.raw, scanner.parts);
         check!(scanner.parts.len() == 5);
 
@@ -332,7 +346,7 @@ mod tests {
 
     #[test]
     fn test_parse_character_class_with_bracket() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("test[]a]file".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("test[]a]file".to_string(), "/", false)?;
 
         assert_scanner_part!(
             &scanner.parts[0],
@@ -347,16 +361,58 @@ mod tests {
     #[test]
     fn test_parse_negated_character_class() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
-        let scanner = S3GlobMatcher::parse("test[!a]file".to_string(), "/")?;
+        // The `Glob::re` test helper uses cross_delim = false, so the
+        // negated class still excludes the delimiter at this layer.
+        let scanner = S3GlobMatcher::parse("test[!a]file".to_string(), "/", false)?;
 
-        assert_scanner_part!(&scanner.parts[1], Any("[!a]"), &["/", "B"], !&["a"]);
+        assert_scanner_part!(&scanner.parts[1], Any("[!a]"), &["B"], !&["a", "/"]);
 
         Ok(())
     }
 
     #[test]
+    fn test_parse_negated_character_class_lax_default() -> Result<()> {
+        // With the user-facing default (cross_delim = true), `[!a]`
+        // matches `/`. This test exercises the matcher's full compiled
+        // regex (not the per-part `Glob::re` helper) so the flag is in
+        // play.
+        let scanner = S3GlobMatcher::parse("foo/[!a]bar".to_string(), "/", true)?;
+        assert!(scanner.matches_key("foo//bar"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_negated_character_class_strict() -> Result<()> {
+        // With cross_delim = false, the negated class should not match
+        // the delimiter.
+        let scanner = S3GlobMatcher::parse("foo/[!a]bar".to_string(), "/", false)?;
+        assert!(!scanner.matches_key("foo//bar"));
+        // sanity: it still matches a non-delimiter, non-`a` character
+        assert!(scanner.matches_key("foo/Xbar"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_question_lax_default() -> Result<()> {
+        // With cross_delim = true, `?` matches `/`.
+        let scanner = S3GlobMatcher::parse("foo?bar".to_string(), "/", true)?;
+        assert!(scanner.matches_key("foo/bar"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_question_strict() -> Result<()> {
+        // With cross_delim = false, `?` does not match `/`.
+        let scanner = S3GlobMatcher::parse("foo?bar".to_string(), "/", false)?;
+        assert!(!scanner.matches_key("foo/bar"));
+        // sanity: it still matches a non-delimiter character
+        assert!(scanner.matches_key("fooXbar"));
+        Ok(())
+    }
+
+    #[test]
     fn test_parse_character_class_with_negation_and_bracket() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("test[!]]file".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("test[!]]file".to_string(), "/", false)?;
 
         assert_scanner_part!(
             &scanner.parts[1],
@@ -370,7 +426,7 @@ mod tests {
 
     #[test]
     fn test_parse_choice_after_any() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("literal/*{foo,bar}/baz".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("literal/*{foo,bar}/baz".to_string(), "/", false)?;
 
         assert_scanner_part!(&scanner.parts[0], OneChoice("literal/"));
         assert_scanner_part!(&scanner.parts[1], Any("*"));
@@ -383,7 +439,7 @@ mod tests {
     #[test]
     fn test_parse_literal_after_any_with_delimiter() -> Result<()> {
         setup_logging(Some("s3glob=trace"));
-        let scanner = S3GlobMatcher::parse("literal/*foo/baz".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("literal/*foo/baz".to_string(), "/", false)?;
         check!(scanner.parts.len() == 3);
 
         assert_scanner_part!(&scanner.parts[0], OneChoice("literal/"));
@@ -395,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_parse_character_range() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[a-c]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[a-c]".to_string(), "/", false)?;
 
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["a", "b", "c"]));
         Ok(())
@@ -403,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_parse_numeric_range() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[0-2]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[0-2]".to_string(), "/", false)?;
 
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["0", "1", "2"]));
         Ok(())
@@ -411,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_parse_multiple_ranges() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[a-c0-2]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[a-c0-2]".to_string(), "/", false)?;
 
         assert_scanner_part!(
             &scanner.parts[0],
@@ -422,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_parse_range_with_single_chars() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[a-cx]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[a-cx]".to_string(), "/", false)?;
 
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["a", "b", "c", "x"]));
         Ok(())
@@ -430,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_parse_range_with_dash_at_start() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[-a-c]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[-a-c]".to_string(), "/", false)?;
 
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["-", "a", "b", "c"]));
         Ok(())
@@ -438,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_parse_range_with_dash_at_end() -> Result<()> {
-        let result = S3GlobMatcher::parse("[a-c-]".to_string(), "/");
+        let result = S3GlobMatcher::parse("[a-c-]".to_string(), "/", false);
 
         assert!(result.is_err());
         let err_msg = format!("{:#?}", result.unwrap_err());
@@ -449,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_parse_range_missing_end() {
-        let result = S3GlobMatcher::parse("[a-]".to_string(), "/");
+        let result = S3GlobMatcher::parse("[a-]".to_string(), "/", false);
         assert!(result.is_err());
         let err_msg = format!("{:#?}", result.unwrap_err());
         println!("err_msg: {err_msg}");
@@ -458,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_parse_range_with_negation() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[!a-c]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[!a-c]".to_string(), "/", false)?;
 
         assert_scanner_part!(
             &scanner.parts[0],
@@ -471,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_parse_range_end_less_than_start() {
-        let result = S3GlobMatcher::parse("[c-a]".to_string(), "/");
+        let result = S3GlobMatcher::parse("[c-a]".to_string(), "/", false);
         assert!(result.is_err());
         let err_msg = format!("{:#?}", result.unwrap_err());
         println!("err_msg: {err_msg}");
@@ -480,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_parse_negated_dash() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[!-]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[!-]".to_string(), "/", false)?;
 
         assert_scanner_part!(
             &scanner.parts[0],
@@ -493,7 +549,7 @@ mod tests {
 
     #[test]
     fn test_parse_unicode_range() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[α-γ]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[α-γ]".to_string(), "/", false)?;
 
         assert_scanner_part!(
             &scanner.parts[0],
@@ -504,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_parse_unicode_with_ascii_range() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[A-Cα-γ]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[A-Cα-γ]".to_string(), "/", false)?;
 
         assert_scanner_part!(
             &scanner.parts[0],
@@ -515,7 +571,7 @@ mod tests {
 
     #[test]
     fn test_parse_emoji_range() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[😀-😃]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[😀-😃]".to_string(), "/", false)?;
 
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["😀", "😁", "😂", "😃"]));
         Ok(())
@@ -523,7 +579,7 @@ mod tests {
 
     #[test]
     fn test_parse_unclosed_character_class() {
-        let result = S3GlobMatcher::parse("[a-c".to_string(), "/");
+        let result = S3GlobMatcher::parse("[a-c".to_string(), "/", false);
         assert!(result.is_err());
         let err_msg = format!("{:#?}", result.unwrap_err());
         println!("err_msg: {err_msg}");
@@ -532,7 +588,7 @@ mod tests {
 
     #[test]
     fn test_parse_empty_character_class() {
-        let result = S3GlobMatcher::parse("[]".to_string(), "/");
+        let result = S3GlobMatcher::parse("[]".to_string(), "/", false);
         assert!(result.is_err());
         let err_msg = format!("{:#?}", result.unwrap_err());
         println!("err_msg: {err_msg}");
@@ -541,7 +597,7 @@ mod tests {
 
     #[test]
     fn test_parse_range_dash_only() -> Result<()> {
-        let scanner = S3GlobMatcher::parse("[-]".to_string(), "/")?;
+        let scanner = S3GlobMatcher::parse("[-]".to_string(), "/", false)?;
         assert_scanner_part!(&scanner.parts[0], Choice(vec!["-"]));
         Ok(())
     }
