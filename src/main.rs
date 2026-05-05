@@ -274,6 +274,60 @@ struct Opts {
     /// support virtualhost-style addressing.
     #[clap(long, global = true)]
     force_path_style: bool,
+
+    /// Allow `?` and `[!...]` to match the delimiter (default: true)
+    ///
+    /// When true (the default), `?` matches any single character including
+    /// the delimiter, and a negated character class like `[!abc]` matches
+    /// any single character not in the set, including the delimiter. This
+    /// preserves the historical behavior of s3glob.
+    ///
+    /// Pass `--no-cross-delim` to make these patterns single-segment:
+    /// `?` becomes "any single non-delimiter character" and `[!abc]`
+    /// becomes "any single character not in the set and not the
+    /// delimiter". `*` is always single-segment regardless of this flag.
+    ///
+    /// A future major release will flip the default to `false`.
+    #[clap(
+        long,
+        global = true,
+        default_value_t = true,
+        env = "S3GLOB_CROSS_DELIM",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        overrides_with = "no_cross_delim",
+        verbatim_doc_comment,
+    )]
+    cross_delim: bool,
+
+    /// Negated form of `--cross-delim`; setting this is equivalent to
+    /// `--cross-delim=false`. Hidden because `--cross-delim` already
+    /// documents both directions.
+    #[clap(
+        long = "no-cross-delim",
+        global = true,
+        action = ArgAction::SetTrue,
+        hide = true,
+        overrides_with = "cross_delim",
+    )]
+    no_cross_delim: bool,
+}
+
+impl Opts {
+    /// Resolve the effective `cross_delim` value.
+    ///
+    /// `--no-cross-delim` and `--cross-delim` use clap's `overrides_with`
+    /// so the last one wins on the command line; this combiner produces
+    /// the final boolean by treating `--no-cross-delim` as the canonical
+    /// "off" signal.
+    fn cross_delim(&self) -> bool {
+        if self.no_cross_delim {
+            false
+        } else {
+            self.cross_delim
+        }
+    }
 }
 
 fn main() {
@@ -335,7 +389,11 @@ async fn run(opts: Opts) -> Result<()> {
     let client = create_s3_client(&opts, &bucket).await?;
 
     let engine = S3Engine::new(client.clone(), bucket.clone());
-    let mut matcher = S3GlobMatcher::parse(raw_pattern.clone(), &opts.delimiter.to_string())?;
+    let mut matcher = S3GlobMatcher::parse(
+        raw_pattern.clone(),
+        &opts.delimiter.to_string(),
+        opts.cross_delim(),
+    )?;
     matcher.set_max_parallelism(opts.max_parallelism);
     let ListResult {
         status,
