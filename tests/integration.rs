@@ -350,6 +350,95 @@ async fn test_glob_prefixes_specific(
     Ok(())
 }
 
+/// Invariants for canonical `PrefixResult` output.
+#[rstest]
+// A pattern whose regex matches the empty string (e.g. `*`) must not
+// surface a blank `PRE` line for the empty initial prefix.
+#[case::no_empty_pre_line(
+    &["root.txt", "dir/file.txt"],
+    "*",
+    &[r"(?m)^PRE\s+dir/$", r"(?m) root\.txt$"],
+    &[r"(?m)^PRE\s*$"],
+)]
+// Intermediate prefixes that can't satisfy the pattern's trailing
+// `[delim]?$` end-anchor must be filtered out — `a/bbb/` cannot match
+// `*/?` because `?` is a single character.
+#[case::trailing_anchor_filters_intermediate_prefix(
+    &["a/b/x.txt", "a/bbb/y.txt"],
+    "*/?",
+    &[r"(?m)^PRE\s+a/b/$"],
+    &[r"a/bbb/"],
+)]
+// When a candidate prefix resolves to a directory rather than a key,
+// `get_exact` must emit it with the trailing delimiter (`a/`, not `a`).
+#[case::prefix_canonicalized_with_trailing_delim(
+    &["a/x"],
+    "{a}",
+    &[r"(?m)^PRE\s+a/$"],
+    &[r"(?m)^PRE\s+a$"],
+)]
+// A candidate validated only by `check_prefixes` (S3 list with
+// `max_keys=1`) returns true for any string that is a prefix of some
+// key. `ab` against bucket `[abc]` is such a "phantom" — neither a key
+// nor a directory — and must be dropped, not emitted as `Prefix(ab)`.
+#[case::phantom_prefix_dropped(
+    &["abc"],
+    "{ab}",
+    &[],
+    &[r"(?m)^PRE"],
+)]
+// In the Choice handler's filter+append branch, an empty alternative
+// must not short-circuit the non-empty alternatives. Pattern `*{,/y}`
+// against `[a/y]` must surface `Object("a/y")` via the `/y` alt.
+#[case::choice_handler_recovers_content_alt(
+    &["a/y"],
+    "*{,/y}",
+    &[r"(?m) a/y$"],
+    &[],
+)]
+#[trace]
+#[tokio::test]
+async fn test_canonical_prefix_output(
+    #[case] source_files: &[&str],
+    #[case] glob: &str,
+    #[case] must_match: &[&str],
+    #[case] must_not_match: &[&str],
+) -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+    for key in source_files {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let needle = format!("s3://{}/{}", bucket, glob);
+    let mut cmd = run_s3glob(port, &["ls", needle.as_str()])?;
+    let res = cmd.assert().success();
+    let output = std::str::from_utf8(&res.get_output().stdout).unwrap();
+
+    for re in must_match {
+        let re = RegexBuilder::new(re).multi_line(true).build().unwrap();
+        assert!(
+            re.is_match(output),
+            "expected regex {:?} to match output {:?}",
+            re,
+            output
+        );
+    }
+    for re in must_not_match {
+        let re = RegexBuilder::new(re).multi_line(true).build().unwrap();
+        assert!(
+            !re.is_match(output),
+            "expected regex {:?} NOT to match output {:?}",
+            re,
+            output
+        );
+    }
+
+    Ok(())
+}
+
 #[rstest]
 #[case( // 1 Keep different subdirs
     &[

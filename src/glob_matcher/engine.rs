@@ -34,12 +34,15 @@ pub trait Engine: Send + Sync + 'static {
     /// Verify and categorize objects in `presult`.
     ///
     /// For each prefix in `presult`, emit either an Object (if it is a real
-    /// key) or a Prefix (if it is a logical prefix only). Already-matched
-    /// objects in `presult.objects` are filtered through `matcher` and
-    /// emitted as Objects. Used when the pattern is "complete" (no `**`).
+    /// key) or a Prefix (if it is a logical prefix only). Prefix output is
+    /// canonicalized to end with `delimiter`. Empty prefixes are skipped.
+    /// Already-matched objects in `presult.objects` are filtered through
+    /// `matcher` and emitted as Objects. Used when the pattern is
+    /// "complete" (no `**`).
     async fn get_exact(
         &self,
         presult: PrefixSearchResult,
+        delimiter: char,
         status: &LiveStatus,
         matcher: &regex::Regex,
         tx: &UnboundedSender<Vec<PrefixResult>>,
@@ -252,12 +255,16 @@ impl Engine for S3Engine {
     async fn get_exact(
         &self,
         presult: PrefixSearchResult,
+        delimiter: char,
         status: &LiveStatus,
         matcher: &regex::Regex,
         tx: &UnboundedSender<Vec<PrefixResult>>,
         permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in &presult.prefixes {
+            if prefix.is_empty() {
+                continue;
+            }
             // just get the object info for each prefix
             let permit = permit.clone().acquire_owned().await;
             let client = self.client.clone();
@@ -267,24 +274,49 @@ impl Engine for S3Engine {
 
             status.total_objects.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
-                // Check if the "prefix" is a real object
-                let r = client
+                // Prefixes that already end with the delimiter came from
+                // Engine::scan_prefixes and are verified directories.
+                if prefix.ends_with(delimiter) {
+                    drop(permit);
+                    let _ = tx.send(vec![PrefixResult::Prefix(prefix)]);
+                    return;
+                }
+
+                // Check whether the prefix is an exact key, and whether it's
+                // also a directory.
+                // simple_append's loose verification can produce phantom
+                // prefixes which are neither.
+                let head = client
                     .head_object()
-                    .bucket(bucket)
+                    .bucket(bucket.clone())
                     .key(prefix.clone())
+                    .send()
+                    .await;
+                let directory_form = format!("{prefix}{delimiter}");
+                let dir_check = client
+                    .list_objects_v2()
+                    .bucket(bucket)
+                    .prefix(directory_form.clone())
+                    .max_keys(1)
                     .send()
                     .await;
                 drop(permit);
 
-                match r {
-                    Ok(o) => {
-                        trace!(prefix, "prefix is actually an object");
-
-                        tx.send(vec![PrefixResult::Object(S3Object::from_head_object(
-                            prefix, o,
-                        ))])
-                    }
-                    Err(_) => tx.send(vec![PrefixResult::Prefix(prefix)]),
+                let mut out: Vec<PrefixResult> = Vec::new();
+                if let Ok(o) = head {
+                    trace!(prefix, "prefix is actually an object");
+                    out.push(PrefixResult::Object(S3Object::from_head_object(
+                        prefix.clone(),
+                        o,
+                    )));
+                }
+                if let Ok(resp) = dir_check
+                    && resp.key_count.unwrap_or(0) > 0
+                {
+                    out.push(PrefixResult::Prefix(directory_form));
+                }
+                if !out.is_empty() {
+                    let _ = tx.send(out);
                 }
             });
         }
@@ -377,10 +409,10 @@ impl Engine for MockS3Engine {
         info!(?prefixes, "MockS3 checking prefixes");
         let mut valid_prefixes = BTreeSet::new();
 
+        // a prefix is "valid" if any key in the bucket starts with it.
+        // Independent of delimiter.
         for prefix in &prefixes {
-            let response = self.scan_prefixes_inner(prefix, "/")?;
-
-            if !response.prefixes.is_empty() || !response.objects.is_empty() {
+            if self.paths.iter().any(|k| k.starts_with(prefix)) {
                 valid_prefixes.insert(prefix.to_string());
             }
         }
@@ -393,18 +425,39 @@ impl Engine for MockS3Engine {
     async fn get_exact(
         &self,
         presult: PrefixSearchResult,
+        delimiter: char,
         _status: &LiveStatus,
         matcher: &regex::Regex,
         tx: &UnboundedSender<Vec<PrefixResult>>,
         _permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in &presult.prefixes {
-            let item = if self.paths.iter().any(|k| k == prefix) {
-                PrefixResult::Object(S3Object::from(Object::builder().key(prefix).build()))
-            } else {
-                PrefixResult::Prefix(prefix.clone())
-            };
-            tx.send(vec![item])?;
+            if prefix.is_empty() {
+                continue;
+            }
+            // Prefixes ending with delimiter are verified directories
+            // from Engine::scan_prefixes
+            if prefix.ends_with(delimiter) {
+                tx.send(vec![PrefixResult::Prefix(prefix.clone())])?;
+                continue;
+            }
+            // For non-delim-suffixed prefixes, emit Object if it's an
+            // exact key, Prefix(directory_form) if any key starts with
+            // prefix+delim. Both can apply (a key plus a "directory" at
+            // the same name, S3 is not a filesystem).
+            let mut out: Vec<PrefixResult> = Vec::new();
+            if self.paths.iter().any(|k| k == prefix) {
+                out.push(PrefixResult::Object(S3Object::from(
+                    Object::builder().key(prefix).build(),
+                )));
+            }
+            let directory_form = format!("{prefix}{delimiter}");
+            if self.paths.iter().any(|k| k.starts_with(&directory_form)) {
+                out.push(PrefixResult::Prefix(directory_form));
+            }
+            if !out.is_empty() {
+                tx.send(out)?;
+            }
         }
         tx.send(
             presult
