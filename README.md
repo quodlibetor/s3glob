@@ -63,13 +63,43 @@ brew install quodlibetor/tap/s3glob
 Glob syntax supported:
 
 - `*` matches any number of non-delimiter characters. The default delimiter is `/`.
-- `?` matches any single character.
-- `[abc]`/`[!abc]` matches any single character in/not in the set.
-- `[a-z]`/`[!a-z]` matches any single character in/not in the range.
+- `?` matches any single character. By default this includes the
+  delimiter; pass `--no-cross-delim` to restrict `?` to a single
+  segment.
+- `[abc]`/`[!abc]` matches any single character in/not in the set. By
+  default the negated form `[!abc]` may also match the delimiter; pass
+  `--no-cross-delim` to keep it single-segment.
+- `[a-z]`/`[!a-z]` matches any single character in/not in the range,
+  with the same `--no-cross-delim` rule for the negated form.
 - `{a,b,c}` matches any of the comma-separated options (but nested globs are not
-  supported).
-- `**` matches any number of characters. This will immediately force
-  `s3glob` to scan all objects starting where it appears.
+  supported). Empty alternatives are allowed: `{a,}` matches either `a` or
+  the empty string.
+- `**` matches any number of characters, including the delimiter. This will
+  immediately force `s3glob` to scan all objects starting where it appears.
+- A pattern (or any brace alternative) ending in `/` implicitly matches
+  everything inside that directory: `s3glob ls 'foo/'` lists every object
+  under `foo/`.
+
+### Differences from standard glob and globset
+
+`s3glob`'s syntax overlaps with traditional Unix glob, but with a few
+intentional deviations driven by the S3-listing model:
+
+- **`**` works anywhere, not only as a path component.** Most glob
+  implementations require `**` to stand alone between delimiters (e.g.
+  `a/**/b`). In `s3glob`, `**` compiles to "any chars including the
+  delimiter" wherever it appears: `a**b` matches `a/x/y/b`, and `{x,y}**`
+  matches anything starting with `x` or `y`.
+- **Negated character classes and `?` can be made single-segment.** By default
+  `?` matches any character, and `[!a]` matches any non-`a` character including
+  the delimiter. Pass `--no-cross-delim` (or set `S3GLOB_CROSS_DELIM=false`) to
+  restrict `[!a]` to a single segment. A future major version will flip this
+  default to single-segment.
+- **Empty brace alternatives are first-class.** `{a,}`, `{,a}`, and
+  `{a,,b}` are all valid; the empty alt matches the empty string. Many
+  glob implementations reject these.
+- **Trailing `/` is "match everything inside this directory".** Pattern
+  `foo/` is internally rewritten to `foo/*`-equivalent.
 
 ### Algorithm and performance implications
 
