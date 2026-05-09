@@ -27,7 +27,7 @@ aws-config = { version = "1.0", default-features = false, features = [
   "default-https-client",
   "rt-tokio",
 ] }
-aws-sdk-s3 = { version = "1.0", default-features = false, features = [
+aws-sdk-s3 = { version = "1.129", default-features = false, features = [
   "default-https-client",
   "rt-tokio",
 ] }
