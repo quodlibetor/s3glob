@@ -224,7 +224,7 @@ impl S3GlobMatcher {
                     // might have no prefixes if we only found objects before any prefixes
                     if scan_might_help && !prefixes.is_empty() {
                         debug!(part = %part.display(), "scanning for keys in an Any");
-                        let (tx, mut rx) = tokio::sync::mpsc::channel(prefixes.len());
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
                         let mut tasks = Vec::new();
                         let semaphore = Arc::new(Semaphore::new(self.max_parallelism));
@@ -235,24 +235,23 @@ impl S3GlobMatcher {
                             let permit = semaphore.clone().acquire_owned().await;
                             let mut engine = engine.clone();
                             let prefix = prefix.clone();
-
-                            // if the prefix matches the regex, we can return it immediately
-                            if self.regex.is_match(&client_prefix) {
-                                tx.send(Ok((
-                                    prefix.clone(),
-                                    ScanResult::for_prefix(prefix.clone()),
-                                )))
-                                .await
-                                .unwrap();
-                            }
+                            let regex = self.regex.clone();
 
                             let task = tokio::spawn(async move {
+                                // if the prefix matches the regex, we can return it immediately
+                                if regex.is_match(&client_prefix) {
+                                    tx.send(Ok((
+                                        prefix.clone(),
+                                        ScanResult::for_prefix(prefix.clone()),
+                                    )))
+                                    .expect("send to unbounded channel always works");
+                                }
                                 match engine.scan_prefixes(&client_prefix, &delimiter).await {
                                     Ok(results) => {
-                                        let _ = tx.send(Ok((prefix, results))).await;
+                                        let _ = tx.send(Ok((prefix, results)));
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(Err(e)).await;
+                                        let _ = tx.send(Err(e));
                                     }
                                 }
                                 drop(permit);
