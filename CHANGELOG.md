@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.4.15](https://github.com/quodlibetor/s3glob/compare/v0.4.14...v0.4.15) - 2026-05-10
+
+### 🚀 Features
+
+- parallelize `**` listings via bounded BFS expansion by [@quodlibetor](https://github.com/quodlibetor) in [#104](https://github.com/quodlibetor/s3glob/pull/104)
+
+### 🐛 Bug Fixes
+
+- **(glob)** Fix two single-character may match delim bugs by [@quodlibetor](https://github.com/quodlibetor) in [47c82e4](https://github.com/quodlibetor/s3glob/commit/47c82e4a9f55488f4a573e12200c4b206ca8601b)
+- **(matcher)** fix deadlock in prefix discovery by [@quodlibetor](https://github.com/quodlibetor) in [#102](https://github.com/quodlibetor/s3glob/pull/102)
+- **(matcher)** canonical S3-correct prefix output by [@quodlibetor](https://github.com/quodlibetor) in [c2e4d7f](https://github.com/quodlibetor/s3glob/commit/c2e4d7fe0023e6f01990a5766d656f33de904218)
+
+### 📚 Documentation
+
+- README section on differences from globset and standard glob by [@quodlibetor](https://github.com/quodlibetor) in [2a23eb7](https://github.com/quodlibetor/s3glob/commit/2a23eb71ae9adaa6dfc8a413fee378d62f40fcf9)
+
+### 🧪 Testing
+
+- **(matcher)** Add proptests by [@quodlibetor](https://github.com/quodlibetor) in [#103](https://github.com/quodlibetor/s3glob/pull/103)
+
 ## [0.4.14](https://github.com/quodlibetor/s3glob/compare/v0.4.13...v0.4.14) - 2026-03-21
 
 ### 💼 Other
