@@ -74,8 +74,10 @@ Glob syntax supported:
 - `{a,b,c}` matches any of the comma-separated options (but nested globs are not
   supported). Empty alternatives are allowed: `{a,}` matches either `a` or
   the empty string.
-- `**` matches any number of characters, including the delimiter. This will
-  immediately force `s3glob` to scan all objects starting where it appears.
+- `**` matches any number of characters, including the delimiter. At a `**`,
+  `s3glob` discovers sub-prefixes via a bounded breadth-first walk so it can
+  list them in parallel; if your bucket shape isn't suited to that, pass
+  `--no-recursive-auto-parallel` to skip the walk.
 - A pattern (or any brace alternative) ending in `/` implicitly matches
   everything inside that directory: `s3glob ls 'foo/'` lists every object
   under `foo/`.
@@ -118,8 +120,15 @@ matching them recursively against the provided glob pattern.
 I have observed s3glob to be able to list hundreds of thousands of objects in a
 couple of seconds from within an ec2 instance.
 
-It has a few tricks that it uses to minimize the number of objects that need to
-listed, but all of those tricks end at the first recursive glob: `**`.
+A `**` is where prefix-narrowing ends — segments after it can't be turned
+into prefix filters. But `s3glob` still tries to parallelize the recursive
+listing itself: at the `**`, it walks one directory level at a time with
+delimiter-aware `LIST` calls and then scans the discovered sub-prefixes
+concurrently. For buckets with a broad subtree under `**` this turns a
+single-stream recursive list into a parallel scan. For buckets with extremely
+wide it can cost extra `LIST` calls without much payoff. Pass
+`--no-recursive-auto-parallel` to force `**` to immediately become a serial
+list.
 
 What this means in general is that, if you have a keyspace that looks like:
 

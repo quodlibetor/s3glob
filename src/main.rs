@@ -115,8 +115,19 @@ enum Command {
     ///
     /// You probably want the maximum parallelism possible. Because of the
     /// APIs provided by AWS, s3glob can only meaningfully issue parallel
-    /// requests for prefixes. Additionally, prefixes can only be generated
-    /// before a delimiter.
+    /// requests for distinct prefixes. Prefixes come from two places:
+    /// explicit glob components (`*`, `{a,b,c}`, `[abc]`) before a
+    /// delimiter, and automatic expansion at `**`.
+    ///
+    /// At a `**` component s3glob runs a bounded breadth-first
+    /// expansion: it walks one directory level at a time with `LIST`
+    /// calls until it has enough sub-prefixes to scan in parallel.
+    /// This typically helps for buckets with broad subtrees under
+    /// `**`. If your bucket shape makes the expansion
+    /// counter-productive (e.g. each level has only one sub-directory
+    /// so the expansion just costs extra LISTs) pass
+    /// `--no-recursive-auto-parallel` to skip the expansion and list
+    /// the `**` parent directly.
     ///
     /// So if you have a keyspace (using {..-..} to represent a range) that
     /// looks like:
@@ -126,8 +137,8 @@ enum Command {
     /// and you want to find all the text files where OBJECT_ID is 5, you have
     /// several options for patterns:
     ///
-    ///    1: s3glob ls bucket/**/5.txt    -- parallelism 1
-    ///    2: s3glob ls bucket/*/**/5.txt  -- parallelism 26
+    ///    1: s3glob ls bucket/**/5.txt    -- relies on `**` auto-expansion
+    ///    2: s3glob ls bucket/*/**/5.txt  -- parallelism >= 26
     ///    3: s3glob ls bucket/*/*/5.txt   -- parallelism 26,000
     ///
     /// Which one is best depends on exactly what you're searching for.
@@ -263,6 +274,28 @@ struct Opts {
     #[clap(short = 'M', long, global = true, default_value = "10000")]
     max_parallelism: usize,
 
+    /// Disable automatic parallelization of `**` (recursive) listings
+    ///
+    /// At a `**` glob component s3glob expands the frontier one
+    /// directory level at a time to discover sub-prefixes it can list
+    /// in parallel. This flag skips that expansion and lists the `**`
+    /// parent serially.
+    ///
+    /// Use this if the expansion is firing too many `LIST` calls for
+    /// your bucket's shape, or if you want predictable serial listing.
+    #[clap(long, global = true, action = ArgAction::SetTrue)]
+    no_recursive_auto_parallel: bool,
+
+    /// Target prefix count for `**` BFS expansion (escape hatch)
+    ///
+    /// The expansion loop at `**` runs while the discovered prefix
+    /// set is smaller than this. Lower to reduce expansion API
+    /// calls, raise to fan out more aggressively, `0` to skip the
+    /// loop entirely (`--no-recursive-auto-parallel` is the
+    /// supported way to do that).
+    #[clap(long, global = true, default_value = "25", hide = true)]
+    min_prefixes: usize,
+
     /// Use path-style S3 addressing
     ///
     /// By default s3glob uses the standard virtualhost-style addressing,
@@ -395,6 +428,12 @@ async fn run(opts: Opts) -> Result<()> {
         opts.cross_delim(),
     )?;
     matcher.set_max_parallelism(opts.max_parallelism);
+    let effective_min_prefixes = if opts.no_recursive_auto_parallel {
+        0
+    } else {
+        opts.min_prefixes
+    };
+    matcher.set_min_prefixes(effective_min_prefixes);
     let ListResult {
         status,
         totals,

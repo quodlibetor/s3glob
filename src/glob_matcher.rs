@@ -38,6 +38,13 @@ const MAX_CHECK_PREFIXES: usize = 10_000;
 /// than 1
 const DESIRED_MIN_PREFIXES: usize = 25;
 
+/// Single-page LIST cap used for the per-prefix density probe at `**`.
+///
+/// 1000 is the maximum S3 honours for `max-keys`; if a prefix's full
+/// content fits in one page we can resolve it in a single round-trip
+/// without exploding into per-sub-prefix listings.
+const PROBE_MAX_KEYS: i32 = 1000;
+
 /// A thing that knows how to generate and filter S3 prefixes based on a glob pattern
 #[derive(Debug, Clone)]
 pub struct S3GlobMatcher {
@@ -47,6 +54,8 @@ pub struct S3GlobMatcher {
     regex: Regex,
     max_parallelism: usize,
     min_prefixes: usize,
+    max_prefixes: usize,
+    probe_max_keys: i32,
     /// True if no further listing needs to be done by the caller
     ///
     /// Generally anything that does not contain a ** will be complete
@@ -136,6 +145,8 @@ impl S3GlobMatcher {
             regex,
             max_parallelism: 500,
             min_prefixes: DESIRED_MIN_PREFIXES,
+            max_prefixes: MAX_PREFIXES,
+            probe_max_keys: PROBE_MAX_KEYS,
             is_complete,
             cross_delim,
         })
@@ -238,8 +249,18 @@ impl S3GlobMatcher {
             // prefix, instead of allowing aws to list them for us.
             match part {
                 glob::Glob::Recursive => {
-                    // we can also skip the last part if it's not a negated character class
-                    debug!("found recursive glob, stopping prefix generation");
+                    debug!("reached **, beginning bounded BFS expansion");
+                    let initial = std::mem::take(&mut prefixes);
+                    prefixes = self
+                        .expand_recursive_frontier(
+                            &engine,
+                            &delimiter,
+                            initial,
+                            &mut objects,
+                            &mut max_prefixes_observed,
+                        )
+                        .await?;
+                    max_prefixes_observed = max_prefixes_observed.max(prefixes.len());
                     break;
                 }
                 // Any is the only place where we actually need to hit the
@@ -274,7 +295,7 @@ impl S3GlobMatcher {
                                     )))
                                     .expect("send to unbounded channel always works");
                                 }
-                                match engine.scan_prefixes(&client_prefix, &delimiter).await {
+                                match engine.scan_prefixes(&client_prefix, &delimiter, None).await {
                                     Ok(results) => {
                                         let _ = tx.send(Ok((prefix, results)));
                                     }
@@ -304,9 +325,8 @@ impl S3GlobMatcher {
                             if !objects_updated {
                                 objects_updated = !results.objects.is_empty();
                             }
-                            objects.extend(results.objects.into_iter().filter(|obj| {
-                                obj.key.as_ref().is_some_and(|key| self.regex.is_match(key))
-                            }));
+                            objects
+                                .extend(results.objects.into_iter().filter(|o| self.match_obj(o)));
                             new_prefix_count = new_prefixes.len();
                             if new_prefix_count >= MAX_PREFIXES {
                                 debug!(
@@ -648,10 +668,219 @@ impl S3GlobMatcher {
         self.is_complete
     }
 
-    #[cfg(test)]
-    fn set_min_prefixes(&mut self, min_prefixes: usize) {
+    /// True if `obj`'s key matches the full compiled regex.
+    fn match_obj(&self, obj: &Object) -> bool {
+        obj.key.as_ref().is_some_and(|key| self.regex.is_match(key))
+    }
+
+    /// Bounded BFS prefix expansion at a `**` glob component.
+    ///
+    /// Expands `initial` one directory level at a time until we reach
+    /// `min_prefixes`, exhaust the frontier, or hit `max_prefixes`.
+    /// Returns the final settled-plus-frontier set; any objects
+    /// resolved along the way are appended to `objects`.
+    ///
+    /// Each round runs two phases per frontier prefix:
+    ///   1. Probe with a single delimiter-less LIST (max_keys =
+    ///      probe_max_keys). Non-truncated probes mean the prefix's
+    ///      full content fits in one call; matching keys go to
+    ///      `objects` and the prefix is dropped. Truncated probes
+    ///      queue the prefix for phase 2.
+    ///   2. Scan with delimiter and a max-prefixes cap. Truncated
+    ///      scans (cap hit or flat-dense parent) settle the parent
+    ///      for `get_all_children`. Leaf scans (truncated=false, no
+    ///      sub-prefixes) forward their complete content like phase 1
+    ///      and drop the prefix. Branch scans replace the parent
+    ///      with sub-prefixes and carry direct objects forward.
+    async fn expand_recursive_frontier<E: Engine + Clone>(
+        &self,
+        engine: &E,
+        delimiter: &str,
+        initial: BTreeSet<String>,
+        objects: &mut Vec<Object>,
+        max_prefixes_observed: &mut usize,
+    ) -> Result<BTreeSet<String>> {
+        let probe_max_keys = self.probe_max_keys;
+        let mut settled: BTreeSet<String> = BTreeSet::new();
+        let mut frontier = initial;
+
+        while settled.len() + frontier.len() < self.min_prefixes && !frontier.is_empty() {
+            debug!(
+                settled_count = settled.len(),
+                frontier_count = frontier.len(),
+                min_prefixes = self.min_prefixes,
+                "too few prefixes at **, expanding one directory level"
+            );
+
+            // Phase 1: parallel probe of the frontier.
+            let probe_results = {
+                let engine = engine.clone();
+                fan_out_per_prefix(&frontier, self.max_parallelism, move |prefix| {
+                    let mut engine = engine.clone();
+                    async move { engine.probe_prefix(&prefix, probe_max_keys).await }
+                })
+                .await
+            };
+
+            let mut to_scan = BTreeSet::new();
+            for (prefix, result) in probe_results {
+                let probe = result.context("probing prefix at **")?;
+                if probe.truncated {
+                    to_scan.insert(prefix);
+                } else {
+                    // Sparse prefix: probe returned complete content.
+                    objects.extend(probe.objects.into_iter().filter(|o| self.match_obj(o)));
+                }
+            }
+
+            if to_scan.is_empty() {
+                debug!("all frontier prefixes resolved by probe, stopping");
+                frontier.clear();
+                break;
+            }
+
+            // Phase 2: capped delimiter-aware scan of the dense prefixes.
+            let scan_cap = self.max_parallelism;
+            let scan_results = {
+                let engine = engine.clone();
+                let delimiter = delimiter.to_string();
+                fan_out_per_prefix(&to_scan, self.max_parallelism, move |prefix| {
+                    let mut engine = engine.clone();
+                    let delimiter = delimiter.clone();
+                    async move {
+                        engine
+                            .scan_prefixes(&prefix, &delimiter, Some(scan_cap))
+                            .await
+                    }
+                })
+                .await
+            };
+
+            let mut new_frontier = BTreeSet::new();
+            let mut made_progress = false;
+            for (prefix, result) in scan_results {
+                let scan_result = result.context("expanding prefixes at **")?;
+                if scan_result.truncated {
+                    // Cap hit (too wide) or page-budget exhausted
+                    // looking for non-existent sub-prefixes. Either
+                    // way, parallel expansion isn't worth it; hand the
+                    // parent to get_all_children.
+                    debug!(
+                        %prefix,
+                        sub_prefix_count = scan_result.prefixes.len(),
+                        "scan truncated, falling back to parent listing"
+                    );
+                    settled.insert(prefix);
+                } else if scan_result.prefixes.is_empty() {
+                    // True leaf with complete content: forward objects
+                    // like the probe-resolved sparse path, skipping
+                    // the get_all_children re-list entirely.
+                    objects.extend(
+                        scan_result
+                            .objects
+                            .into_iter()
+                            .filter(|o| self.match_obj(o)),
+                    );
+                } else {
+                    made_progress = true;
+                    new_frontier.extend(scan_result.prefixes);
+                    // Direct objects at a branch prefix would be lost
+                    // when we drop the parent in favor of its children.
+                    // Carry them forward.
+                    objects.extend(
+                        scan_result
+                            .objects
+                            .into_iter()
+                            .filter(|o| self.match_obj(o)),
+                    );
+                }
+            }
+
+            if !made_progress {
+                debug!("no sub-directories found during ** expansion, stopping");
+                frontier.clear();
+                break;
+            }
+
+            let total_after = settled.len() + new_frontier.len();
+            *max_prefixes_observed = (*max_prefixes_observed).max(total_after);
+
+            if total_after >= self.max_prefixes {
+                let cap = self.max_prefixes;
+                warn!(
+                    new_prefix_count = total_after,
+                    "found over {cap} prefixes during ** expansion, stopping"
+                );
+                frontier = new_frontier;
+                break;
+            }
+
+            frontier = new_frontier;
+        }
+
+        Ok(settled.into_iter().chain(frontier).collect())
+    }
+
+    /// Set the BFS target prefix count at `**`.
+    ///
+    /// The expansion loop runs while `settled + frontier < min_prefixes`.
+    /// Setting this to `0` (or any value the initial frontier already
+    /// exceeds) skips the loop entirely, so the `**` falls straight
+    /// through to a single-prefix recursive listing in
+    /// `get_all_children`.
+    pub fn set_min_prefixes(&mut self, min_prefixes: usize) {
         self.min_prefixes = min_prefixes;
     }
+
+    #[cfg(test)]
+    fn set_probe_max_keys(&mut self, probe_max_keys: i32) {
+        self.probe_max_keys = probe_max_keys;
+    }
+
+    #[cfg(test)]
+    fn set_max_prefixes(&mut self, max_prefixes: usize) {
+        self.max_prefixes = max_prefixes;
+    }
+}
+
+/// Run `make` over each prefix in parallel, bounded by
+/// `max_parallelism`, and return one `(prefix, Result)` per input.
+///
+/// `make` is called once per prefix with the owned `String` and must
+/// produce a `Send + 'static` future — the helper does the
+/// `tokio::spawn` and `Semaphore`-bounded channel collection.
+async fn fan_out_per_prefix<T, F, Fut>(
+    prefixes: &BTreeSet<String>,
+    max_parallelism: usize,
+    mut make: F,
+) -> Vec<(String, Result<T>)>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    if prefixes.is_empty() {
+        return Vec::new();
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::channel(prefixes.len());
+    let semaphore = Arc::new(Semaphore::new(max_parallelism));
+    for prefix in prefixes {
+        let prefix = prefix.clone();
+        let tx = tx.clone();
+        let permit = semaphore.clone().acquire_owned().await;
+        let fut = make(prefix.clone());
+        tokio::spawn(async move {
+            let result = fut.await;
+            drop(permit);
+            let _ = tx.send((prefix, result)).await;
+        });
+    }
+    drop(tx);
+    let mut out = Vec::with_capacity(prefixes.len());
+    while let Some(item) = rx.recv().await {
+        out.push(item);
+    }
+    out
 }
 
 async fn check_prefixes(
@@ -834,6 +1063,608 @@ mod tests {
         assert!(prefixes == vec!["src/"]);
         let e: &[(&str, &str)] = &[];
         engine.assert_calls(e);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_expands_when_few_prefixes() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        let mut scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(3);
+        // Force the scan path: pretend the probe always says "more exists"
+        // so we drop to delimiter-aware enumeration.
+        scanner.set_probe_max_keys(1);
+        let engine = MockS3Engine::new(vec![
+            "src/bar/test.rs".to_string(),
+            "src/baz/test.rs".to_string(),
+            "src/foo/test.rs".to_string(),
+        ]);
+
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
+        // src/ has 3 sub-dirs: bar/, baz/, foo/ — one expansion round reaches min_prefixes
+        assert!(prefixes == vec!["src/bar/", "src/baz/", "src/foo/"]);
+        engine.assert_calls(&[("src/", "/")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_expands_multiple_levels() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        let mut scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(3);
+        scanner.set_probe_max_keys(1);
+        // src/ has only one sub-dir; a second level is needed to reach min_prefixes
+        let engine = MockS3Engine::new(vec![
+            "src/foo/a/test.rs".to_string(),
+            "src/foo/b/test.rs".to_string(),
+            "src/foo/c/test.rs".to_string(),
+        ]);
+
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
+        // Round 1: src/ → src/foo/ (1 prefix < 3)
+        // Round 2: src/foo/ → src/foo/a/, src/foo/b/, src/foo/c/ (3 prefixes >= 3)
+        assert!(prefixes == vec!["src/foo/a/", "src/foo/b/", "src/foo/c/"]);
+        engine.assert_calls(&[("src/", "/"), ("src/foo/", "/")]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_forwards_leaf_objects() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // When a scan returns `truncated=false` with no sub-prefixes
+        // the scan already paged through the leaf's complete content.
+        // The BFS forwards those objects directly (mirroring the
+        // probe-resolved sparse path) and drops the prefix — no need
+        // for `get_all_children` to re-list it. This saves one API
+        // call per leaf in production.
+        let mut scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(3);
+        // probe_max_keys=1 forces every prefix's probe to truncate, so
+        // leaf classification comes from the scan arm (not probe).
+        scanner.set_probe_max_keys(1);
+        let paths = vec![
+            "src/bar/a/one.rs".to_string(),
+            "src/bar/a/two.rs".to_string(),
+            "src/foo/one.rs".to_string(),
+            "src/foo/two.rs".to_string(),
+        ];
+        let engine = MockS3Engine::new(paths.clone());
+
+        let presult = scanner.find_prefixes(engine.clone()).await?;
+        // Round 1: scan(src/) → branch into {src/bar/, src/foo/}.
+        // Round 2: scan(src/bar/) → branch (src/bar/a/);
+        //          scan(src/foo/) → leaf → forward two .rs files.
+        // Round 3: scan(src/bar/a/) → leaf → forward two .rs files.
+        // Final: presult.prefixes empty; presult.objects has all four.
+        assert!(
+            presult.prefixes.is_empty(),
+            "leaf forwarding should empty the prefix set, got: {:?}",
+            presult.prefixes,
+        );
+        let mut object_keys: Vec<String> = presult
+            .objects
+            .iter()
+            .filter_map(|o| o.key.clone())
+            .collect();
+        object_keys.sort();
+        let mut expected = paths.clone();
+        expected.sort();
+        assert!(
+            object_keys == expected,
+            "expected all four matching keys forwarded;\n  got:      {object_keys:?}\n  expected: {expected:?}",
+        );
+        // Round 2 spawns scan(src/bar/) and scan(src/foo/) in parallel,
+        // so their relative order is non-deterministic.
+        engine.assert_call_set(&[
+            ("src/", "/"),
+            ("src/bar/", "/"),
+            ("src/foo/", "/"),
+            ("src/bar/a/", "/"),
+        ]);
+
+        // End-to-end: with prefixes empty, `get_all_children` does no
+        // listing work and just forwards the already-collected objects.
+        // Each matching key is emitted exactly once.
+        let mut result = scanner
+            .get_objects(MockS3Engine::new(paths.clone()))
+            .await?;
+        let mut keys: Vec<String> = Vec::new();
+        while let Some(batch) = result.rx.recv().await {
+            for r in batch {
+                if let PrefixResult::Object(obj) = r {
+                    keys.push(obj.key);
+                }
+            }
+        }
+        keys.sort();
+        assert!(
+            keys == expected,
+            "expected each matching key emitted once via leaf forwarding;\n  got:      {keys:?}\n  expected: {expected:?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_no_expansion_when_enough_prefixes() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // Start with multiple prefixes before ** — no expansion needed
+        let mut scanner = S3GlobMatcher::parse("{a,b,c}/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(3);
+        let engine = MockS3Engine::new(vec![
+            "a/test.rs".to_string(),
+            "b/test.rs".to_string(),
+            "c/test.rs".to_string(),
+        ]);
+
+        let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
+        // Already 3 prefixes (a/, b/, c/) — no expansion calls needed
+        assert!(prefixes == vec!["a/", "b/", "c/"]);
+        // check_prefixes is called (for the Choice part), but no scan_prefixes for **
+        let calls = engine.calls.lock().unwrap();
+        assert!(
+            calls.is_empty(),
+            "expected no scan_prefixes calls, got: {calls:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_resolves_sparse_via_probe() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // Default probe_max_keys=1000 — small bucket fits in one probe call,
+        // no scan is needed.
+        let mut scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(25);
+        let engine = MockS3Engine::new(vec![
+            "src/bar/test.rs".to_string(),
+            "src/foo/test.rs".to_string(),
+        ]);
+
+        let presult = scanner.find_prefixes(engine.clone()).await?;
+        // Probe returned 2 keys, not truncated → both resolved directly.
+        assert!(presult.prefixes.is_empty());
+        let object_keys: Vec<String> = presult
+            .objects
+            .iter()
+            .filter_map(|o| o.key.clone())
+            .collect();
+        assert!(object_keys.contains(&"src/bar/test.rs".to_string()));
+        assert!(object_keys.contains(&"src/foo/test.rs".to_string()));
+        // No delimiter-aware scan was needed.
+        let scan_calls = engine.calls.lock().unwrap();
+        assert!(
+            scan_calls.is_empty(),
+            "expected no scan_prefixes calls, got: {scan_calls:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_objects_recursive_forwards_probe_resolved_objects() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // Regression guard: when the probe phase at `**` resolves a sparse
+        // prefix in one call, matching keys are stashed in `presult.objects`
+        // and the prefix is dropped from the frontier. `get_all_children`
+        // must forward those objects to the output channel — if it ever
+        // stops doing so, sparse `**` queries silently return zero matches.
+        let scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
+        let engine = MockS3Engine::new(vec![
+            "src/bar/test.rs".to_string(),
+            "src/foo/sub/deep.rs".to_string(),
+            "src/foo/test.rs".to_string(),
+            // non-matching key under the same prefix; must NOT appear
+            "src/skip.txt".to_string(),
+        ]);
+
+        let mut result = scanner.get_objects(engine).await?;
+
+        let mut keys: Vec<String> = Vec::new();
+        while let Some(batch) = result.rx.recv().await {
+            for r in batch {
+                if let PrefixResult::Object(obj) = r {
+                    keys.push(obj.key);
+                }
+            }
+        }
+        keys.sort();
+
+        assert!(
+            keys == vec![
+                "src/bar/test.rs".to_string(),
+                "src/foo/sub/deep.rs".to_string(),
+                "src/foo/test.rs".to_string(),
+            ],
+            "expected probe-resolved objects forwarded to channel, got: {keys:?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_objects_recursive_no_duplicate_emissions_with_mixed_outcomes() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // Regression guard: across rounds of `**` expansion with mixed
+        // leaf/branch/truncated outcomes, the final prefix set must
+        // not contain both an ancestor and one of its descendants —
+        // otherwise `get_all_children` would double-list everything
+        // under the descendant.
+        //
+        // Scenario: `{a,b,c}/**/*.rs` pre-populates the initial frontier
+        // with three sibling prefixes so we exercise the BFS without
+        // depending on round-1 src/ scan behavior. With probe_max_keys=1
+        // and ≥2 keys per prefix every probe truncates; cap=3 so:
+        //   Round 1: a/ → leaf (forward 2 objects);
+        //            b/ → 1 sub-dir (branch, new_frontier += b/x/);
+        //            c/ → 4 sub-dirs (> cap) → truncated (settled).
+        //   Round 2: b/x/ → leaf (forward 2 objects); break.
+        //   Final: settled={c/}, objects=[a/*, b/x/*]. Only c/ remains
+        //   in prefixes — neither it nor its descendants overlap with
+        //   anything else in the result.
+        let mut scanner = S3GlobMatcher::parse("{a,b,c}/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(10);
+        scanner.set_probe_max_keys(1);
+        scanner.set_max_parallelism(3);
+
+        let paths = vec![
+            "a/file1.rs".to_string(),
+            "a/file2.rs".to_string(),
+            "b/x/file1.rs".to_string(),
+            "b/x/file2.rs".to_string(),
+            "c/p/f.rs".to_string(),
+            "c/q/f.rs".to_string(),
+            "c/r/f.rs".to_string(),
+            "c/s/f.rs".to_string(),
+        ];
+
+        // Sanity: the scenario actually exercised mixed BFS outcomes
+        // — the truncated parent c/ stays in prefixes, the leaves go
+        // to objects.
+        let presult = scanner
+            .find_prefixes(MockS3Engine::new(paths.clone()))
+            .await?;
+        assert!(
+            presult.prefixes == vec!["c/".to_string()],
+            "expected only the truncated parent in prefixes, got: {:?}",
+            presult.prefixes,
+        );
+        let mut object_keys: Vec<String> = presult
+            .objects
+            .iter()
+            .filter_map(|o| o.key.clone())
+            .collect();
+        object_keys.sort();
+        assert!(
+            object_keys
+                == vec![
+                    "a/file1.rs".to_string(),
+                    "a/file2.rs".to_string(),
+                    "b/x/file1.rs".to_string(),
+                    "b/x/file2.rs".to_string(),
+                ],
+            "expected leaf-forwarded objects from a/ and b/x/, got: {object_keys:?}",
+        );
+
+        // Invariant 1: no element of presult.prefixes is a strict
+        // prefix of another. presult.prefixes is sorted, so consecutive
+        // pairs suffice — any X that is a strict prefix of any Y is
+        // adjacent to *some* Y' it strictly precedes.
+        for window in presult.prefixes.windows(2) {
+            let (a, b) = (&window[0], &window[1]);
+            assert!(
+                !(a != b && b.starts_with(a.as_str())),
+                "prefix {a:?} is a strict ancestor of {b:?} in {:?}",
+                presult.prefixes,
+            );
+        }
+
+        // Invariant 2: get_objects emits each matching key exactly
+        // once. A bug that admitted overlapping prefixes would surface
+        // here as duplicate emissions even if invariant 1 missed it.
+        let mut result = scanner
+            .get_objects(MockS3Engine::new(paths.clone()))
+            .await?;
+        let mut keys: Vec<String> = Vec::new();
+        while let Some(batch) = result.rx.recv().await {
+            for r in batch {
+                if let PrefixResult::Object(obj) = r {
+                    keys.push(obj.key);
+                }
+            }
+        }
+        keys.sort();
+
+        let mut expected = paths;
+        expected.sort();
+        assert!(
+            keys == expected,
+            "expected each matching key emitted exactly once;\n  got:      {keys:?}\n  expected: {expected:?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_falls_back_when_scan_capped() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // 5 sub-dirs but max_parallelism=2 caps the scan. The mock
+        // returns truncated when sub-prefix count exceeds the cap, which
+        // triggers the parent-fallback path: the original prefix stays
+        // in the final set instead of being replaced by partial children.
+        let mut scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(25);
+        scanner.set_probe_max_keys(1);
+        scanner.set_max_parallelism(2);
+        let engine = MockS3Engine::new(vec![
+            "src/a/x.rs".to_string(),
+            "src/b/x.rs".to_string(),
+            "src/c/x.rs".to_string(),
+            "src/d/x.rs".to_string(),
+            "src/e/x.rs".to_string(),
+        ]);
+
+        let presult = scanner.find_prefixes(engine.clone()).await?;
+        assert!(
+            presult.prefixes == vec!["src/"],
+            "expected fallback to parent, got prefixes={:?}",
+            presult.prefixes,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_keeps_branch_direct_objects() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // src/foo/ is a *branch*: it has a sub-dir (src/foo/sub/) AND a direct
+        // file (src/foo/bar.rs). Both files match `src/**/*.rs`, so neither
+        // may be lost when expansion replaces src/foo/ with src/foo/sub/.
+        let mut scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(3);
+        // Force scan path so we exercise the branch-direct-object case
+        // instead of letting the probe resolve everything.
+        scanner.set_probe_max_keys(1);
+        let paths = vec![
+            "src/foo/bar.rs".to_string(),
+            "src/foo/sub/baz.rs".to_string(),
+        ];
+
+        let presult = scanner
+            .find_prefixes(MockS3Engine::new(paths.clone()))
+            .await?;
+
+        // After expansion, src/foo/ is replaced by src/foo/sub/. For
+        // src/foo/bar.rs to remain reachable end-to-end, it must be carried
+        // forward in presult.objects (mirroring what the Any arm does).
+        let object_keys: Vec<String> = presult
+            .objects
+            .iter()
+            .filter_map(|o| o.key.clone())
+            .collect();
+        assert!(
+            object_keys.iter().any(|k| k == "src/foo/bar.rs"),
+            "expected src/foo/bar.rs in presult.objects, prefixes={:?} objects={:?}",
+            presult.prefixes,
+            object_keys,
+        );
+        // End-to-end check: both files reachable, neither emitted twice.
+        // This is what the test name actually claims — "neither file
+        // is lost". Whether src/foo/sub/baz.rs comes through via a
+        // covering prefix or via probe-resolved objects depends on the
+        // BFS scheduling; either path is correct, but neither file may
+        // be missing or duplicated in the output.
+        let mut result = scanner
+            .get_objects(MockS3Engine::new(paths.clone()))
+            .await?;
+        let mut keys: Vec<String> = Vec::new();
+        while let Some(batch) = result.rx.recv().await {
+            for r in batch {
+                if let PrefixResult::Object(obj) = r {
+                    keys.push(obj.key);
+                }
+            }
+        }
+        keys.sort();
+        let mut expected = paths;
+        expected.sort();
+        assert!(
+            keys == expected,
+            "expected both files emitted exactly once;\n  got:      {keys:?}\n  expected: {expected:?}",
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_stops_at_max_prefixes() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // The BFS has a hard cap (`max_prefixes`) that aborts expansion
+        // once total prefixes (settled + new_frontier) reach it. Without
+        // a test, off-by-one or "forgot to seed `frontier = new_frontier`
+        // before break" regressions would silently produce truncated
+        // results.
+        //
+        // Scenario: scan(src/) branches into 10 sub-prefixes. With the
+        // BFS cap set to 5, total_after=10 ≥ 5 fires the warn-and-break
+        // path which keeps `new_frontier` as the partial result.
+        let mut scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
+        // High enough that we'd otherwise keep expanding past round 1.
+        scanner.set_min_prefixes(100);
+        scanner.set_probe_max_keys(1);
+        scanner.set_max_prefixes(5);
+        // Cap the per-scan sub-prefix budget high enough that all 10
+        // children come through without scan-level truncation.
+        scanner.set_max_parallelism(20);
+        let paths: Vec<String> = (0..10)
+            .flat_map(|i| vec![format!("src/d{i:02}/a.rs"), format!("src/d{i:02}/b.rs")])
+            .collect();
+        let engine = MockS3Engine::new(paths);
+
+        let presult = scanner.find_prefixes(engine).await?;
+
+        // The cap fired and kept the full new_frontier of 10 sub-dirs.
+        assert!(
+            presult.prefixes.len() == 10,
+            "expected 10 partial-frontier prefixes after cap, got {}: {:?}",
+            presult.prefixes.len(),
+            presult.prefixes,
+        );
+        // Every kept prefix is a sub-dir of src/ — confirms we kept the
+        // expanded children, not the original frontier.
+        for p in &presult.prefixes {
+            assert!(
+                p.starts_with("src/d") && p.ends_with('/'),
+                "unexpected prefix in capped result: {p:?}",
+            );
+        }
+        // High-water mark should reflect the cap-trigger value.
+        assert!(
+            presult.max_prefixes_observed >= 10,
+            "max_prefixes_observed must be ≥ 10 after cap, got {}",
+            presult.max_prefixes_observed,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_settles_flat_dense_prefix() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // The real `S3Engine::scan_prefixes` fires a page-budget guard
+        // (`prefixes.is_empty() && pages_seen >= ceil(max/1000)`) that
+        // returns `truncated=true` with no sub-prefixes for flat-dense
+        // parents. The BFS treats that the same as cap-hit truncation
+        // — settle the parent and let `get_all_children` re-list it.
+        // The mock simulates this via `with_forced_truncation`.
+        //
+        // Scenario: src/dense/ pretends to be flat-dense (forced
+        // truncate). src/sparse/ has one file and is probe-resolvable.
+        // The two prefixes exercise different settle paths in the same
+        // run.
+        let mut scanner = S3GlobMatcher::parse("src/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(10);
+        scanner.set_probe_max_keys(1);
+        scanner.set_max_parallelism(20);
+        let paths = vec![
+            "src/dense/f001.rs".to_string(),
+            "src/dense/f002.rs".to_string(),
+            "src/dense/f003.rs".to_string(),
+            "src/sparse/x.rs".to_string(),
+        ];
+        let engine = MockS3Engine::new(paths.clone()).with_forced_truncation(["src/dense/"]);
+
+        let presult = scanner.find_prefixes(engine).await?;
+
+        // src/dense/ must end up settled (not expanded into children
+        // and not dropped); src/sparse/ probe-resolves to objects.
+        assert!(
+            presult.prefixes.contains(&"src/dense/".to_string()),
+            "expected src/dense/ settled via flat-dense fallback, got: {:?}",
+            presult.prefixes,
+        );
+        assert!(
+            !presult
+                .prefixes
+                .iter()
+                .any(|p| p.starts_with("src/dense/f")),
+            "flat-dense prefix must not be expanded into per-file children, got: {:?}",
+            presult.prefixes,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_find_prefixes_recursive_mixed_probe_outcomes() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // Within one round, the probe phase classifies each frontier
+        // prefix independently: some return non-truncated (sparse →
+        // pulled into objects, dropped) and some return truncated
+        // (dense → handed to phase-2 scan). All previous tests force
+        // every probe to truncate (probe_max_keys=1) or none to. This
+        // covers the genuine mix.
+        //
+        // Scenario: probe_max_keys=2.
+        //   a/ has 1 file → 1≤2, probe resolves, dropped from frontier.
+        //   b/ has 5 files → 5>2, probe truncates → scan settles as
+        //                    leaf (no sub-dirs).
+        //   c/ has 3 sub-dirs each with 1 file → 3>2, probe truncates
+        //                    → scan branches into 3.
+        let mut scanner = S3GlobMatcher::parse("{a,b,c}/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(10);
+        scanner.set_probe_max_keys(2);
+        scanner.set_max_parallelism(20);
+        let paths = vec![
+            "a/only.rs".to_string(),
+            "b/f1.rs".to_string(),
+            "b/f2.rs".to_string(),
+            "b/f3.rs".to_string(),
+            "b/f4.rs".to_string(),
+            "b/f5.rs".to_string(),
+            "c/x/f.rs".to_string(),
+            "c/y/f.rs".to_string(),
+            "c/z/f.rs".to_string(),
+        ];
+        let engine = MockS3Engine::new(paths.clone());
+
+        // a/'s probe produced 1 key (objects forwarded); b/ scan empty
+        // (settled); c/ scan branched. Round 1 probes all three; later
+        // rounds may probe further descendants (c/x/, c/y/, c/z/).
+        let presult = scanner.find_prefixes(engine.clone()).await?;
+        let probes: Vec<String> = engine
+            .probe_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        for sibling in ["a/", "b/", "c/"] {
+            assert!(
+                probes.iter().any(|p| p == sibling),
+                "expected probe of {sibling:?} in round 1, got probes: {probes:?}",
+            );
+        }
+        // a/ resolves via probe → not in scan-call set; b/ and c/ do.
+        let scan_calls: Vec<String> = engine
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert!(
+            !scan_calls.contains(&"a/".to_string()),
+            "a/ should be probe-resolved, but scan was called for it. scan calls: {scan_calls:?}",
+        );
+        assert!(
+            scan_calls.contains(&"b/".to_string()) && scan_calls.contains(&"c/".to_string()),
+            "b/ and c/ both must be scanned. scan calls: {scan_calls:?}",
+        );
+
+        // End-to-end: every matching key emitted exactly once.
+        let mut result = scanner
+            .get_objects(MockS3Engine::new(paths.clone()))
+            .await?;
+        let mut keys: Vec<String> = Vec::new();
+        while let Some(batch) = result.rx.recv().await {
+            for r in batch {
+                if let PrefixResult::Object(obj) = r {
+                    keys.push(obj.key);
+                }
+            }
+        }
+        keys.sort();
+        let mut expected = paths;
+        expected.sort();
+        assert!(
+            keys == expected,
+            "expected each matching key emitted exactly once;\n  got:      {keys:?}\n  expected: {expected:?}",
+        );
+        // Sanity: presult had a non-trivial mix — at least one settled
+        // (b/), one expanded (c/x/, c/y/, c/z/), and a/ pulled into
+        // objects. Anchor the test to that mix.
+        let object_keys: Vec<String> = presult
+            .objects
+            .iter()
+            .filter_map(|o| o.key.clone())
+            .collect();
+        assert!(
+            object_keys.contains(&"a/only.rs".to_string()),
+            "a/only.rs should be in presult.objects via probe resolution, got: {object_keys:?}",
+        );
         Ok(())
     }
 
