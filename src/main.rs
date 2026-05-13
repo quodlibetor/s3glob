@@ -1,4 +1,4 @@
-use std::io::IsTerminal as _;
+use std::io::{self, IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -460,11 +460,20 @@ async fn run(opts: Opts) -> Result<()> {
             } else {
                 None
             };
-            while let Some(results) = rx.recv().await {
+            let mut stdout = io::stdout().lock();
+            'recv: while let Some(results) = rx.recv().await {
                 match_count += results.len();
                 if stream {
                     for result in results {
-                        print_prefix_result(&bucket, &user_format, decimal, result);
+                        if !keep_writing(write_prefix_result(
+                            &mut stdout,
+                            &bucket,
+                            &user_format,
+                            decimal,
+                            result,
+                        ))? {
+                            break 'recv;
+                        }
                     }
                 } else {
                     matching_objects.extend(results);
@@ -483,13 +492,26 @@ async fn run(opts: Opts) -> Result<()> {
                     ));
                 }
             }
+            // Done receiving. Dropping the receiver lets the matcher's senders
+            // fail fast if we broke out early on a closed pipe. In-flight S3
+            // list calls still finish their current page, but nothing new is
+            // queued.
+            drop(rx);
             if let Some(matches_progress) = &matches_progress {
                 matches_progress.finish_and_clear();
             }
             let mut objects = matching_objects;
             objects.sort_by_key(|r| r.key().to_owned());
             for obj in objects {
-                print_prefix_result(&bucket, &user_format, decimal, obj);
+                if !keep_writing(write_prefix_result(
+                    &mut stdout,
+                    &bucket,
+                    &user_format,
+                    decimal,
+                    obj,
+                ))? {
+                    break;
+                }
             }
             progressln!(
                 "Matched {}/{} objects across {} prefixes in {:?}",
@@ -623,8 +645,13 @@ async fn run(opts: Opts) -> Result<()> {
             }
 
             files.sort_unstable();
-            for path in files {
-                println!("{}", path);
+            {
+                let mut stdout = io::stdout().lock();
+                for path in &files {
+                    if !keep_writing(writeln!(stdout, "{}", path))? {
+                        break;
+                    }
+                }
             }
             let dl_ms = start_time.elapsed().as_millis() as u64;
             progressln!(
@@ -644,19 +671,38 @@ async fn run(opts: Opts) -> Result<()> {
     Ok(())
 }
 
-fn print_prefix_result(
+fn write_prefix_result(
+    stdout: &mut io::StdoutLock<'_>,
     bucket: &str,
     user_format: &Option<Vec<FormatToken>>,
     decimal: FormatSizeOptions,
     result: PrefixResult,
-) {
+) -> io::Result<()> {
     if let Some(user_fmt) = user_format {
-        print_user(bucket, &result, user_fmt);
+        writeln!(stdout, "{}", format_user(bucket, &result, user_fmt))
     } else {
         match result {
-            PrefixResult::Object(obj) => print_default(&obj, decimal),
-            PrefixResult::Prefix(prefix) => println!("PRE     {prefix}"),
+            PrefixResult::Object(obj) => writeln!(
+                stdout,
+                "{:>10}   {:>7}   {}",
+                obj.last_modified,
+                SizeFormatter::new(obj.size as u64, decimal).to_string(),
+                obj.key,
+            ),
+            PrefixResult::Prefix(prefix) => writeln!(stdout, "PRE     {prefix}"),
         }
+    }
+}
+
+/// Classify the result of a write to stdout.
+///
+/// Returns `Ok(true)` to keep writing, `Ok(false)` when the reader has gone
+/// away, and `Err` for an unknown write error.
+fn keep_writing(result: io::Result<()>) -> Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -804,19 +850,6 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
         tokens.push(FormatToken::Literal(current_literal.clone()));
     }
     Ok(tokens)
-}
-
-fn print_default(obj: &S3Object, format: FormatSizeOptions) {
-    println!(
-        "{:>10}   {:>7}   {}",
-        obj.last_modified,
-        SizeFormatter::new(obj.size as u64, format).to_string(),
-        obj.key,
-    );
-}
-
-fn print_user(bucket: &str, obj: &PrefixResult, tokens: &[FormatToken]) {
-    println!("{}", format_user(bucket, obj, tokens));
 }
 
 fn format_user(bucket: &str, obj: &PrefixResult, tokens: &[FormatToken]) -> String {

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::env;
+use std::io::{BufRead, BufReader};
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
@@ -795,4 +796,70 @@ impl LogConsumer for LogPrinter {
         }
         .boxed()
     }
+}
+
+/// Closing stdout early (e.g. piping to `head`) should not panic or
+/// crash; s3glob must exit cleanly with status 0.
+#[tokio::test]
+async fn test_ls_pipe_closed_early_exits_cleanly() -> anyhow::Result<()> {
+    use std::process::{Command as StdCommand, Stdio};
+
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "pipe-test";
+    client.create_bucket().bucket(bucket).send().await?;
+    for i in 0..200 {
+        create_object(&client, bucket, &format!("prefix/{i:04}/file.txt")).await?;
+    }
+
+    // In `--stream` mode s3glob writes each result as it arrives, and the
+    // reader below takes one line then drops the pipe so the next write
+    // already hits EPIPE. That alone is enough to exercise the path. The
+    // wide `--format` literal (~2 KiB/line, ~400 KiB total for 200 keys)
+    // additionally makes it a hard guarantee: that much output cannot fit
+    // the OS pipe buffer (~64 KiB), so the child is provably still blocked
+    // in `write` when the reader drops, independent of streaming pace or
+    // OS scheduling.
+    let wide_format = format!("{}{{key}}", "x".repeat(2000));
+
+    let cargo_bin = assert_cmd::cargo::cargo_bin("s3glob");
+    let mut child = StdCommand::new(&cargo_bin)
+        .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
+        .env("AWS_ACCESS_KEY_ID", "minioadmin")
+        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .args([
+            "ls",
+            "--stream",
+            "--format",
+            &wide_format,
+            &format!("s3://{}/prefix/**", bucket),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    // Read just one line then drop the pipe — the child should keep
+    // trying to write more, hit EPIPE, and exit cleanly.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    assert!(!line.is_empty(), "expected at least one output line");
+    drop(reader);
+
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "s3glob did not exit cleanly when stdout pipe closed: {:?}",
+        output.status,
+    );
+    // The "Matched X/Y" summary is emitted to stderr after the stdout
+    // loop exits, and must still appear when the pipe closed early.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Matched "),
+        "expected 'Matched' summary in stderr after pipe-close, got:\n{stderr}",
+    );
+
+    Ok(())
 }
