@@ -8,7 +8,7 @@ use aws_sdk_s3::types::Object;
 use num_format::{Locale, ToFormattedString as _};
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 #[cfg(test)]
 use std::sync::Mutex;
@@ -202,10 +202,10 @@ impl Engine for S3Engine {
             pages_seen += 1;
             let page_is_truncated = page.is_truncated.unwrap_or(false);
             if result.len() >= warning_count + warning_inc {
-                if warning_count == 0 {
-                    progressln!(); // create a new line after the "discovering.." message
-                }
-                warn!(
+                // Routed through progressln! (not tracing::warn!) so the
+                // prefix-discovery spinner is suspended while we print, and
+                // the line doesn't get clobbered by the next bar redraw.
+                progressln!(
                     "found {} objects and {} prefixes in {prefix} and still discovering more",
                     result.objects.len().to_formatted_string(&Locale::en),
                     result.prefixes.len().to_formatted_string(&Locale::en),

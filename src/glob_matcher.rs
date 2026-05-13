@@ -17,7 +17,8 @@ use tracing::{debug, trace, warn};
 mod engine;
 pub use engine::{Engine, S3Engine};
 
-use crate::{S3Object, progress, progressln};
+use crate::progress;
+use crate::{S3Object, progressln};
 
 mod glob;
 
@@ -215,6 +216,8 @@ impl S3GlobMatcher {
         mut engine: impl Engine + Clone,
     ) -> Result<PrefixSearchResult> {
         debug!("finding prefixes for {}", self.raw);
+        let prefix_progress = progress::get().spinner(progress::prefix_spinner_style());
+        let _prefix_cleanup = progress::ClearOnDrop(&prefix_progress);
         let mut prefixes = BTreeSet::new();
         prefixes.insert("".to_string());
         let mut objects: Vec<Object> = Vec::new();
@@ -237,12 +240,7 @@ impl S3GlobMatcher {
             // only included prefixes in trace logs
             trace!(?prefixes, objects = ?objects.iter().map(|o| o.key().unwrap()).collect::<Vec<_>>(), "scanning for part");
             debug!(%regex_so_far, new_part = %part.re_string(&delimiter, self.cross_delim), prefix_count = prefixes.len(), object_count = objects.len(), "scanning for part");
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                // don't overwrite log messages
-                progressln!("Discovering prefixes: {:>6}", prefixes.len());
-            } else {
-                progress!("\rDiscovering prefixes: {:>6}", prefixes.len());
-            }
+            prefix_progress.set_position(prefixes.len() as u64);
             // We always want to scan for things including the last part,
             // finding more prefixes in it is guaranteed to be slower than
             // just searching because we have to do an api call to check each
@@ -580,25 +578,18 @@ impl S3GlobMatcher {
             prev_part = Some(part);
         }
 
-        if prefixes.len() < self.min_prefixes && !self.is_complete {
-            let count = prefixes.len();
+        let count = prefixes.len();
+        if count < self.min_prefixes && !self.is_complete {
             progressln!(
-                "\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow"
-            );
-        } else if self.is_complete {
-            // clear the previous output
-            progressln!(
-                "\r                                          \
-                 \rDiscovered matches: {:>5}",
-                prefixes.len()
+                "Discovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow"
             );
         } else {
-            // clear the previous output
-            progressln!(
-                "\r                                          \
-                 \rDiscovered prefixes: {:>5}",
-                prefixes.len()
-            );
+            let noun = if self.is_complete {
+                "matches"
+            } else {
+                "prefixes"
+            };
+            progressln!("Discovered {noun}: {count:>5}");
         }
         // For complete patterns, every prefix in the final result must
         // match the full regex (including the trailing `[delim]?$`). The
@@ -616,15 +607,7 @@ impl S3GlobMatcher {
     }
 
     pub(crate) async fn get_objects<E: Engine + Clone>(&self, engine: E) -> Result<ListResult> {
-        let presult = match self.find_prefixes(engine.clone()).await {
-            Ok(prefixes) => prefixes,
-            Err(err) => {
-                // the matcher prints some progress info to stderr, if there's an
-                // error we should make sure to add a newline
-                progressln!();
-                return Err(err);
-            }
-        };
+        let presult = self.find_prefixes(engine.clone()).await?;
         trace!(?presult.prefixes, "matcher generated prefixes");
         debug!(
             prefix_count = presult.prefixes.len(),

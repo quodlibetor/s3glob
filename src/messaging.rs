@@ -9,28 +9,6 @@ pub(crate) enum MessageLevel {
 
 pub(crate) static MESSAGE_LEVEL: OnceLock<MessageLevel> = OnceLock::new();
 
-/// A macro that forwards to eprint! if the message level is normal, or
-/// does nothing if the message level is quiet
-#[macro_export]
-macro_rules! progress {
-    ($($args:tt)*) => {
-        if $crate::messaging::louder_than($crate::messaging::MessageLevel::Quiet) {
-            eprint!($($args)*);
-        }
-    };
-}
-
-/// A macro that forwards to eprintln! if the message level is normal, or
-/// does nothing if the message level is quiet
-#[macro_export]
-macro_rules! progressln {
-    ($($args:tt)*) => {
-        if $crate::messaging::louder_than($crate::messaging::MessageLevel::Quiet) {
-            eprintln!($($args)*);
-        }
-    };
-}
-
 /// A macro that forwards to eprintln! if the message level is louder than VeryQuiet
 #[macro_export]
 macro_rules! message_err {
@@ -46,7 +24,7 @@ pub(crate) fn louder_than(level: MessageLevel) -> bool {
     current > level
 }
 
-/// Suppress progress!/progressln! output from the calling test process.
+/// Suppress progress output from the calling test process.
 ///
 /// Intended for proptest cases that would otherwise spam stderr. Safe to
 /// call multiple times. The first caller in a process wins — subsequent

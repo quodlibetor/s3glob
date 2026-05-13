@@ -22,6 +22,7 @@ mod download;
 mod glob_matcher;
 mod messaging;
 mod platform_tls;
+mod progress;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -366,11 +367,15 @@ impl Opts {
 fn main() {
     let opts = Opts::parse();
     setup_logging(log_directive(opts.verbose, opts.quiet));
-    if opts.quiet == 1 {
-        MESSAGE_LEVEL.get_or_init(|| MessageLevel::Quiet);
-    } else if opts.quiet >= 2 {
-        MESSAGE_LEVEL.get_or_init(|| MessageLevel::VeryQuiet);
-    }
+    let level = if opts.quiet >= 2 {
+        MessageLevel::VeryQuiet
+    } else if opts.quiet == 1 {
+        MessageLevel::Quiet
+    } else {
+        MessageLevel::Normal
+    };
+    let _ = MESSAGE_LEVEL.set(level);
+    progress::init(level);
     debug!(?opts, "parsed options");
 
     let rt = Runtime::new().expect("tokio runtime should create successfully");
@@ -450,30 +455,37 @@ async fn run(opts: Opts) -> Result<()> {
             let mut matching_objects: Vec<PrefixResult> = Vec::new();
             let mut match_count = 0;
             let decimal = decimal_format();
+            let matches_progress = if !matcher.is_complete() {
+                Some(progress::get().spinner(progress::matches_spinner_style()))
+            } else {
+                None
+            };
             while let Some(results) = rx.recv().await {
+                match_count += results.len();
                 if stream {
-                    match_count += results.len();
                     for result in results {
                         print_prefix_result(&bucket, &user_format, decimal, result);
                     }
                 } else {
-                    match_count += results.len();
                     matching_objects.extend(results);
-                    if !matcher.is_complete() {
-                        progress!(
-                            "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
-                            match_count.to_formatted_string(&Locale::en),
-                            status
-                                .total_objects
-                                .load(Ordering::Relaxed)
-                                .to_formatted_string(&Locale::en),
-                            status.seen_prefixes.load(Ordering::Relaxed),
-                            totals.total_prefixes
-                        );
-                    }
+                }
+                if let Some(matches_progress) = &matches_progress {
+                    let total_objects = status.total_objects.load(Ordering::Relaxed);
+                    matches_progress.set_message(format!(
+                        "{:>4}/{:<10}",
+                        match_count.to_formatted_string(&Locale::en),
+                        total_objects.to_formatted_string(&Locale::en),
+                    ));
+                    matches_progress.set_prefix(format!(
+                        "{:>4}/{:<4}",
+                        status.seen_prefixes.load(Ordering::Relaxed),
+                        totals.total_prefixes,
+                    ));
                 }
             }
-            progressln!();
+            if let Some(matches_progress) = &matches_progress {
+                matches_progress.finish_and_clear();
+            }
             let mut objects = matching_objects;
             objects.sort_by_key(|r| r.key().to_owned());
             for obj in objects {
@@ -510,7 +522,12 @@ async fn run(opts: Opts) -> Result<()> {
                 base_path.clone(),
                 ntfctn_tx.clone(),
             );
-            // if the path_mode is shortes then we need to know all the paths to be able to extract the shortest
+            let matches_progress = if !matcher.is_complete() {
+                Some(progress::get().spinner(progress::matches_spinner_style()))
+            } else {
+                None
+            };
+            // if the path_mode is shortest then we need to know all the paths to be able to extract the shortest
             let mut objects_to_download = Vec::new();
             while let Some(result) = rx.recv().await {
                 total_matches += result
@@ -531,21 +548,22 @@ async fn run(opts: Opts) -> Result<()> {
                         }
                     }
                 }
-                if !matcher.is_complete() {
-                    progress!(
-                        "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                if let Some(matches_progress) = &matches_progress {
+                    let total_objects = status.total_objects.load(Ordering::Relaxed);
+                    matches_progress.set_message(format!(
+                        "{:>4}/{:<10}",
                         total_matches.to_formatted_string(&Locale::en),
-                        status
-                            .total_objects
-                            .load(Ordering::Relaxed)
-                            .to_formatted_string(&Locale::en),
+                        total_objects.to_formatted_string(&Locale::en),
+                    ));
+                    matches_progress.set_prefix(format!(
+                        "{:>4}/{:<4}",
                         status.seen_prefixes.load(Ordering::Relaxed),
-                        totals.total_prefixes
-                    );
+                        totals.total_prefixes,
+                    ));
                 }
             }
-            if !matcher.is_complete() {
-                progressln!();
+            if let Some(matches_progress) = matches_progress {
+                matches_progress.finish_and_clear();
             }
             // close the tx so the downloaders know to finish
             drop(dl);
@@ -573,7 +591,6 @@ async fn run(opts: Opts) -> Result<()> {
                     pools.download_object(dl.fresh(), obj);
                 }
             } else {
-                progressln!();
                 drop(ntfctn_tx);
             }
             let start_time = Instant::now();
@@ -581,31 +598,29 @@ async fn run(opts: Opts) -> Result<()> {
             let mut total_bytes = 0_usize;
             let mut speed = 0.0;
             let mut files = Vec::with_capacity(total_matches);
+            let downloads_progress = progress::get().spinner(progress::downloads_count_style());
+            downloads_progress.set_length(total_matches as u64);
+            let bytes_progress = progress::get().bar(progress::downloads_bytes_style());
             while let Some(n) = ntfctn_rx.recv().await {
                 match n {
                     download::Notification::ObjectDownloaded(path) => {
                         downloaded_matches += 1;
                         files.push(path.display().to_string());
+                        downloads_progress.set_position(downloaded_matches as u64);
                     }
                     download::Notification::BytesDownloaded(bytes) => {
                         total_bytes += bytes;
+                        bytes_progress.set_position(total_bytes as u64);
                     }
                 }
                 let elapsed = start_time.elapsed().as_secs_f64();
                 speed = total_bytes as f64 / elapsed;
-                progress!(
-                    "\rdownloaded {}/{} objects, {:>7}   {:>10}/s",
-                    downloaded_matches,
-                    total_matches,
-                    SizeFormatter::new(total_bytes as u64, decimal_format()).to_string(),
-                    SizeFormatter::new(speed.round() as u64, decimal_format()).to_string(),
-                );
             }
+            downloads_progress.finish_and_clear();
+            bytes_progress.finish_and_clear();
             if files.is_empty() {
-                progressln!();
                 bail!("No objects found matching the pattern.");
             }
-            progressln!("\n");
 
             files.sort_unstable();
             for path in files {
@@ -613,7 +628,7 @@ async fn run(opts: Opts) -> Result<()> {
             }
             let dl_ms = start_time.elapsed().as_millis() as u64;
             progressln!(
-                "\ndiscovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
+                "discovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
                 downloaded_matches,
                 Duration::from_millis(start.elapsed().as_millis() as u64 - dl_ms),
                 SizeFormatter::new(total_bytes as u64, decimal_format()),
