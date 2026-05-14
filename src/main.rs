@@ -453,7 +453,11 @@ async fn run(opts: Opts) -> Result<()> {
                 None
             };
             let mut matching_objects: Vec<PrefixResult> = Vec::new();
-            let mut match_count = 0;
+            // The matcher surfaces both real objects and logical prefixes
+            // (directories) as matches; count them separately so the
+            // summary doesn't report directories as "objects".
+            let mut object_count = 0;
+            let mut prefix_count = 0;
             let decimal = decimal_format();
             let matches_progress = if !matcher.is_complete() {
                 Some(progress::get().spinner(progress::matches_spinner_style()))
@@ -462,7 +466,12 @@ async fn run(opts: Opts) -> Result<()> {
             };
             let mut stdout = io::stdout().lock();
             'recv: while let Some(results) = rx.recv().await {
-                match_count += results.len();
+                for result in &results {
+                    match result {
+                        PrefixResult::Object(_) => object_count += 1,
+                        PrefixResult::Prefix(_) => prefix_count += 1,
+                    }
+                }
                 if stream {
                     for result in results {
                         if !keep_writing(write_prefix_result(
@@ -482,7 +491,7 @@ async fn run(opts: Opts) -> Result<()> {
                     let total_objects = status.total_objects.load(Ordering::Relaxed);
                     matches_progress.set_message(format!(
                         "{:>4}/{:<10}",
-                        match_count.to_formatted_string(&Locale::en),
+                        (object_count + prefix_count).to_formatted_string(&Locale::en),
                         total_objects.to_formatted_string(&Locale::en),
                     ));
                     matches_progress.set_prefix(format!(
@@ -513,16 +522,28 @@ async fn run(opts: Opts) -> Result<()> {
                     break;
                 }
             }
-            progressln!(
-                "Matched {}/{} objects across {} prefixes in {:?}",
-                match_count,
-                status
-                    .total_objects
-                    .load(Ordering::Relaxed)
-                    .max(totals.max_objects_observed),
-                totals.max_prefixes_observed,
-                Duration::from_millis(start.elapsed().as_millis() as u64)
-            );
+            let elapsed = Duration::from_millis(start.elapsed().as_millis() as u64);
+            let matched = object_count + prefix_count;
+            let candidates = totals
+                .max_candidate_prefixes
+                .max(status.total_objects.load(Ordering::Relaxed))
+                .max(matched);
+            if candidates > matched {
+                progressln!(
+                    "Matched {} objects and {} prefixes out of {} candidates in {:?}",
+                    object_count,
+                    prefix_count,
+                    candidates,
+                    elapsed,
+                );
+            } else {
+                progressln!(
+                    "Matched {} objects and {} prefixes in {:?}",
+                    object_count,
+                    prefix_count,
+                    elapsed,
+                );
+            }
         }
         Command::Download {
             dest,

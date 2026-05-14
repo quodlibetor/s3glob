@@ -440,6 +440,87 @@ async fn test_canonical_prefix_output(
     Ok(())
 }
 
+/// The `ls` summary must count objects and logical prefixes
+/// (directories) separately. A pattern ending in `/*` matches the
+/// directories it descends into as well as their contents, so the
+/// summary must not lump the directories in with "objects" — that was
+/// the bug behind a run reporting thousands of "matched objects" when
+/// only a handful of real objects existed.
+#[tokio::test]
+async fn test_summary_counts_objects_and_prefixes_separately() -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    // Pattern `p/*/RUN0/*CLONE997/*` against these keys matches six
+    // entities: the three `*CLONE997/` directories themselves (`*`
+    // matches the empty trailing segment), the two nested `results/`
+    // directories, and the one object sitting directly in a CLONE997
+    // dir. That's 1 object + 5 prefixes.
+    let test_objects = &[
+        "p/a/RUN0/xCLONE997/results/frame.xtc",
+        "p/b/RUN0/yCLONE997/results/frame.xtc",
+        "p/c/RUN0/zCLONE997/direct.txt",
+    ];
+    for key in test_objects {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let needle = format!("s3://{}/p/*/RUN0/*CLONE997/*", bucket);
+    let mut cmd = run_s3glob(port, &["ls", needle.as_str()])?;
+    let res = cmd.assert().success();
+    let stderr = std::str::from_utf8(&res.get_output().stderr).unwrap();
+
+    assert!(
+        stderr.contains("Discovered matches:     6"),
+        "expected 'Discovered matches: 6' in stderr, got:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("Matched 1 objects and 5 prefixes"),
+        "expected 'Matched 1 objects and 5 prefixes' in stderr, got:\n{stderr}",
+    );
+
+    Ok(())
+}
+
+/// When the search fans out wider than the final match set, the
+/// summary reports the peak as "out of N candidates" so the user can
+/// see how much keyspace was traversed.
+#[tokio::test]
+async fn test_summary_reports_candidate_count() -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    // Listing `data/` for the `*` fans out to five sub-directories;
+    // the trailing `/keep` literal then narrows that to the two that
+    // actually contain a `keep` key. Peak candidates = 5, matched = 2.
+    let test_objects = &[
+        "data/a/keep",
+        "data/b/keep",
+        "data/c/nope",
+        "data/d/nope",
+        "data/e/nope",
+    ];
+    for key in test_objects {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let needle = format!("s3://{}/data/*/keep", bucket);
+    let mut cmd = run_s3glob(port, &["ls", needle.as_str()])?;
+    let res = cmd.assert().success();
+    let stderr = std::str::from_utf8(&res.get_output().stderr).unwrap();
+
+    assert!(
+        stderr.contains("Matched 2 objects and 0 prefixes out of 5 candidates"),
+        "expected candidate count in stderr summary, got:\n{stderr}",
+    );
+
+    Ok(())
+}
+
 #[rstest]
 #[case( // 1 Keep different subdirs
     &[
@@ -853,7 +934,7 @@ async fn test_ls_pipe_closed_early_exits_cleanly() -> anyhow::Result<()> {
         "s3glob did not exit cleanly when stdout pipe closed: {:?}",
         output.status,
     );
-    // The "Matched X/Y" summary is emitted to stderr after the stdout
+    // The "Matched ..." summary is emitted to stderr after the stdout
     // loop exits, and must still appear when the pipe closed early.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
