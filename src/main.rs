@@ -1,4 +1,4 @@
-use std::io::IsTerminal as _;
+use std::io::{self, IsTerminal as _, Write as _};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -22,6 +22,7 @@ mod download;
 mod glob_matcher;
 mod messaging;
 mod platform_tls;
+mod progress;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -366,11 +367,15 @@ impl Opts {
 fn main() {
     let opts = Opts::parse();
     setup_logging(log_directive(opts.verbose, opts.quiet));
-    if opts.quiet == 1 {
-        MESSAGE_LEVEL.get_or_init(|| MessageLevel::Quiet);
-    } else if opts.quiet >= 2 {
-        MESSAGE_LEVEL.get_or_init(|| MessageLevel::VeryQuiet);
-    }
+    let level = if opts.quiet >= 2 {
+        MessageLevel::VeryQuiet
+    } else if opts.quiet == 1 {
+        MessageLevel::Quiet
+    } else {
+        MessageLevel::Normal
+    };
+    let _ = MESSAGE_LEVEL.set(level);
+    progress::init(level);
     debug!(?opts, "parsed options");
 
     let rt = Runtime::new().expect("tokio runtime should create successfully");
@@ -448,47 +453,97 @@ async fn run(opts: Opts) -> Result<()> {
                 None
             };
             let mut matching_objects: Vec<PrefixResult> = Vec::new();
-            let mut match_count = 0;
+            // The matcher surfaces both real objects and logical prefixes
+            // (directories) as matches; count them separately so the
+            // summary doesn't report directories as "objects".
+            let mut object_count = 0;
+            let mut prefix_count = 0;
             let decimal = decimal_format();
-            while let Some(results) = rx.recv().await {
-                if stream {
-                    match_count += results.len();
-                    for result in results {
-                        print_prefix_result(&bucket, &user_format, decimal, result);
-                    }
-                } else {
-                    match_count += results.len();
-                    matching_objects.extend(results);
-                    if !matcher.is_complete() {
-                        progress!(
-                            "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
-                            match_count.to_formatted_string(&Locale::en),
-                            status
-                                .total_objects
-                                .load(Ordering::Relaxed)
-                                .to_formatted_string(&Locale::en),
-                            status.seen_prefixes.load(Ordering::Relaxed),
-                            totals.total_prefixes
-                        );
+            let matches_progress = if !matcher.is_complete() {
+                Some(progress::get().spinner(progress::matches_spinner_style()))
+            } else {
+                None
+            };
+            let mut stdout = io::stdout().lock();
+            'recv: while let Some(results) = rx.recv().await {
+                for result in &results {
+                    match result {
+                        PrefixResult::Object(_) => object_count += 1,
+                        PrefixResult::Prefix(_) => prefix_count += 1,
                     }
                 }
+                if stream {
+                    for result in results {
+                        if !keep_writing(write_prefix_result(
+                            &mut stdout,
+                            &bucket,
+                            &user_format,
+                            decimal,
+                            result,
+                        ))? {
+                            break 'recv;
+                        }
+                    }
+                } else {
+                    matching_objects.extend(results);
+                }
+                if let Some(matches_progress) = &matches_progress {
+                    let total_objects = status.total_objects.load(Ordering::Relaxed);
+                    matches_progress.set_message(format!(
+                        "{:>4}/{:<10}",
+                        (object_count + prefix_count).to_formatted_string(&Locale::en),
+                        total_objects.to_formatted_string(&Locale::en),
+                    ));
+                    matches_progress.set_prefix(format!(
+                        "{:>4}/{:<4}",
+                        status.seen_prefixes.load(Ordering::Relaxed),
+                        totals.total_prefixes,
+                    ));
+                }
             }
-            progressln!();
+            // Done receiving. Dropping the receiver lets the matcher's senders
+            // fail fast if we broke out early on a closed pipe. In-flight S3
+            // list calls still finish their current page, but nothing new is
+            // queued.
+            drop(rx);
+            if let Some(matches_progress) = &matches_progress {
+                matches_progress.finish_and_clear();
+            }
             let mut objects = matching_objects;
             objects.sort_by_key(|r| r.key().to_owned());
             for obj in objects {
-                print_prefix_result(&bucket, &user_format, decimal, obj);
+                if !keep_writing(write_prefix_result(
+                    &mut stdout,
+                    &bucket,
+                    &user_format,
+                    decimal,
+                    obj,
+                ))? {
+                    break;
+                }
             }
-            progressln!(
-                "Matched {}/{} objects across {} prefixes in {:?}",
-                match_count,
-                status
-                    .total_objects
-                    .load(Ordering::Relaxed)
-                    .max(totals.max_objects_observed),
-                totals.max_prefixes_observed,
-                Duration::from_millis(start.elapsed().as_millis() as u64)
-            );
+            let elapsed = Duration::from_millis(start.elapsed().as_millis() as u64);
+            let matched = object_count + prefix_count;
+            let candidates = totals
+                .max_candidate_prefixes
+                .max(status.total_objects.load(Ordering::Relaxed))
+                .max(matched);
+            if candidates > matched {
+                progressln!(
+                    "Matched {} objects and {} prefixes out of {} candidates in {:?}",
+                    object_count,
+                    prefix_count,
+                    candidates,
+                    elapsed,
+                );
+            } else {
+                progressln!(
+                    "Matched {} objects and {} prefixes in {:?}",
+                    object_count,
+                    prefix_count,
+                    elapsed,
+                );
+            }
         }
         Command::Download {
             dest,
@@ -510,7 +565,12 @@ async fn run(opts: Opts) -> Result<()> {
                 base_path.clone(),
                 ntfctn_tx.clone(),
             );
-            // if the path_mode is shortes then we need to know all the paths to be able to extract the shortest
+            let matches_progress = if !matcher.is_complete() {
+                Some(progress::get().spinner(progress::matches_spinner_style()))
+            } else {
+                None
+            };
+            // if the path_mode is shortest then we need to know all the paths to be able to extract the shortest
             let mut objects_to_download = Vec::new();
             while let Some(result) = rx.recv().await {
                 total_matches += result
@@ -531,21 +591,22 @@ async fn run(opts: Opts) -> Result<()> {
                         }
                     }
                 }
-                if !matcher.is_complete() {
-                    progress!(
-                        "\rmatches/total {:>4}/{:<10} prefixes completed/total {:>4}/{:<4}",
+                if let Some(matches_progress) = &matches_progress {
+                    let total_objects = status.total_objects.load(Ordering::Relaxed);
+                    matches_progress.set_message(format!(
+                        "{:>4}/{:<10}",
                         total_matches.to_formatted_string(&Locale::en),
-                        status
-                            .total_objects
-                            .load(Ordering::Relaxed)
-                            .to_formatted_string(&Locale::en),
+                        total_objects.to_formatted_string(&Locale::en),
+                    ));
+                    matches_progress.set_prefix(format!(
+                        "{:>4}/{:<4}",
                         status.seen_prefixes.load(Ordering::Relaxed),
-                        totals.total_prefixes
-                    );
+                        totals.total_prefixes,
+                    ));
                 }
             }
-            if !matcher.is_complete() {
-                progressln!();
+            if let Some(matches_progress) = matches_progress {
+                matches_progress.finish_and_clear();
             }
             // close the tx so the downloaders know to finish
             drop(dl);
@@ -573,7 +634,6 @@ async fn run(opts: Opts) -> Result<()> {
                     pools.download_object(dl.fresh(), obj);
                 }
             } else {
-                progressln!();
                 drop(ntfctn_tx);
             }
             let start_time = Instant::now();
@@ -581,39 +641,42 @@ async fn run(opts: Opts) -> Result<()> {
             let mut total_bytes = 0_usize;
             let mut speed = 0.0;
             let mut files = Vec::with_capacity(total_matches);
+            let downloads_progress = progress::get().spinner(progress::downloads_count_style());
+            downloads_progress.set_length(total_matches as u64);
+            let bytes_progress = progress::get().bar(progress::downloads_bytes_style());
             while let Some(n) = ntfctn_rx.recv().await {
                 match n {
                     download::Notification::ObjectDownloaded(path) => {
                         downloaded_matches += 1;
                         files.push(path.display().to_string());
+                        downloads_progress.set_position(downloaded_matches as u64);
                     }
                     download::Notification::BytesDownloaded(bytes) => {
                         total_bytes += bytes;
+                        bytes_progress.set_position(total_bytes as u64);
                     }
                 }
                 let elapsed = start_time.elapsed().as_secs_f64();
                 speed = total_bytes as f64 / elapsed;
-                progress!(
-                    "\rdownloaded {}/{} objects, {:>7}   {:>10}/s",
-                    downloaded_matches,
-                    total_matches,
-                    SizeFormatter::new(total_bytes as u64, decimal_format()).to_string(),
-                    SizeFormatter::new(speed.round() as u64, decimal_format()).to_string(),
-                );
             }
+            downloads_progress.finish_and_clear();
+            bytes_progress.finish_and_clear();
             if files.is_empty() {
-                progressln!();
                 bail!("No objects found matching the pattern.");
             }
-            progressln!("\n");
 
             files.sort_unstable();
-            for path in files {
-                println!("{}", path);
+            {
+                let mut stdout = io::stdout().lock();
+                for path in &files {
+                    if !keep_writing(writeln!(stdout, "{}", path))? {
+                        break;
+                    }
+                }
             }
             let dl_ms = start_time.elapsed().as_millis() as u64;
             progressln!(
-                "\ndiscovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
+                "discovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
                 downloaded_matches,
                 Duration::from_millis(start.elapsed().as_millis() as u64 - dl_ms),
                 SizeFormatter::new(total_bytes as u64, decimal_format()),
@@ -629,19 +692,38 @@ async fn run(opts: Opts) -> Result<()> {
     Ok(())
 }
 
-fn print_prefix_result(
+fn write_prefix_result(
+    stdout: &mut io::StdoutLock<'_>,
     bucket: &str,
     user_format: &Option<Vec<FormatToken>>,
     decimal: FormatSizeOptions,
     result: PrefixResult,
-) {
+) -> io::Result<()> {
     if let Some(user_fmt) = user_format {
-        print_user(bucket, &result, user_fmt);
+        writeln!(stdout, "{}", format_user(bucket, &result, user_fmt))
     } else {
         match result {
-            PrefixResult::Object(obj) => print_default(&obj, decimal),
-            PrefixResult::Prefix(prefix) => println!("PRE     {prefix}"),
+            PrefixResult::Object(obj) => writeln!(
+                stdout,
+                "{:>10}   {:>7}   {}",
+                obj.last_modified,
+                SizeFormatter::new(obj.size as u64, decimal).to_string(),
+                obj.key,
+            ),
+            PrefixResult::Prefix(prefix) => writeln!(stdout, "PRE     {prefix}"),
         }
+    }
+}
+
+/// Classify the result of a write to stdout.
+///
+/// Returns `Ok(true)` to keep writing, `Ok(false)` when the reader has gone
+/// away, and `Err` for an unknown write error.
+fn keep_writing(result: io::Result<()>) -> Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -789,19 +871,6 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
         tokens.push(FormatToken::Literal(current_literal.clone()));
     }
     Ok(tokens)
-}
-
-fn print_default(obj: &S3Object, format: FormatSizeOptions) {
-    println!(
-        "{:>10}   {:>7}   {}",
-        obj.last_modified,
-        SizeFormatter::new(obj.size as u64, format).to_string(),
-        obj.key,
-    );
-}
-
-fn print_user(bucket: &str, obj: &PrefixResult, tokens: &[FormatToken]) {
-    println!("{}", format_user(bucket, obj, tokens));
 }
 
 fn format_user(bucket: &str, obj: &PrefixResult, tokens: &[FormatToken]) -> String {

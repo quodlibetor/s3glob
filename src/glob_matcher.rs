@@ -17,7 +17,8 @@ use tracing::{debug, trace, warn};
 mod engine;
 pub use engine::{Engine, S3Engine};
 
-use crate::{S3Object, progress, progressln};
+use crate::progress;
+use crate::{S3Object, progressln};
 
 mod glob;
 
@@ -74,8 +75,11 @@ pub struct S3GlobMatcher {
 pub(crate) struct PrefixSearchResult {
     pub prefixes: Vec<String>,
     pub objects: Vec<Object>,
-    pub max_prefixes_observed: usize,
-    pub max_objects_observed: usize,
+    /// Peak size of the candidate prefix set across the whole search,
+    /// including intermediate sets pruned away before the next pattern
+    /// part. A measure of how wide the search had to fan out; surfaced
+    /// to the user by `ls` as "out of N candidates".
+    pub max_candidate_prefixes: usize,
 }
 
 /// A scanner takes a glob pattern and can efficiently generate a list of S3
@@ -215,6 +219,8 @@ impl S3GlobMatcher {
         mut engine: impl Engine + Clone,
     ) -> Result<PrefixSearchResult> {
         debug!("finding prefixes for {}", self.raw);
+        let prefix_progress = progress::get().spinner(progress::prefix_spinner_style());
+        let _prefix_cleanup = progress::ClearOnDrop(&prefix_progress);
         let mut prefixes = BTreeSet::new();
         prefixes.insert("".to_string());
         let mut objects: Vec<Object> = Vec::new();
@@ -223,8 +229,7 @@ impl S3GlobMatcher {
         let mut regex_so_far = "^".to_string();
         let mut prev_part = None;
         let mut part_iter = self.parts.iter().enumerate();
-        let mut max_prefixes_observed = 0;
-        let mut max_objects_observed = 0;
+        let mut max_candidate_prefixes = 0;
         for (part_idx, part) in &mut part_iter {
             if prefixes.len() >= MAX_PREFIXES {
                 warn!(
@@ -233,16 +238,11 @@ impl S3GlobMatcher {
                 );
                 break;
             }
-            max_prefixes_observed = max_prefixes_observed.max(prefixes.len());
+            max_candidate_prefixes = max_candidate_prefixes.max(prefixes.len());
             // only included prefixes in trace logs
             trace!(?prefixes, objects = ?objects.iter().map(|o| o.key().unwrap()).collect::<Vec<_>>(), "scanning for part");
             debug!(%regex_so_far, new_part = %part.re_string(&delimiter, self.cross_delim), prefix_count = prefixes.len(), object_count = objects.len(), "scanning for part");
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                // don't overwrite log messages
-                progressln!("Discovering prefixes: {:>6}", prefixes.len());
-            } else {
-                progress!("\rDiscovering prefixes: {:>6}", prefixes.len());
-            }
+            prefix_progress.set_position(prefixes.len() as u64);
             // We always want to scan for things including the last part,
             // finding more prefixes in it is guaranteed to be slower than
             // just searching because we have to do an api call to check each
@@ -257,10 +257,10 @@ impl S3GlobMatcher {
                             &delimiter,
                             initial,
                             &mut objects,
-                            &mut max_prefixes_observed,
+                            &mut max_candidate_prefixes,
                         )
                         .await?;
-                    max_prefixes_observed = max_prefixes_observed.max(prefixes.len());
+                    max_candidate_prefixes = max_candidate_prefixes.max(prefixes.len());
                     break;
                 }
                 // Any is the only place where we actually need to hit the
@@ -344,7 +344,7 @@ impl S3GlobMatcher {
                             prefixes = new_prefixes;
                         }
                     }
-                    max_objects_observed = max_objects_observed.max(prefixes.len());
+                    max_candidate_prefixes = max_candidate_prefixes.max(prefixes.len());
                     if part.is_negated() {
                         // if this part is a negated character class then we should filter
                         let matcher = Regex::new(&format!(
@@ -390,7 +390,7 @@ impl S3GlobMatcher {
                             );
                             break;
                         }
-                        max_objects_observed = max_objects_observed.max(new_prefixes.len());
+                        max_candidate_prefixes = max_candidate_prefixes.max(new_prefixes.len());
                         prefixes = check_prefixes(
                             &mut engine,
                             &prefixes,
@@ -507,7 +507,7 @@ impl S3GlobMatcher {
                                 break;
                             }
                             trace!(new_prefixes = ?new_prefixes, new_prefix_count = new_prefixes.len(), "checking appended prefixes");
-                            max_objects_observed = max_objects_observed.max(new_prefixes.len());
+                            max_candidate_prefixes = max_candidate_prefixes.max(new_prefixes.len());
                             let new_prefixes = check_prefixes(
                                 &mut engine,
                                 &prefixes,
@@ -580,26 +580,6 @@ impl S3GlobMatcher {
             prev_part = Some(part);
         }
 
-        if prefixes.len() < self.min_prefixes && !self.is_complete {
-            let count = prefixes.len();
-            progressln!(
-                "\rDiscovered prefixes: {count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow"
-            );
-        } else if self.is_complete {
-            // clear the previous output
-            progressln!(
-                "\r                                          \
-                 \rDiscovered matches: {:>5}",
-                prefixes.len()
-            );
-        } else {
-            // clear the previous output
-            progressln!(
-                "\r                                          \
-                 \rDiscovered prefixes: {:>5}",
-                prefixes.len()
-            );
-        }
         // For complete patterns, every prefix in the final result must
         // match the full regex (including the trailing `[delim]?$`). The
         // Any handler scans subprefixes and adds them all without
@@ -607,36 +587,40 @@ impl S3GlobMatcher {
         if self.is_complete {
             prefixes.retain(|p| self.regex.is_match(p));
         }
+        let prefix_count = prefixes.len();
+        if !self.is_complete && prefix_count < self.min_prefixes {
+            progressln!(
+                "Discovered prefixes: {prefix_count:>5} -- see `s3glob help parallelism` if it feels like this run is too slow"
+            );
+        } else if self.is_complete {
+            // For a complete pattern the result is objects found directly
+            // during scanning plus candidate prefixes that get_exact will
+            // resolve into objects and/or directories.
+            let count = prefix_count + objects.len();
+            progressln!("Discovered matches: {count:>5}");
+        } else {
+            progressln!("Discovered prefixes: {prefix_count:>5}");
+        }
         Ok(PrefixSearchResult {
             prefixes: prefixes.into_iter().collect(),
             objects,
-            max_prefixes_observed,
-            max_objects_observed,
+            max_candidate_prefixes,
         })
     }
 
     pub(crate) async fn get_objects<E: Engine + Clone>(&self, engine: E) -> Result<ListResult> {
-        let presult = match self.find_prefixes(engine.clone()).await {
-            Ok(prefixes) => prefixes,
-            Err(err) => {
-                // the matcher prints some progress info to stderr, if there's an
-                // error we should make sure to add a newline
-                progressln!();
-                return Err(err);
-            }
-        };
+        let presult = self.find_prefixes(engine.clone()).await?;
         trace!(?presult.prefixes, "matcher generated prefixes");
         debug!(
             prefix_count = presult.prefixes.len(),
             "matcher generated prefixes"
         );
-        let max_objects_observed = presult.max_objects_observed;
-        let max_prefixes_observed = presult.max_prefixes_observed;
         let status = LiveStatus {
             total_objects: Arc::new(AtomicUsize::new(0)),
             seen_prefixes: Arc::new(AtomicUsize::new(0)),
         };
         let total_prefixes = presult.prefixes.len();
+        let max_candidate_prefixes = presult.max_candidate_prefixes;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
         let re = self.regex.clone();
         debug!(regex = %re.as_str(), "full regex");
@@ -654,9 +638,8 @@ impl S3GlobMatcher {
         drop(tx);
         Ok(ListResult {
             totals: Totals {
-                max_objects_observed,
-                max_prefixes_observed,
                 total_prefixes,
+                max_candidate_prefixes,
             },
             status,
             rx,
@@ -698,7 +681,7 @@ impl S3GlobMatcher {
         delimiter: &str,
         initial: BTreeSet<String>,
         objects: &mut Vec<Object>,
-        max_prefixes_observed: &mut usize,
+        max_candidate_prefixes: &mut usize,
     ) -> Result<BTreeSet<String>> {
         let probe_max_keys = self.probe_max_keys;
         let mut settled: BTreeSet<String> = BTreeSet::new();
@@ -803,7 +786,7 @@ impl S3GlobMatcher {
             }
 
             let total_after = settled.len() + new_frontier.len();
-            *max_prefixes_observed = (*max_prefixes_observed).max(total_after);
+            *max_candidate_prefixes = (*max_candidate_prefixes).max(total_after);
 
             if total_after >= self.max_prefixes {
                 let cap = self.max_prefixes;
@@ -955,8 +938,8 @@ pub(crate) struct ListResult {
 
 pub(crate) struct Totals {
     pub(crate) total_prefixes: usize,
-    pub(crate) max_objects_observed: usize,
-    pub(crate) max_prefixes_observed: usize,
+    /// Carried through from [`PrefixSearchResult::max_candidate_prefixes`].
+    pub(crate) max_candidate_prefixes: usize,
 }
 
 pub(crate) struct LiveStatus {
@@ -1512,11 +1495,13 @@ mod tests {
                 "unexpected prefix in capped result: {p:?}",
             );
         }
-        // High-water mark should reflect the cap-trigger value.
+        // The candidate-prefix high-water mark must reflect the
+        // cap-trigger value, confirming it's threaded through the
+        // recursive BFS expansion.
         assert!(
-            presult.max_prefixes_observed >= 10,
-            "max_prefixes_observed must be ≥ 10 after cap, got {}",
-            presult.max_prefixes_observed,
+            presult.max_candidate_prefixes >= 10,
+            "max_candidate_prefixes must be ≥ 10 after cap, got {}",
+            presult.max_candidate_prefixes,
         );
         Ok(())
     }

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::env;
+use std::io::{BufRead, BufReader};
 
 use assert_cmd::Command;
 use assert_fs::TempDir;
@@ -439,6 +440,87 @@ async fn test_canonical_prefix_output(
     Ok(())
 }
 
+/// The `ls` summary must count objects and logical prefixes
+/// (directories) separately. A pattern ending in `/*` matches the
+/// directories it descends into as well as their contents, so the
+/// summary must not lump the directories in with "objects" — that was
+/// the bug behind a run reporting thousands of "matched objects" when
+/// only a handful of real objects existed.
+#[tokio::test]
+async fn test_summary_counts_objects_and_prefixes_separately() -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    // Pattern `p/*/RUN0/*CLONE997/*` against these keys matches six
+    // entities: the three `*CLONE997/` directories themselves (`*`
+    // matches the empty trailing segment), the two nested `results/`
+    // directories, and the one object sitting directly in a CLONE997
+    // dir. That's 1 object + 5 prefixes.
+    let test_objects = &[
+        "p/a/RUN0/xCLONE997/results/frame.xtc",
+        "p/b/RUN0/yCLONE997/results/frame.xtc",
+        "p/c/RUN0/zCLONE997/direct.txt",
+    ];
+    for key in test_objects {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let needle = format!("s3://{}/p/*/RUN0/*CLONE997/*", bucket);
+    let mut cmd = run_s3glob(port, &["ls", needle.as_str()])?;
+    let res = cmd.assert().success();
+    let stderr = std::str::from_utf8(&res.get_output().stderr).unwrap();
+
+    assert!(
+        stderr.contains("Discovered matches:     6"),
+        "expected 'Discovered matches: 6' in stderr, got:\n{stderr}",
+    );
+    assert!(
+        stderr.contains("Matched 1 objects and 5 prefixes"),
+        "expected 'Matched 1 objects and 5 prefixes' in stderr, got:\n{stderr}",
+    );
+
+    Ok(())
+}
+
+/// When the search fans out wider than the final match set, the
+/// summary reports the peak as "out of N candidates" so the user can
+/// see how much keyspace was traversed.
+#[tokio::test]
+async fn test_summary_reports_candidate_count() -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "test-bucket";
+    client.create_bucket().bucket(bucket).send().await?;
+
+    // Listing `data/` for the `*` fans out to five sub-directories;
+    // the trailing `/keep` literal then narrows that to the two that
+    // actually contain a `keep` key. Peak candidates = 5, matched = 2.
+    let test_objects = &[
+        "data/a/keep",
+        "data/b/keep",
+        "data/c/nope",
+        "data/d/nope",
+        "data/e/nope",
+    ];
+    for key in test_objects {
+        create_object(&client, bucket, key).await?;
+    }
+
+    let needle = format!("s3://{}/data/*/keep", bucket);
+    let mut cmd = run_s3glob(port, &["ls", needle.as_str()])?;
+    let res = cmd.assert().success();
+    let stderr = std::str::from_utf8(&res.get_output().stderr).unwrap();
+
+    assert!(
+        stderr.contains("Matched 2 objects and 0 prefixes out of 5 candidates"),
+        "expected candidate count in stderr summary, got:\n{stderr}",
+    );
+
+    Ok(())
+}
+
 #[rstest]
 #[case( // 1 Keep different subdirs
     &[
@@ -795,4 +877,70 @@ impl LogConsumer for LogPrinter {
         }
         .boxed()
     }
+}
+
+/// Closing stdout early (e.g. piping to `head`) should not panic or
+/// crash; s3glob must exit cleanly with status 0.
+#[tokio::test]
+async fn test_ls_pipe_closed_early_exits_cleanly() -> anyhow::Result<()> {
+    use std::process::{Command as StdCommand, Stdio};
+
+    let (_node, port, client) = minio_and_client().await;
+
+    let bucket = "pipe-test";
+    client.create_bucket().bucket(bucket).send().await?;
+    for i in 0..200 {
+        create_object(&client, bucket, &format!("prefix/{i:04}/file.txt")).await?;
+    }
+
+    // In `--stream` mode s3glob writes each result as it arrives, and the
+    // reader below takes one line then drops the pipe so the next write
+    // already hits EPIPE. That alone is enough to exercise the path. The
+    // wide `--format` literal (~2 KiB/line, ~400 KiB total for 200 keys)
+    // additionally makes it a hard guarantee: that much output cannot fit
+    // the OS pipe buffer (~64 KiB), so the child is provably still blocked
+    // in `write` when the reader drops, independent of streaming pace or
+    // OS scheduling.
+    let wide_format = format!("{}{{key}}", "x".repeat(2000));
+
+    let cargo_bin = assert_cmd::cargo::cargo_bin("s3glob");
+    let mut child = StdCommand::new(&cargo_bin)
+        .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
+        .env("AWS_ACCESS_KEY_ID", "minioadmin")
+        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .args([
+            "ls",
+            "--stream",
+            "--format",
+            &wide_format,
+            &format!("s3://{}/prefix/**", bucket),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    // Read just one line then drop the pipe — the child should keep
+    // trying to write more, hit EPIPE, and exit cleanly.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    assert!(!line.is_empty(), "expected at least one output line");
+    drop(reader);
+
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "s3glob did not exit cleanly when stdout pipe closed: {:?}",
+        output.status,
+    );
+    // The "Matched ..." summary is emitted to stderr after the stdout
+    // loop exits, and must still appear when the pipe closed early.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Matched "),
+        "expected 'Matched' summary in stderr after pipe-close, got:\n{stderr}",
+    );
+
+    Ok(())
 }
