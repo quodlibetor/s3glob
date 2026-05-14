@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.16](https://github.com/quodlibetor/s3glob/compare/v0.4.15...v0.4.16) - 2026-05-14
+
+### 🚀 Features
+
+- replace ad-hoc progress with indicatif bars by [@quodlibetor](https://github.com/quodlibetor) in [eaa2788](https://github.com/quodlibetor/s3glob/commit/eaa27884bf6360ea8d51a8a7f4f0e907befab5de)
+
+### 🐛 Bug Fixes
+
+- **(security)** Upgrade astral-tokio-tar by [@quodlibetor](https://github.com/quodlibetor) in [153f095](https://github.com/quodlibetor/s3glob/commit/153f0957938fe6d53bc47b63b919389b8064f04f)
+- exit cleanly on broken pipe and still emit the summary by [@quodlibetor](https://github.com/quodlibetor) in [1aa6e72](https://github.com/quodlibetor/s3glob/commit/1aa6e725e1cdef35767317dc8abf51b025ba914e)
+- count objects and prefixes separately in ls summary by [@quodlibetor](https://github.com/quodlibetor) in [3e72761](https://github.com/quodlibetor/s3glob/commit/3e727616307137001e222339691dab81305a4ba9)
+
 ## [0.4.15](https://github.com/quodlibetor/s3glob/compare/v0.4.14...v0.4.15) - 2026-05-10
 
 ### 🚀 Features
