@@ -15,6 +15,7 @@ use humansize::{DECIMAL, FormatSizeOptions, SizeFormatter};
 use messaging::{MESSAGE_LEVEL, MessageLevel};
 use num_format::{Locale, ToFormattedString};
 use regex::Regex;
+use serde::Serialize;
 use tokio::runtime::Runtime;
 use tracing::debug;
 
@@ -54,16 +55,36 @@ enum Command {
         /// - `{size_bytes}`: the size of the object in bytes, with no suffix
         /// - `{size_human}`: the size of the object in a decimal format (e.g. 1.23MB)
         /// - `{last_modified}`: the last modified date of the object, RFC3339 format
+        /// - `{etag}`: the object ETag
+        /// - `{storage_class}`: STANDARD, GLACIER, etc.
+        /// - `{restore_in_progress}`: "true"/"false" if the object is a Glacier
+        ///   restore in progress, empty otherwise
+        /// - `{restore_expiry}`: RFC3339 expiry of an active restore, empty otherwise
+        /// - `{checksums}`: comma-separated list of additional-checksum algorithms
         ///
         /// For example, the default format looks as though you ran s3glob like this:
         ///
         ///     s3glob ls -f "{last_modified} {size_human} {key}" "my-bucket/*"
+        ///
+        /// Mutually exclusive with `--output json` and `--output ndjson`.
         #[clap(short, long, verbatim_doc_comment)]
         format: Option<String>,
 
         /// Stream keys as they are found, rather than sorting and printing at the end
         #[clap(long)]
         stream: bool,
+
+        /// Output format: text|json|ndjson
+        ///
+        /// - `text` (default): one match per line, optionally formatted by --format
+        /// - `json`: a single sorted JSON array of records (buffered until end)
+        /// - `ndjson`: one JSON record per line, streamed in arrival order
+        ///
+        /// JSON records carry the full object metadata: type ("object" or "prefix"),
+        /// bucket, key, uri, size, last_modified, etag, storage_class,
+        /// checksum_algorithms, and restore_status.
+        #[clap(short, long, verbatim_doc_comment, default_value = "text")]
+        output: OutputFormat,
     },
 
     /// Download objects matching the pattern
@@ -104,6 +125,15 @@ enum Command {
         /// downloaded file.
         #[clap(long)]
         flatten: bool,
+
+        /// Output format: text|json|ndjson
+        ///
+        /// - `text` (default): one local file path per line on stdout, summary on stderr
+        /// - `json`: single buffered `{ "downloads": [...], "summary": {...} }` object
+        /// - `ndjson`: streams `{ "event": "downloaded", ... }` per file then a final
+        ///   `{ "event": "summary", ... }` record (summary moves to stdout)
+        #[clap(short, long, verbatim_doc_comment, default_value = "text")]
+        output: OutputFormat,
     },
 
     /// Learn how to tune s3glob's parallelism for better performance
@@ -160,6 +190,14 @@ enum Command {
         #[clap(short, hide = true)]
         no_sign_requests: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[clap(rename_all = "lowercase")]
+enum OutputFormat {
+    Text,
+    Json,
+    Ndjson,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,6 +444,15 @@ fn main() {
 
 async fn run(opts: Opts) -> Result<()> {
     let start = Instant::now();
+    if let Command::List {
+        format: Some(_),
+        output,
+        ..
+    } = &opts.command
+        && !matches!(output, OutputFormat::Text)
+    {
+        bail!("--format cannot be combined with --output json or --output ndjson");
+    }
     let pat = match &opts.command {
         Command::List { pattern, .. } | Command::Download { pattern, .. } => pattern,
         Command::Parallelism { .. } => {
@@ -446,11 +493,28 @@ async fn run(opts: Opts) -> Result<()> {
     } = matcher.get_objects(engine).await?;
 
     match opts.command {
-        Command::List { format, stream, .. } => {
+        Command::List {
+            format,
+            stream,
+            output,
+            ..
+        } => {
             let user_format = if let Some(user_fmt) = format {
                 Some(compile_format(&user_fmt)?)
             } else {
                 None
+            };
+            let stream_mode = match output {
+                OutputFormat::Text => stream,
+                OutputFormat::Ndjson => true,
+                OutputFormat::Json => {
+                    if stream {
+                        progressln!(
+                            "note: --stream ignored with --output json (records are buffered)"
+                        );
+                    }
+                    false
+                }
             };
             let mut matching_objects: Vec<PrefixResult> = Vec::new();
             // The matcher surfaces both real objects and logical prefixes
@@ -472,15 +536,23 @@ async fn run(opts: Opts) -> Result<()> {
                         PrefixResult::Prefix(_) => prefix_count += 1,
                     }
                 }
-                if stream {
-                    for result in results {
-                        if !keep_writing(write_prefix_result(
-                            &mut stdout,
-                            &bucket,
-                            &user_format,
-                            decimal,
-                            result,
-                        ))? {
+                if stream_mode {
+                    for result in &results {
+                        let written = match output {
+                            OutputFormat::Text => write_prefix_result(
+                                &mut stdout,
+                                &bucket,
+                                &user_format,
+                                decimal,
+                                result,
+                            ),
+                            OutputFormat::Ndjson => write_json_line(
+                                &mut stdout,
+                                &JsonLsRecord::from_result(&bucket, result),
+                            ),
+                            OutputFormat::Json => unreachable!(),
+                        };
+                        if !keep_writing(written)? {
                             break 'recv;
                         }
                     }
@@ -509,17 +581,31 @@ async fn run(opts: Opts) -> Result<()> {
             if let Some(matches_progress) = &matches_progress {
                 matches_progress.finish_and_clear();
             }
-            let mut objects = matching_objects;
-            objects.sort_by_key(|r| r.key().to_owned());
-            for obj in objects {
-                if !keep_writing(write_prefix_result(
-                    &mut stdout,
-                    &bucket,
-                    &user_format,
-                    decimal,
-                    obj,
-                ))? {
-                    break;
+            if !stream_mode {
+                let mut objects = matching_objects;
+                objects.sort_by_key(|r| r.key().to_owned());
+                match output {
+                    OutputFormat::Text => {
+                        for obj in &objects {
+                            if !keep_writing(write_prefix_result(
+                                &mut stdout,
+                                &bucket,
+                                &user_format,
+                                decimal,
+                                obj,
+                            ))? {
+                                break;
+                            }
+                        }
+                    }
+                    OutputFormat::Json => {
+                        let records: Vec<JsonLsRecord> = objects
+                            .iter()
+                            .map(|r| JsonLsRecord::from_result(&bucket, r))
+                            .collect();
+                        keep_writing(write_json_line(&mut stdout, &records))?;
+                    }
+                    OutputFormat::Ndjson => unreachable!(),
                 }
             }
             let elapsed = Duration::from_millis(start.elapsed().as_millis() as u64);
@@ -549,6 +635,7 @@ async fn run(opts: Opts) -> Result<()> {
             dest,
             path_mode,
             flatten,
+            output,
             ..
         } => {
             let mut total_matches = 0;
@@ -623,7 +710,7 @@ async fn run(opts: Opts) -> Result<()> {
                 );
                 let dl = download::Downloader::new(
                     client,
-                    bucket,
+                    bucket.clone(),
                     prefix_to_strip,
                     flatten,
                     base_path,
@@ -640,16 +727,27 @@ async fn run(opts: Opts) -> Result<()> {
             let mut downloaded_matches = 0;
             let mut total_bytes = 0_usize;
             let mut speed = 0.0;
-            let mut files = Vec::with_capacity(total_matches);
+            let mut records: Vec<DownloadedRecord> = Vec::with_capacity(total_matches);
             let downloads_progress = progress::get().spinner(progress::downloads_count_style());
             downloads_progress.set_length(total_matches as u64);
             let bytes_progress = progress::get().bar(progress::downloads_bytes_style());
+            let mut ndjson_stdout =
+                matches!(output, OutputFormat::Ndjson).then(|| io::stdout().lock());
             while let Some(n) = ntfctn_rx.recv().await {
                 match n {
-                    download::Notification::ObjectDownloaded(path) => {
+                    download::Notification::ObjectDownloaded { object, local_path } => {
                         downloaded_matches += 1;
-                        files.push(path.display().to_string());
                         downloads_progress.set_position(downloaded_matches as u64);
+                        let record = DownloadedRecord { object, local_path };
+                        if let Some(out) = &mut ndjson_stdout {
+                            let event = JsonDlEvent::Downloaded {
+                                record: JsonDlObject::new(&bucket, &record),
+                            };
+                            if !keep_writing(write_json_line(out, &event))? {
+                                ndjson_stdout = None;
+                            }
+                        }
+                        records.push(record);
                     }
                     download::Notification::BytesDownloaded(bytes) => {
                         total_bytes += bytes;
@@ -661,28 +759,58 @@ async fn run(opts: Opts) -> Result<()> {
             }
             downloads_progress.finish_and_clear();
             bytes_progress.finish_and_clear();
-            if files.is_empty() {
+            if records.is_empty() {
                 bail!("No objects found matching the pattern.");
             }
-
-            files.sort_unstable();
-            {
-                let mut stdout = io::stdout().lock();
-                for path in &files {
-                    if !keep_writing(writeln!(stdout, "{}", path))? {
-                        break;
+            let dl_ms = start_time.elapsed().as_millis() as u64;
+            let summary = JsonDlSummary {
+                bytes: total_bytes,
+                discovery_ms: start_time.duration_since(start).as_millis() as u64,
+                download_ms: dl_ms,
+                bytes_per_sec: speed.round() as u64,
+            };
+            match output {
+                OutputFormat::Text => {
+                    let mut files: Vec<String> = records
+                        .iter()
+                        .map(|r| r.local_path.display().to_string())
+                        .collect();
+                    files.sort_unstable();
+                    let mut stdout = io::stdout().lock();
+                    for path in &files {
+                        if !keep_writing(writeln!(stdout, "{}", path))? {
+                            break;
+                        }
+                    }
+                    progressln!(
+                        "discovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
+                        downloaded_matches,
+                        Duration::from_millis(summary.discovery_ms),
+                        SizeFormatter::new(total_bytes as u64, decimal_format()),
+                        Duration::from_millis(dl_ms),
+                        SizeFormatter::new(speed.round() as u64, decimal_format()),
+                    );
+                }
+                OutputFormat::Ndjson => {
+                    if let Some(mut out) = ndjson_stdout {
+                        let event = JsonDlEvent::Summary { record: &summary };
+                        keep_writing(write_json_line(&mut out, &event))?;
                     }
                 }
+                OutputFormat::Json => {
+                    records.sort_by(|a, b| a.object.key.cmp(&b.object.key));
+                    let downloads: Vec<JsonDlObject<'_>> = records
+                        .iter()
+                        .map(|r| JsonDlObject::new(&bucket, r))
+                        .collect();
+                    let wrapper = JsonDlWrapper {
+                        downloads,
+                        summary: &summary,
+                    };
+                    let mut stdout = io::stdout().lock();
+                    keep_writing(write_json_line(&mut stdout, &wrapper))?;
+                }
             }
-            let dl_ms = start_time.elapsed().as_millis() as u64;
-            progressln!(
-                "discovered {} objects in {:?} | downloaded {} in {:?} ({}/s)",
-                downloaded_matches,
-                Duration::from_millis(start.elapsed().as_millis() as u64 - dl_ms),
-                SizeFormatter::new(total_bytes as u64, decimal_format()),
-                Duration::from_millis(dl_ms),
-                SizeFormatter::new(speed.round() as u64, decimal_format()),
-            );
         }
         Command::Parallelism { .. } => {
             progressln!("This is just for documentation, run instead: s3glob help parallelism");
@@ -697,10 +825,10 @@ fn write_prefix_result(
     bucket: &str,
     user_format: &Option<Vec<FormatToken>>,
     decimal: FormatSizeOptions,
-    result: PrefixResult,
+    result: &PrefixResult,
 ) -> io::Result<()> {
     if let Some(user_fmt) = user_format {
-        writeln!(stdout, "{}", format_user(bucket, &result, user_fmt))
+        writeln!(stdout, "{}", format_user(bucket, result, user_fmt))
     } else {
         match result {
             PrefixResult::Object(obj) => writeln!(
@@ -713,6 +841,134 @@ fn write_prefix_result(
             PrefixResult::Prefix(prefix) => writeln!(stdout, "PRE     {prefix}"),
         }
     }
+}
+
+fn s3_uri(bucket: &str, key: &str) -> String {
+    format!("s3://{bucket}/{key}")
+}
+
+fn fmt_rfc3339(d: &DateTime) -> String {
+    d.fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)
+        .unwrap_or_default()
+}
+
+fn write_json_line<W: io::Write, T: Serialize>(w: &mut W, value: &T) -> io::Result<()> {
+    serde_json::to_writer(&mut *w, value).map_err(io::Error::other)?;
+    w.write_all(b"\n")
+}
+
+/// Per-object fields shared by ls and dl JSON outputs.
+#[derive(Serialize)]
+struct ObjectMetadata<'a> {
+    key: &'a str,
+    uri: String,
+    size: i64,
+    last_modified: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    etag: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    storage_class: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checksum_algorithms: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restore_status: Option<&'a RestoreStatus>,
+}
+
+impl<'a> ObjectMetadata<'a> {
+    fn new(bucket: &str, obj: &'a S3Object) -> Self {
+        Self {
+            key: &obj.key,
+            uri: s3_uri(bucket, &obj.key),
+            size: obj.size,
+            last_modified: fmt_rfc3339(&obj.last_modified),
+            etag: obj.etag.as_deref(),
+            storage_class: obj.storage_class.as_deref(),
+            checksum_algorithms: obj.checksum_algorithms.as_deref(),
+            restore_status: obj.restore_status.as_ref(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum JsonLsRecord<'a> {
+    Object {
+        bucket: &'a str,
+        #[serde(flatten)]
+        meta: ObjectMetadata<'a>,
+    },
+    Prefix {
+        bucket: &'a str,
+        key: &'a str,
+        uri: String,
+    },
+}
+
+impl<'a> JsonLsRecord<'a> {
+    fn from_result(bucket: &'a str, result: &'a PrefixResult) -> Self {
+        match result {
+            PrefixResult::Object(obj) => JsonLsRecord::Object {
+                bucket,
+                meta: ObjectMetadata::new(bucket, obj),
+            },
+            PrefixResult::Prefix(prefix) => JsonLsRecord::Prefix {
+                bucket,
+                key: prefix,
+                uri: s3_uri(bucket, prefix),
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DownloadedRecord {
+    object: S3Object,
+    local_path: PathBuf,
+}
+
+#[derive(Serialize)]
+struct JsonDlObject<'a> {
+    bucket: &'a str,
+    #[serde(flatten)]
+    meta: ObjectMetadata<'a>,
+    local_path: String,
+}
+
+impl<'a> JsonDlObject<'a> {
+    fn new(bucket: &'a str, rec: &'a DownloadedRecord) -> Self {
+        Self {
+            bucket,
+            meta: ObjectMetadata::new(bucket, &rec.object),
+            local_path: rec.local_path.display().to_string(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct JsonDlSummary {
+    bytes: usize,
+    discovery_ms: u64,
+    download_ms: u64,
+    bytes_per_sec: u64,
+}
+
+#[derive(Serialize)]
+struct JsonDlWrapper<'a> {
+    downloads: Vec<JsonDlObject<'a>>,
+    summary: &'a JsonDlSummary,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "event", rename_all = "lowercase")]
+enum JsonDlEvent<'a> {
+    Downloaded {
+        #[serde(flatten)]
+        record: JsonDlObject<'a>,
+    },
+    Summary {
+        #[serde(flatten)]
+        record: &'a JsonDlSummary,
+    },
 }
 
 /// Classify the result of a write to stdout.
@@ -732,6 +988,24 @@ struct S3Object {
     key: String,
     size: i64,
     last_modified: DateTime,
+    etag: Option<String>,
+    storage_class: Option<String>,
+    checksum_algorithms: Option<Vec<String>>,
+    restore_status: Option<RestoreStatus>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RestoreStatus {
+    in_progress: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiry: Option<String>,
+}
+
+/// S3 returns ETag as a quoted string per the HTTP entity-tag grammar
+/// (e.g. `"d41d8cd98f00b204e9800998ecf8427e"`). Strip the syntactic quotes
+/// so consumers get the bare hash to compare against.
+fn unquote_etag(s: String) -> String {
+    s.trim_matches('"').to_owned()
 }
 
 impl From<Object> for S3Object {
@@ -742,6 +1016,19 @@ impl From<Object> for S3Object {
             last_modified: obj
                 .last_modified
                 .unwrap_or_else(|| DateTime::from_millis(0)),
+            etag: obj.e_tag.map(unquote_etag),
+            storage_class: obj.storage_class.map(|s| s.as_str().to_owned()),
+            checksum_algorithms: obj
+                .checksum_algorithm
+                .filter(|v| !v.is_empty())
+                .map(|v| v.into_iter().map(|a| a.as_str().to_owned()).collect()),
+            restore_status: obj.restore_status.map(|rs| RestoreStatus {
+                in_progress: rs.is_restore_in_progress.unwrap_or(false),
+                expiry: rs.restore_expiry_date.map(|d| {
+                    d.fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)
+                        .unwrap_or_default()
+                }),
+            }),
         }
     }
 }
@@ -752,6 +1039,10 @@ impl S3Object {
             key,
             size: obj.content_length().expect("Content length is present"),
             last_modified: obj.last_modified.unwrap(),
+            etag: obj.e_tag.map(unquote_etag),
+            storage_class: obj.storage_class.map(|s| s.as_str().to_owned()),
+            checksum_algorithms: None,
+            restore_status: None,
         }
     }
 }
@@ -855,6 +1146,37 @@ fn compile_format(format: &str) -> Result<Vec<FormatToken>> {
                 "last_modified" => tokens.push(FormatToken::Variable(|_, obj| match obj {
                     PrefixResult::Object(obj) => obj.last_modified.to_string(),
                     PrefixResult::Prefix(_) => "-1".to_owned(),
+                })),
+                "etag" => tokens.push(FormatToken::Variable(|_, obj| match obj {
+                    PrefixResult::Object(obj) => obj.etag.clone().unwrap_or_default(),
+                    PrefixResult::Prefix(_) => String::new(),
+                })),
+                "storage_class" => tokens.push(FormatToken::Variable(|_, obj| match obj {
+                    PrefixResult::Object(obj) => obj.storage_class.clone().unwrap_or_default(),
+                    PrefixResult::Prefix(_) => String::new(),
+                })),
+                "restore_in_progress" => tokens.push(FormatToken::Variable(|_, obj| match obj {
+                    PrefixResult::Object(obj) => match &obj.restore_status {
+                        Some(rs) => rs.in_progress.to_string(),
+                        None => String::new(),
+                    },
+                    PrefixResult::Prefix(_) => String::new(),
+                })),
+                "restore_expiry" => tokens.push(FormatToken::Variable(|_, obj| match obj {
+                    PrefixResult::Object(obj) => obj
+                        .restore_status
+                        .as_ref()
+                        .and_then(|rs| rs.expiry.clone())
+                        .unwrap_or_default(),
+                    PrefixResult::Prefix(_) => String::new(),
+                })),
+                "checksums" => tokens.push(FormatToken::Variable(|_, obj| match obj {
+                    PrefixResult::Object(obj) => obj
+                        .checksum_algorithms
+                        .as_ref()
+                        .map(|v| v.join(","))
+                        .unwrap_or_default(),
+                    PrefixResult::Prefix(_) => String::new(),
                 })),
                 _ => {
                     return Err(anyhow::anyhow!(
@@ -966,5 +1288,95 @@ mod tests {
     #[test]
     fn test_format_invalid_variable() {
         assert!(compile_format("{invalid_var}").is_err());
+    }
+
+    #[rstest]
+    #[case("\"abc123\"", "abc123")]
+    #[case("abc123", "abc123")]
+    #[case("", "")]
+    fn test_unquote_etag(#[case] input: &str, #[case] expected: &str) {
+        assert_eq!(unquote_etag(input.to_owned()), expected);
+    }
+
+    #[rstest]
+    #[case("{etag}", "abc123")]
+    #[case("{storage_class}", "STANDARD")]
+    #[case("{checksums}", "SHA256")]
+    #[case("{etag} {storage_class}", "abc123 STANDARD")]
+    #[trace]
+    fn test_compile_format_new_vars(#[case] format: &str, #[case] expected: &str) {
+        use aws_sdk_s3::types::{ChecksumAlgorithm, ObjectStorageClass};
+        let fmt = compile_format(format).unwrap();
+        let object = Object::builder()
+            .key("test/file.txt")
+            .size(1234)
+            .e_tag("\"abc123\"")
+            .storage_class(ObjectStorageClass::Standard)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .build();
+        let result = format_user("bkt", &PrefixResult::Object(S3Object::from(object)), &fmt);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_compile_format_new_vars_missing_render_empty() {
+        let fmt = compile_format(
+            "[{etag}|{storage_class}|{restore_in_progress}|{restore_expiry}|{checksums}]",
+        )
+        .unwrap();
+        let object = Object::builder().key("test/file.txt").size(1234).build();
+        let result = format_user("bkt", &PrefixResult::Object(S3Object::from(object)), &fmt);
+        assert_eq!(result, "[||||]");
+    }
+
+    #[test]
+    fn test_json_ls_record_object_omits_missing_fields() {
+        let object = Object::builder().key("a/b.txt").size(42).build();
+        let result = PrefixResult::Object(S3Object::from(object));
+        let record = JsonLsRecord::from_result("bkt", &result);
+        let v = serde_json::to_value(&record).unwrap();
+        assert_eq!(v["type"], "object");
+        assert_eq!(v["bucket"], "bkt");
+        assert_eq!(v["key"], "a/b.txt");
+        assert_eq!(v["uri"], "s3://bkt/a/b.txt");
+        assert_eq!(v["size"], 42);
+        // Optional fields not populated by Object::builder() must be omitted.
+        assert!(v.get("etag").is_none());
+        assert!(v.get("storage_class").is_none());
+        assert!(v.get("checksum_algorithms").is_none());
+        assert!(v.get("restore_status").is_none());
+    }
+
+    #[test]
+    fn test_json_ls_record_object_includes_optional_fields() {
+        use aws_sdk_s3::types::{ChecksumAlgorithm, ObjectStorageClass};
+        let object = Object::builder()
+            .key("a/b.txt")
+            .size(42)
+            .e_tag("\"deadbeef\"")
+            .storage_class(ObjectStorageClass::IntelligentTiering)
+            .checksum_algorithm(ChecksumAlgorithm::Sha256)
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .build();
+        let result = PrefixResult::Object(S3Object::from(object));
+        let record = JsonLsRecord::from_result("bkt", &result);
+        let v = serde_json::to_value(&record).unwrap();
+        assert_eq!(v["etag"], "deadbeef");
+        assert_eq!(v["storage_class"], "INTELLIGENT_TIERING");
+        let algos = v["checksum_algorithms"].as_array().unwrap();
+        assert_eq!(algos.len(), 2);
+    }
+
+    #[test]
+    fn test_json_ls_record_prefix_shape() {
+        let result = PrefixResult::Prefix("dir/".to_owned());
+        let record = JsonLsRecord::from_result("bkt", &result);
+        let v = serde_json::to_value(&record).unwrap();
+        assert_eq!(v["type"], "prefix");
+        assert_eq!(v["bucket"], "bkt");
+        assert_eq!(v["key"], "dir/");
+        assert_eq!(v["uri"], "s3://bkt/dir/");
+        assert!(v.get("size").is_none());
+        assert!(v.get("last_modified").is_none());
     }
 }

@@ -2940,6 +2940,8 @@ dependencies = [
  "rstest",
  "rustls",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "testcontainers",
  "testcontainers-modules",
  "tokio",

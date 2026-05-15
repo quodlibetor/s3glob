@@ -737,6 +737,156 @@ async fn create_object_with_size(
     Ok(())
 }
 
+async fn create_object_with_checksum(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    size: usize,
+    algorithm: aws_sdk_s3::types::ChecksumAlgorithm,
+) -> anyhow::Result<()> {
+    let body = vec![b'a'; size];
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key.to_string())
+        .checksum_algorithm(algorithm)
+        .body(ByteStream::from(body))
+        .send()
+        .await?;
+    Ok(())
+}
+
+fn sha256() -> aws_sdk_s3::types::ChecksumAlgorithm {
+    aws_sdk_s3::types::ChecksumAlgorithm::Sha256
+}
+
+fn snapshot_by_key(
+    listed: &aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output,
+) -> std::collections::HashMap<String, aws_sdk_s3::types::Object> {
+    listed
+        .contents()
+        .iter()
+        .filter_map(|o| o.key().map(|k| (k.to_string(), o.clone())))
+        .collect()
+}
+
+fn run_and_capture_stdout(mut cmd: Command) -> anyhow::Result<String> {
+    let output = cmd.output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "s3glob failed with {}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+fn parse_records(stdout: &str, mode: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+    if mode == "json" {
+        serde_json::from_str(stdout.trim())
+            .map_err(|e| anyhow::anyhow!("not valid JSON array: {e}\n{stdout}"))
+    } else {
+        stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l)
+                    .map_err(|e| anyhow::anyhow!("invalid NDJSON line {l:?}: {e}"))
+            })
+            .collect()
+    }
+}
+
+/// Returns `(downloads, summary)`. For ndjson, also asserts there is exactly
+/// one summary record and it is the last one (the contract: per-pool arrival
+/// order is undefined, but exactly one summary closes the stream).
+fn parse_dl_records(
+    stdout: &str,
+    mode: &str,
+) -> anyhow::Result<(Vec<serde_json::Value>, serde_json::Value)> {
+    if mode == "json" {
+        let v: serde_json::Value = serde_json::from_str(stdout.trim())
+            .map_err(|e| anyhow::anyhow!("not valid JSON: {e}\n{stdout}"))?;
+        let downloads = v["downloads"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("expected downloads array, got {v}"))?
+            .clone();
+        Ok((downloads, v["summary"].clone()))
+    } else {
+        let parsed = parse_records(stdout, mode)?;
+        let summary_count = parsed.iter().filter(|v| v["event"] == "summary").count();
+        assert_eq!(
+            summary_count, 1,
+            "expected exactly one summary record, got {summary_count}: {parsed:#?}"
+        );
+        let last = parsed
+            .last()
+            .filter(|v| v["event"] == "summary")
+            .ok_or_else(|| anyhow::anyhow!("expected summary as last record: {parsed:?}"))?
+            .clone();
+        let downloads = parsed
+            .into_iter()
+            .filter(|v| v["event"] == "downloaded")
+            .collect();
+        Ok((downloads, last))
+    }
+}
+
+fn assert_object_metadata_matches(
+    record: &serde_json::Value,
+    bucket: &str,
+    server: &aws_sdk_s3::types::Object,
+) -> anyhow::Result<()> {
+    let key = record["key"].as_str().unwrap();
+    assert_eq!(record["bucket"], bucket);
+    assert_eq!(record["uri"], format!("s3://{bucket}/{key}"));
+    assert_eq!(record["size"].as_i64().unwrap(), server.size().unwrap());
+    assert_eq!(
+        record["last_modified"],
+        server
+            .last_modified()
+            .unwrap()
+            .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)?
+    );
+    // S3 returns ETag wrapped in HTTP entity-tag quotes; s3glob strips them.
+    assert_eq!(record["etag"], server.e_tag().unwrap().trim_matches('"'));
+    assert_eq!(
+        record["storage_class"],
+        server.storage_class().unwrap().as_str()
+    );
+    let server_checksums: Vec<&str> = server
+        .checksum_algorithm()
+        .iter()
+        .map(|a| a.as_str())
+        .collect();
+    if server_checksums.is_empty() {
+        // If MinIO doesn't surface checksum_algorithm, s3glob must omit the
+        // field rather than emitting an empty list.
+        assert!(
+            record.get("checksum_algorithms").is_none(),
+            "server returned no checksum_algorithm but s3glob emitted: {}",
+            record["checksum_algorithms"]
+        );
+    } else {
+        let emitted: Vec<&str> = record["checksum_algorithms"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("checksum_algorithms missing or not array"))?
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(emitted, server_checksums);
+    }
+    // restore_status only populated for in-progress Glacier restores; MinIO
+    // doesn't simulate Glacier so it must be omitted.
+    assert!(
+        record.get("restore_status").is_none(),
+        "unexpected restore_status: {}",
+        record["restore_status"]
+    );
+    Ok(())
+}
+
 fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
     let mut command = assert_cmd::cargo::cargo_bin_cmd!("s3glob");
     let log_directive = env::var("S3GLOB_LOG").unwrap_or_else(|_| "s3glob=trace".to_string());
@@ -877,6 +1027,226 @@ impl LogConsumer for LogPrinter {
         }
         .boxed()
     }
+}
+
+/// Verify both `--output json` and `--output ndjson` end-to-end against
+/// MinIO: the right number of records appear, each metadata field matches
+/// what `ListObjectsV2` actually returns, and json mode is sorted by key.
+#[rstest]
+#[case::json("json", true)]
+#[case::ndjson("ndjson", false)]
+#[tokio::test]
+async fn test_ls_output_json_round_trip(
+    #[case] mode: &str,
+    #[case] expect_sorted: bool,
+) -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+    let bucket = format!("ls-rt-{mode}");
+    client.create_bucket().bucket(&bucket).send().await?;
+    // Created out of lexicographic order, with a nested key so MinIO surfaces
+    // a CommonPrefix (`prefix/sub/`) and we exercise the prefix branch too.
+    create_object_with_checksum(&client, &bucket, "prefix/c.txt", 33, sha256()).await?;
+    create_object_with_checksum(&client, &bucket, "prefix/a.txt", 11, sha256()).await?;
+    create_object_with_checksum(&client, &bucket, "prefix/b.txt", 22, sha256()).await?;
+    create_object_with_checksum(&client, &bucket, "prefix/sub/x.txt", 7, sha256()).await?;
+
+    let server_by_key = snapshot_by_key(
+        &client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .prefix("prefix/")
+            .delimiter("/")
+            .send()
+            .await?,
+    );
+
+    let pattern = format!("s3://{bucket}/prefix/*");
+    let stdout = run_and_capture_stdout(run_s3glob(
+        port,
+        &["ls", "--output", mode, pattern.as_str()],
+    )?)?;
+    let records = parse_records(&stdout, mode)?;
+
+    let objects: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["type"] == "object").collect();
+    let prefixes: Vec<&serde_json::Value> =
+        records.iter().filter(|r| r["type"] == "prefix").collect();
+    assert_eq!(objects.len(), server_by_key.len(), "objects: {records:#?}");
+    assert!(
+        prefixes.iter().any(|p| p["key"] == "prefix/sub/"),
+        "expected prefix/sub/ to appear as a prefix record: {records:#?}"
+    );
+    for prefix in &prefixes {
+        let key = prefix["key"].as_str().unwrap();
+        assert_eq!(prefix["bucket"], bucket);
+        assert_eq!(prefix["uri"], format!("s3://{bucket}/{key}"));
+        // Prefix records carry no object-only metadata.
+        for absent in [
+            "size",
+            "last_modified",
+            "etag",
+            "storage_class",
+            "checksum_algorithms",
+            "restore_status",
+        ] {
+            assert!(prefix.get(absent).is_none(), "{absent} on prefix {prefix}");
+        }
+    }
+
+    if expect_sorted {
+        let keys: Vec<&str> = objects.iter().map(|r| r["key"].as_str().unwrap()).collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "json output must be sorted by key");
+    }
+
+    for record in &objects {
+        let key = record["key"].as_str().unwrap();
+        let server = server_by_key
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("emitted key {key:?} not in server snapshot"))?;
+        assert_object_metadata_matches(record, &bucket, server)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ls_output_format_conflicts_with_json() -> anyhow::Result<()> {
+    let (_node, port, _client) = minio_and_client().await;
+    let mut cmd = run_s3glob(
+        port,
+        &[
+            "ls",
+            "--output",
+            "json",
+            "--format",
+            "{key}",
+            "s3://anything/foo/*",
+        ],
+    )?;
+    cmd.assert()
+        .failure()
+        .stderr(contains("--format").and(contains("--output")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ls_format_with_explicit_text_output_is_allowed() -> anyhow::Result<()> {
+    // --format is rejected only against json/ndjson; explicit `--output text`
+    // must still permit --format. (clap's conflicts_with would over-reject here.)
+    let (_node, port, client) = minio_and_client().await;
+    let bucket = "format-text-test";
+    client.create_bucket().bucket(bucket).send().await?;
+    create_object(&client, bucket, "prefix/file.txt").await?;
+
+    // Distinctive prefix on the format so a regression that silently drops
+    // --format (and falls back to default text formatting) would fail the
+    // assertion — the default format does not emit "FMT:".
+    let pattern = format!("s3://{}/prefix/*", bucket);
+    let mut cmd = run_s3glob(
+        port,
+        &[
+            "ls",
+            "--output",
+            "text",
+            "--format",
+            "FMT:{key}",
+            pattern.as_str(),
+        ],
+    )?;
+    cmd.assert()
+        .success()
+        .stdout(contains("FMT:prefix/file.txt"));
+    Ok(())
+}
+
+/// Object sizes chosen to land in three different download pools
+/// (`DlPools::download_object`): the 50-byte object goes to the 200KB pool,
+/// the 250 KB object to the 1 MB pool, and the 1.5 MB object to the 10 MB
+/// pool. This stresses the assertion that arrival order doesn't break the
+/// JSON / NDJSON contract (summary is always last; JSON wrapper is sorted).
+const POOL_DIVERSE_SIZES: &[(usize, &str)] = &[
+    (50, "a-tiny.txt"),
+    (250_000, "b-medium.txt"),
+    (1_500_000, "c-large.txt"),
+];
+
+#[rstest]
+#[case::json("json", true)]
+#[case::ndjson("ndjson", false)]
+#[tokio::test]
+async fn test_dl_output_json_round_trip(
+    #[case] mode: &str,
+    #[case] expect_sorted: bool,
+) -> anyhow::Result<()> {
+    let (_node, port, client) = minio_and_client().await;
+    let bucket = format!("dl-rt-{mode}");
+    client.create_bucket().bucket(&bucket).send().await?;
+    let mut expected_total: u64 = 0;
+    for (size, name) in POOL_DIVERSE_SIZES {
+        create_object_with_checksum(&client, &bucket, &format!("prefix/{name}"), *size, sha256())
+            .await?;
+        expected_total += *size as u64;
+    }
+
+    let server_by_key = snapshot_by_key(
+        &client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .prefix("prefix/")
+            .send()
+            .await?,
+    );
+
+    let tempdir = TempDir::new()?;
+    let out_path = tempdir.path().to_str().unwrap();
+    let pattern = format!("s3://{bucket}/prefix/*");
+    let stdout = run_and_capture_stdout(run_s3glob(
+        port,
+        &[
+            "dl",
+            "--output",
+            mode,
+            "-p",
+            "abs",
+            pattern.as_str(),
+            out_path,
+        ],
+    )?)?;
+
+    let (downloads, summary) = parse_dl_records(&stdout, mode)?;
+    assert_eq!(downloads.len(), server_by_key.len());
+
+    if expect_sorted {
+        let keys: Vec<&str> = downloads
+            .iter()
+            .map(|d| d["key"].as_str().unwrap())
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "json downloads must be sorted by key");
+    }
+
+    for record in &downloads {
+        let key = record["key"].as_str().unwrap();
+        let server = server_by_key
+            .get(key)
+            .ok_or_else(|| anyhow::anyhow!("emitted key {key:?} not in server snapshot"))?;
+        assert_object_metadata_matches(record, &bucket, server)?;
+        let local_path = record["local_path"].as_str().unwrap();
+        assert!(
+            std::path::Path::new(local_path).exists(),
+            "local_path {local_path} does not exist"
+        );
+    }
+    assert_eq!(summary["bytes"], expected_total);
+    for field in ["discovery_ms", "download_ms", "bytes_per_sec"] {
+        assert!(
+            summary.get(field).and_then(|v| v.as_u64()).is_some(),
+            "summary missing or non-integer {field}: {summary}"
+        );
+    }
+    Ok(())
 }
 
 /// Closing stdout early (e.g. piping to `head`) should not panic or
