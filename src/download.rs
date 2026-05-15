@@ -102,7 +102,10 @@ pub(crate) struct Downloader {
 
 #[derive(Debug)]
 pub(crate) enum Notification {
-    ObjectDownloaded(PathBuf),
+    ObjectDownloaded {
+        object: S3Object,
+        local_path: PathBuf,
+    },
     BytesDownloaded(usize),
 }
 
@@ -143,8 +146,8 @@ impl Downloader {
     }
 
     pub(crate) async fn download_object(self, obj: S3Object) {
-        let key = &obj.key;
-        let mut key_suffix = key
+        let mut key_suffix = obj
+            .key
             .strip_prefix(&self.prefix_to_strip)
             .expect("all found objects will include the prefix")
             .to_string();
@@ -161,11 +164,11 @@ impl Downloader {
             .client
             .get_object()
             .bucket(self.bucket)
-            .key(key)
+            .key(&obj.key)
             .send()
             .await;
-        let Ok(mut obj) = result else {
-            warn!("Failed to download object {}", key);
+        let Ok(mut response) = result else {
+            warn!("Failed to download object {}", obj.key);
             return;
         };
         let temp_path = path.with_extension(format!(".s3glob-tmp-{}", self.obj_id));
@@ -176,7 +179,7 @@ impl Downloader {
                 return;
             }
         };
-        let mut res = obj.body.try_next().await;
+        let mut res = response.body.try_next().await;
         loop {
             match res {
                 Ok(Some(bytes)) => {
@@ -190,11 +193,11 @@ impl Downloader {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    warn!("Failed to download object {}: {}", key, e);
+                    warn!("Failed to download object {}: {}", obj.key, e);
                     return;
                 }
             }
-            res = obj.body.try_next().await;
+            res = response.body.try_next().await;
         }
         if let Err(e) = file.flush().await {
             warn!("Failed to flush file {}: {}", temp_path.display(), e);
@@ -212,7 +215,10 @@ impl Downloader {
             return;
         };
         self.notifier
-            .send(Notification::ObjectDownloaded(path))
+            .send(Notification::ObjectDownloaded {
+                object: obj,
+                local_path: path,
+            })
             .expect("send on our channel should succeed");
     }
 }
@@ -332,6 +338,10 @@ mod tests {
                     key: key.to_string(),
                     size: 0,
                     last_modified: DateTime::from_millis(0),
+                    etag: None,
+                    storage_class: None,
+                    checksum_algorithms: None,
+                    restore_status: None,
                 })
                 .collect()
         }

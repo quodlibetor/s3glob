@@ -45,6 +45,8 @@ indicatif = "0.18"
 itertools = "0.14.0"
 num-format = "0.4"
 regex = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tokio = { version = "1.45", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
