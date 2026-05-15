@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.17](https://github.com/quodlibetor/s3glob/compare/v0.4.16...v0.4.17) - 2026-05-15
+
+### 🚀 Features
+
+- add JSON output to ls and dl by [@quodlibetor](https://github.com/quodlibetor) in [5bde7b9](https://github.com/quodlibetor/s3glob/commit/5bde7b9c34ceb789b6d790bd8a563bb58084ecf4)
+
 ## [0.4.16](https://github.com/quodlibetor/s3glob/compare/v0.4.15...v0.4.16) - 2026-05-14
 
 ### 🚀 Features
