@@ -897,25 +897,11 @@ fn assert_object_metadata_matches(
     Ok(())
 }
 
+/// An s3glob command against the test server on `port`. Nothing runs
+/// until the test runs it; assert_cmd prints stdout and stderr when an
+/// assertion fails.
 fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
-    let mut command = s3glob_cmd(port, args);
-    print_s3glob_output(&mut command);
-    Ok(command)
-}
-
-/// Like [`run_s3glob`], but without the extra run that prints output, for
-/// tests where running s3glob twice would change what they observe (e.g.
-/// the fault proxy's per-request budget).
-fn s3glob_cmd(port: u16, args: &[&str]) -> Command {
-    let mut command = assert_cmd::cargo::cargo_bin_cmd!("s3glob");
-    let log_directive = env::var("S3GLOB_LOG").unwrap_or_else(|_| "s3glob=trace".to_string());
-    command
-        .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
-        .env("AWS_ACCESS_KEY_ID", ACCESS_KEY)
-        .env("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
-        .env("S3GLOB_LOG", log_directive)
-        .args(args);
-    command
+    s3glob_with_endpoint(&format!("http://127.0.0.1:{port}"), args)
 }
 
 /// Verifies that `--force-path-style` switches the SDK from virtual-hosted
@@ -968,7 +954,6 @@ fn s3glob_with_endpoint(endpoint: &str, args: &[&str]) -> anyhow::Result<Command
         .env("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
         .env("S3GLOB_LOG", log_directive)
         .args(args);
-    print_s3glob_output(&mut command);
     Ok(command)
 }
 
@@ -988,15 +973,6 @@ async fn test_platform_tls_env_var() -> anyhow::Result<()> {
     cmd.assert().success().stdout(contains("hello/world.txt"));
 
     Ok(())
-}
-
-fn print_s3glob_output(cmd: &mut Command) {
-    let output = cmd.output().unwrap();
-    println!(
-        "==== s3glob stdout ====\n{}\n==== s3glob stderr ====\n{}\n==== end s3glob output ====\n",
-        String::from_utf8(output.stdout).unwrap(),
-        String::from_utf8(output.stderr).unwrap()
-    );
 }
 
 /// A consumer that logs the output of container with the [`log`] crate.
@@ -1394,7 +1370,7 @@ async fn test_ls_listing_failure_exits_nonzero(#[case] flags: &[&str]) -> anyhow
     let mut args = vec!["ls", "--no-recursive-auto-parallel", "--max-retries=0"];
     args.extend_from_slice(flags);
     args.push(&pattern);
-    let output = s3glob_cmd(proxy.port, &args).output()?;
+    let output = run_s3glob(proxy.port, &args)?.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -1442,7 +1418,7 @@ async fn test_ls_discovery_failure_exits_nonzero(#[case] flags: &[&str]) -> anyh
     let mut args = vec!["ls", "--max-retries=0"];
     args.extend_from_slice(flags);
     args.push(&pattern);
-    let output = s3glob_cmd(proxy.port, &args).output()?;
+    let output = run_s3glob(proxy.port, &args)?.output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -1474,7 +1450,7 @@ async fn test_dl_listing_failure_exits_nonzero() -> anyhow::Result<()> {
 
     let tempdir = TempDir::new()?;
     let pattern = format!("s3://{bucket}/prefix/*/**");
-    let output = s3glob_cmd(
+    let output = run_s3glob(
         proxy.port,
         &[
             "dl",
@@ -1484,7 +1460,7 @@ async fn test_dl_listing_failure_exits_nonzero() -> anyhow::Result<()> {
             &pattern,
             tempdir.path().to_str().unwrap(),
         ],
-    )
+    )?
     .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -1570,7 +1546,7 @@ async fn test_ls_retries_throttled_listing() -> anyhow::Result<()> {
     let proxy = FaultProxy::start(port, vec![Fault::times("prefix/0003/", 3)]).await;
 
     let pattern = format!("s3://{bucket}/prefix/*/**");
-    let output = s3glob_cmd(
+    let output = run_s3glob(
         proxy.port,
         &[
             "ls",
@@ -1578,7 +1554,7 @@ async fn test_ls_retries_throttled_listing() -> anyhow::Result<()> {
             "--max-backoff=0.05",
             &pattern,
         ],
-    )
+    )?
     .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1621,7 +1597,7 @@ async fn test_ls_honors_server_retry_after() -> anyhow::Result<()> {
     let pattern = format!("s3://{bucket}/prefix/*/**");
     let start = std::time::Instant::now();
     // --max-backoff is far below the server's request: the server wins.
-    let output = s3glob_cmd(
+    let output = run_s3glob(
         proxy.port,
         &[
             "ls",
@@ -1629,7 +1605,7 @@ async fn test_ls_honors_server_retry_after() -> anyhow::Result<()> {
             "--max-backoff=0.01",
             &pattern,
         ],
-    )
+    )?
     .output()?;
     let elapsed = start.elapsed();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1657,7 +1633,7 @@ async fn test_ls_gives_up_after_max_retries() -> anyhow::Result<()> {
     let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0001/")]).await;
 
     let pattern = format!("s3://{bucket}/prefix/*/**");
-    let output = s3glob_cmd(
+    let output = run_s3glob(
         proxy.port,
         &[
             "ls",
@@ -1666,7 +1642,7 @@ async fn test_ls_gives_up_after_max_retries() -> anyhow::Result<()> {
             "--max-backoff=0.01",
             &pattern,
         ],
-    )
+    )?
     .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
 
