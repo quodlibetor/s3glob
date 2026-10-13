@@ -19,11 +19,13 @@ use serde::Serialize;
 use tokio::runtime::Runtime;
 use tracing::debug;
 
+mod bucket;
 mod download;
 mod glob_matcher;
 mod messaging;
 mod platform_tls;
 mod progress;
+mod retry;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -142,7 +144,8 @@ enum Command {
     /// slower than you hope, or if you're getting a slowdown error.
     ///
     /// If you want to limit parallel API calls, you can use the
-    /// --max-parallelism flag.
+    /// --max-parallelism flag. s3glob also lowers its parallelism by
+    /// itself when S3 throttles it, and retries the throttled requests.
     ///
     /// You probably want the maximum parallelism possible. Because of the
     /// APIs provided by AWS, s3glob can only meaningfully issue parallel
@@ -308,10 +311,27 @@ struct Opts {
 
     /// Maximum number of parallel requests to make
     ///
-    /// If you get a slowdown error you can use this to limit the number of
-    /// concurrent requests.
+    /// When S3 throttles requests (a SlowDown error) s3glob halves its
+    /// parallelism and then slowly raises it again, never above this
+    /// value. Lower it if you want to start out gentler on a bucket that
+    /// you know is busy.
     #[clap(short = 'M', long, global = true, default_value = "10000")]
     max_parallelism: usize,
+
+    /// How many times to retry a failed S3 request before giving up
+    ///
+    /// Throttling (SlowDown) and transient errors (timeouts, 500s) are
+    /// retried with exponential backoff. Other errors, like access denied,
+    /// are not retried.
+    #[clap(long, global = true, default_value = "10")]
+    max_retries: u32,
+
+    /// Longest time, in seconds, to back off between retries
+    ///
+    /// If S3 says how long to wait (the `x-amz-retry-after` header)
+    /// s3glob waits exactly that long, even if it is longer than this.
+    #[clap(long, global = true, default_value = "20", value_name = "SECONDS")]
+    max_backoff: f64,
 
     /// Disable automatic parallelization of `**` (recursive) listings
     ///
@@ -512,7 +532,13 @@ fn main() {
 
     let rt = Runtime::new().expect("tokio runtime should create successfully");
     rt.block_on(async {
-        if let Err(err) = run(opts).await {
+        let mut retrier = None;
+        let result = run(opts, &mut retrier).await;
+        // Shown even with -q: throttling explains a slow or failed run.
+        if let Some(summary) = retrier.as_ref().and_then(retry::Retrier::summary) {
+            progress::get().error(summary);
+        }
+        if let Err(err) = result {
             // TODO: Separate user error from internal error?
             message_err!("Error: {}", err);
             let mut err = err.source();
@@ -540,7 +566,9 @@ fn main() {
     rt.shutdown_timeout(Duration::from_millis(1));
 }
 
-async fn run(opts: Opts) -> Result<()> {
+/// `retrier` is filled in once options are validated, so `main` can report
+/// throttling even when the run fails.
+async fn run(opts: Opts, retrier: &mut Option<retry::Retrier>) -> Result<()> {
     let start = Instant::now();
     if let Command::List {
         format: Some(_),
@@ -569,9 +597,17 @@ async fn run(opts: Opts) -> Result<()> {
         bail!("pattern must have a <bucket>/<pattern> format, with an optional s3:// prefix");
     };
 
-    let client = create_s3_client(&opts, &bucket).await?;
+    let max_backoff = Duration::try_from_secs_f64(opts.max_backoff)
+        .map_err(|e| anyhow!("invalid --max-backoff {}: {e}", opts.max_backoff))?;
+    let retrier = retrier.insert(retry::Retrier::new(
+        opts.max_parallelism,
+        opts.max_retries,
+        max_backoff,
+    ));
+    let client = create_s3_client(&opts, &bucket, retrier).await?;
 
-    let engine = S3Engine::new(client.clone(), bucket.clone());
+    let s3_bucket = bucket::Bucket::new(client, retrier.clone(), bucket.clone());
+    let engine = S3Engine::new(s3_bucket.clone());
     let mut matcher = S3GlobMatcher::parse(
         raw_pattern.clone(),
         &opts.delimiter.to_string(),
@@ -757,8 +793,7 @@ async fn run(opts: Opts) -> Result<()> {
                 tokio::sync::mpsc::unbounded_channel::<download::Notification>();
             let base_path = PathBuf::from(dest);
             let dl = download::Downloader::new(
-                client.clone(),
-                bucket.clone(),
+                s3_bucket.clone(),
                 prefix_to_strip,
                 flatten,
                 base_path.clone(),
@@ -833,8 +868,7 @@ async fn run(opts: Opts) -> Result<()> {
                     prefix_to_strip
                 );
                 let dl = download::Downloader::new(
-                    client,
-                    bucket.clone(),
+                    s3_bucket,
                     prefix_to_strip,
                     flatten,
                     base_path,
@@ -1184,7 +1218,11 @@ impl S3Object {
 }
 
 /// Create a new S3 client with region auto-detection
-async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
+async fn create_s3_client(
+    opts: &Opts,
+    bucket: &String,
+    retrier: &retry::Retrier,
+) -> Result<Client> {
     let region = RegionProviderChain::first_try(Region::new(opts.region.clone()));
     let mut config = aws_config::defaults(BehaviorVersion::latest()).region(region);
     if opts.no_sign_request {
@@ -1198,11 +1236,14 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     let config = config.load().await;
     let client = build_s3_client(&config, opts.force_path_style);
 
-    let res = client.head_bucket().bucket(bucket).send().await;
+    let res = retrier
+        .send(|| client.head_bucket().bucket(bucket).send())
+        .await;
 
     let bucket_region = match res {
         Ok(_) => return Ok(client),
         Err(err) => err
+            .sdk_error()
             .raw_response()
             .and_then(|res| res.headers().get("x-amz-bucket-region"))
             .map(str::to_owned)
@@ -1229,6 +1270,10 @@ fn build_s3_client(config: &aws_config::SdkConfig, force_path_style: bool) -> Cl
     Client::from_conf(
         aws_sdk_s3::config::Builder::from(config)
             .force_path_style(force_path_style)
+            // Every call retries through `retry::Retrier`, which also adapts
+            // parallelism to throttling; SDK retries would hide throttling
+            // from it.
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .build(),
     )
 }

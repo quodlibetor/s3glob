@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context as _, Result};
-use aws_sdk_s3::Client;
 use aws_sdk_s3::types::Object;
 use num_format::{Locale, ToFormattedString as _};
 use tokio::sync::Semaphore;
@@ -15,6 +14,7 @@ use std::sync::Mutex;
 #[cfg(test)]
 use tracing::info;
 
+use crate::bucket::Bucket;
 use crate::{S3Object, add_atomic, progressln};
 
 use super::{LiveStatus, MatchBatch, PrefixResult, PrefixSearchResult};
@@ -86,32 +86,24 @@ pub trait Engine: Send + Sync + 'static {
 
 #[derive(Debug, Clone)]
 pub struct S3Engine {
-    client: Client,
-    bucket: String,
+    bucket: Bucket,
 }
 
 impl S3Engine {
-    pub fn new(client: Client, bucket: String) -> Self {
-        Self { client, bucket }
+    pub fn new(bucket: Bucket) -> Self {
+        Self { bucket }
     }
 }
 
 async fn list_matching_objects(
-    client: Client,
-    bucket: String,
+    engine: S3Engine,
     prefix: String,
     matcher: Arc<regex::Regex>,
     total_objects: Arc<AtomicUsize>,
     tx: UnboundedSender<MatchBatch>,
 ) -> Result<()> {
-    let mut paginator = client
-        .list_objects_v2()
-        .bucket(bucket.clone())
-        .prefix(prefix)
-        .into_paginator()
-        .send();
-
-    while let Some(page) = paginator.next().await {
+    let mut pages = engine.bucket.list_pages(&prefix, None);
+    while let Some(page) = pages.next().await {
         let page = page?;
         if let Some(contents) = page.contents {
             let mut matching_objects = Vec::new();
@@ -183,22 +175,14 @@ impl Engine for S3Engine {
     ) -> Result<ScanResult> {
         trace!(prefix, ?max_prefixes, "scanning for prefixes within");
         let mut result = ScanResult::default();
-        let mut paginator = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(prefix)
-            .delimiter(delimiter)
-            .into_paginator()
-            .send();
-
         let mut warning_count = 0;
         let mut warning_inc = 50_000;
         let mut pages_seen = 0usize;
-        while let Some(page) = paginator.next().await {
+        let mut pages = self.bucket.list_pages(prefix, Some(delimiter));
+        while let Some(page) = pages.next().await {
             let page = page?;
             pages_seen += 1;
-            let page_is_truncated = page.is_truncated.unwrap_or(false);
+            let page_is_truncated = pages.has_more();
             if result.len() >= warning_count + warning_inc {
                 // Routed through progressln! (not tracing::warn!) so the
                 // prefix-discovery spinner is suspended while we print, and
@@ -247,12 +231,8 @@ impl Engine for S3Engine {
     async fn probe_prefix(&mut self, prefix: &str, max_keys: i32) -> Result<ScanResult> {
         trace!(prefix, max_keys, "probing prefix for direct content");
         let response = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(prefix)
-            .max_keys(max_keys)
-            .send()
+            .bucket
+            .list_first_page(prefix, None, Some(max_keys))
             .await?;
         Ok(ScanResult {
             prefixes: Vec::new(),
@@ -279,20 +259,13 @@ impl Engine for S3Engine {
         let permit = Arc::new(tokio::sync::Semaphore::new(max_parallelism));
 
         for prefix in prefixes {
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
+            let engine = self.clone();
             let tx = tx.clone();
             let prefix = prefix.clone();
             let permit = permit.clone().acquire_owned().await;
 
             tokio::spawn(async move {
-                let result = client
-                    .list_objects_v2()
-                    .bucket(bucket)
-                    .prefix(prefix.clone())
-                    .max_keys(1)
-                    .send()
-                    .await;
+                let result = engine.bucket.list_first_page(&prefix, None, Some(1)).await;
                 drop(permit);
 
                 match result {
@@ -334,8 +307,7 @@ impl Engine for S3Engine {
             }
             // just get the object info for each prefix
             let permit = permit.clone().acquire_owned().await;
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
+            let engine = self.clone();
             let prefix = prefix.clone();
             let tx = tx.clone();
 
@@ -353,21 +325,14 @@ impl Engine for S3Engine {
                 // also a directory.
                 // simple_append's loose verification can produce phantom
                 // prefixes which are neither.
-                let head = client
-                    .head_object()
-                    .bucket(bucket.clone())
-                    .key(prefix.clone())
-                    .send()
-                    .await;
+                let head = engine.bucket.head_object(&prefix).await;
                 let directory_form = format!("{prefix}{delimiter}");
-                let dir_check = client
-                    .list_objects_v2()
-                    .bucket(bucket.clone())
-                    .prefix(directory_form.clone())
-                    .max_keys(1)
-                    .send()
+                let dir_check = engine
+                    .bucket
+                    .list_first_page(&directory_form, None, Some(1))
                     .await;
                 drop(permit);
+                let bucket = &engine.bucket;
 
                 let mut out: Vec<PrefixResult> = Vec::new();
                 match head {
@@ -380,10 +345,14 @@ impl Engine for S3Engine {
                     }
                     // A candidate that isn't a key is expected: it may be
                     // only a directory, or neither.
-                    Err(e) if e.as_service_error().is_some_and(|e| e.is_not_found()) => {}
+                    Err(e)
+                        if e.sdk_error()
+                            .as_service_error()
+                            .is_some_and(|e| e.is_not_found()) => {}
                     Err(e) => {
                         let _ = tx.send(Err(anyhow::Error::new(e).context(format!(
-                            "checking whether s3://{bucket}/{prefix} is an object"
+                            "checking whether {} is an object",
+                            bucket.uri(&prefix)
                         ))));
                     }
                 }
@@ -394,7 +363,7 @@ impl Engine for S3Engine {
                     Ok(_) => {}
                     Err(e) => {
                         let _ = tx.send(Err(anyhow::Error::new(e)
-                            .context(format!("listing s3://{bucket}/{directory_form}"))));
+                            .context(format!("listing {}", bucket.uri(&directory_form)))));
                     }
                 }
                 if !out.is_empty() {
@@ -424,30 +393,23 @@ impl Engine for S3Engine {
         permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in presult.prefixes {
-            let client = self.client.clone();
+            let engine = self.clone();
             let total_objects = Arc::clone(&status.total_objects);
             let seen_prefixes = Arc::clone(&status.seen_prefixes);
             let matcher = matcher.clone();
-            let bucket = self.bucket.clone();
             let tx = tx.clone();
             let permit = permit.clone().acquire_owned().await;
 
             tokio::spawn(async move {
-                let result = list_matching_objects(
-                    client,
-                    bucket.clone(),
-                    prefix.clone(),
-                    matcher,
-                    total_objects,
-                    tx.clone(),
-                )
-                .await;
+                let result =
+                    list_matching_objects(engine, prefix, matcher, total_objects, tx.clone()).await;
                 drop(permit);
                 add_atomic(&seen_prefixes, 1);
                 if let Err(e) = result {
-                    // The receiver is gone only when the consumer stopped
+                    // The error already names the prefix (see `Pages`). The
+                    // receiver is gone only when the consumer stopped
                     // reading on purpose, so there is nobody to tell.
-                    let _ = tx.send(Err(e.context(format!("listing s3://{bucket}/{prefix}"))));
+                    let _ = tx.send(Err(e));
                 }
             });
         }

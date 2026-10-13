@@ -3,8 +3,8 @@ use crate::glob_matcher::GLOB_CHARS;
 use super::PathMode;
 use super::S3Object;
 use super::add_atomic;
+use crate::bucket::Bucket;
 use anyhow::{Context as _, Result};
-use aws_sdk_s3::Client;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -90,8 +90,7 @@ pub(crate) fn start_threadpool(
 
 #[derive(Debug)]
 pub(crate) struct Downloader {
-    pub(crate) client: Client,
-    pub(crate) bucket: String,
+    pub(crate) bucket: Bucket,
     pub(crate) prefix_to_strip: String,
     pub(crate) flatten: bool,
     pub(crate) base_path: PathBuf,
@@ -112,15 +111,13 @@ pub(crate) enum Notification {
 
 impl Downloader {
     pub(crate) fn new(
-        client: Client,
-        bucket: String,
+        bucket: Bucket,
         prefix_to_strip: String,
         flatten: bool,
         base_path: PathBuf,
         notifier: UnboundedSender<Notification>,
     ) -> Self {
         Self {
-            client,
             bucket,
             obj_counter: Arc::new(AtomicUsize::new(0)),
             obj_id: 0,
@@ -135,7 +132,6 @@ impl Downloader {
     pub(crate) fn fresh(&self) -> Self {
         let obj_id = add_atomic(&self.obj_counter, 1);
         Self {
-            client: self.client.clone(),
             bucket: self.bucket.clone(),
             obj_counter: Arc::clone(&self.obj_counter),
             obj_id,
@@ -152,7 +148,7 @@ impl Downloader {
         let bucket = self.bucket.clone();
         let notification = match self.try_download_object(obj).await {
             Ok((object, local_path)) => Notification::ObjectDownloaded { object, local_path },
-            Err(e) => Notification::Failed(e.context(format!("downloading s3://{bucket}/{key}"))),
+            Err(e) => Notification::Failed(e.context(format!("downloading {}", bucket.uri(&key)))),
         };
         // The receiver is gone only when the run already stopped (e.g.
         // --fail-fast), so there is nobody left to tell.
@@ -172,13 +168,10 @@ impl Downloader {
         let dir = path.parent().unwrap();
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating directory {}", dir.display()))?;
-        let mut response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(&obj.key)
-            .send()
-            .await?;
+        // Only the request is retried: a failure while streaming the body
+        // fails this download. The slot is held until the body is read, so
+        // downloads count against the throttling-adjusted limit.
+        let (mut response, _slot) = self.bucket.get_object(&obj.key).await?;
         let temp_path = path.with_extension(format!(".s3glob-tmp-{}", self.obj_id));
         let mut file = tokio::fs::File::create(&temp_path)
             .await

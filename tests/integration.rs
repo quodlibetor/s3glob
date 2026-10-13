@@ -1391,7 +1391,7 @@ async fn test_ls_listing_failure_exits_nonzero(#[case] flags: &[&str]) -> anyhow
     // --no-recursive-auto-parallel sends each `prefix/NNNN/` straight to
     // the per-prefix recursive listing, which is where the failure lands.
     let pattern = format!("s3://{bucket}/prefix/*/**");
-    let mut args = vec!["ls", "--no-recursive-auto-parallel"];
+    let mut args = vec!["ls", "--no-recursive-auto-parallel", "--max-retries=0"];
     args.extend_from_slice(flags);
     args.push(&pattern);
     let output = s3glob_cmd(proxy.port, &args).output()?;
@@ -1439,6 +1439,7 @@ async fn test_dl_listing_failure_exits_nonzero() -> anyhow::Result<()> {
         &[
             "dl",
             "--no-recursive-auto-parallel",
+            "--max-retries=0",
             "-pabs",
             &pattern,
             tempdir.path().to_str().unwrap(),
@@ -1492,6 +1493,7 @@ async fn test_ls_pipe_closed_with_listing_failure_exits_cleanly() -> anyhow::Res
             "ls",
             "--stream",
             "--no-recursive-auto-parallel",
+            "--max-retries=0",
             "--format",
             &wide_format,
             &format!("s3://{bucket}/prefix/*/**"),
@@ -1512,6 +1514,131 @@ async fn test_ls_pipe_closed_with_listing_failure_exits_cleanly() -> anyhow::Res
         "s3glob should exit 0 when the reader closed stdout: {:?}\n{}",
         output.status,
         String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(())
+}
+
+//
+// Retries: throttled requests are retried, politely
+//
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_retries_throttled_listing() -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "ls-retry";
+    bucket_with_prefixes(&client, bucket, 20).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::times("prefix/0003/", 3)]).await;
+
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let output = s3glob_cmd(
+        proxy.port,
+        &[
+            "ls",
+            "--no-recursive-auto-parallel",
+            "--max-backoff=0.05",
+            &pattern,
+        ],
+    )
+    .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected success, stderr:\n{stderr}"
+    );
+    assert_eq!(proxy.injected(), vec![3]);
+    for i in 0..20 {
+        let key = format!("prefix/{i:04}/file.txt");
+        assert!(stdout.contains(&key), "missing {key} in:\n{stdout}");
+    }
+    assert!(
+        stderr.contains("S3 is throttling requests (SlowDown):")
+            && stderr.contains("reducing parallelism to"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("S3 throttled 1 request (3 throttled responses in all)"),
+        "stderr:\n{stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_honors_server_retry_after() -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "ls-retry-after";
+    bucket_with_prefixes(&client, bucket, 3).await?;
+    let proxy = FaultProxy::start(
+        port,
+        vec![Fault {
+            retry_after_ms: Some(2000),
+            ..Fault::times("prefix/0001/", 1)
+        }],
+    )
+    .await;
+
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let start = std::time::Instant::now();
+    // --max-backoff is far below the server's request: the server wins.
+    let output = s3glob_cmd(
+        proxy.port,
+        &[
+            "ls",
+            "--no-recursive-auto-parallel",
+            "--max-backoff=0.01",
+            &pattern,
+        ],
+    )
+    .output()?;
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected success, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("S3 asked for a 2s wait"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(2),
+        "finished in {elapsed:?}, before the requested wait"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_gives_up_after_max_retries() -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "ls-give-up";
+    bucket_with_prefixes(&client, bucket, 3).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0001/")]).await;
+
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let output = s3glob_cmd(
+        proxy.port,
+        &[
+            "ls",
+            "--no-recursive-auto-parallel",
+            "--max-retries=2",
+            "--max-backoff=0.01",
+            &pattern,
+        ],
+    )
+    .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr:\n{stderr}"
+    );
+    // One attempt plus two retries.
+    assert_eq!(proxy.injected(), vec![3]);
+    assert!(
+        stderr.contains("still throttled after 2 retries"),
+        "stderr:\n{stderr}"
     );
     Ok(())
 }
