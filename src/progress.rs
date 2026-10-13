@@ -69,6 +69,19 @@ impl Progress {
         if !messaging::louder_than(MessageLevel::Quiet) {
             return;
         }
+        self.print(msg);
+    }
+
+    /// Print an error to stderr above any active progress bars (still
+    /// shown with `-q`, suppressed by `-qq`).
+    pub(crate) fn error(&self, msg: impl fmt::Display) {
+        if !messaging::louder_than(MessageLevel::VeryQuiet) {
+            return;
+        }
+        self.print(msg);
+    }
+
+    fn print(&self, msg: impl fmt::Display) {
         match &self.multi {
             Some(m) => m.suspend(|| eprintln!("{msg}")),
             None => eprintln!("{msg}"),

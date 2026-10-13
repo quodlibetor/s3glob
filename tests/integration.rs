@@ -22,6 +22,9 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 const ACCESS_KEY: &str = "test-access-key";
 const SECRET_KEY: &str = "test-secret-key";
 
+mod common;
+use common::{Fault, FaultProxy};
+
 #[rstest]
 #[case("prefix/2024-*/file*.txt", &[
     "prefix/2024-01/file1.txt",
@@ -895,6 +898,15 @@ fn assert_object_metadata_matches(
 }
 
 fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
+    let mut command = s3glob_cmd(port, args);
+    print_s3glob_output(&mut command);
+    Ok(command)
+}
+
+/// Like [`run_s3glob`], but without the extra run that prints output, for
+/// tests where running s3glob twice would change what they observe (e.g.
+/// the fault proxy's per-request budget).
+fn s3glob_cmd(port: u16, args: &[&str]) -> Command {
     let mut command = assert_cmd::cargo::cargo_bin_cmd!("s3glob");
     let log_directive = env::var("S3GLOB_LOG").unwrap_or_else(|_| "s3glob=trace".to_string());
     command
@@ -903,9 +915,7 @@ fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
         .env("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
         .env("S3GLOB_LOG", log_directive)
         .args(args);
-
-    print_s3glob_output(&mut command);
-    Ok(command)
+    command
 }
 
 /// Verifies that `--force-path-style` switches the SDK from virtual-hosted
@@ -1349,5 +1359,159 @@ async fn test_ls_pipe_closed_early_exits_cleanly() -> anyhow::Result<()> {
         "expected 'Matched' summary in stderr after pipe-close, got:\n{stderr}",
     );
 
+    Ok(())
+}
+
+//
+// Failure reporting: a failed request must never silently truncate output
+//
+
+/// Bucket with `prefix/NNNN/file.txt` for `count` prefixes.
+async fn bucket_with_prefixes(client: &Client, bucket: &str, count: usize) -> anyhow::Result<()> {
+    client.create_bucket().bucket(bucket).send().await?;
+    for i in 0..count {
+        create_object(client, bucket, &format!("prefix/{i:04}/file.txt")).await?;
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::default(&[])]
+#[case::fail_fast(&["--fail-fast"])]
+#[case::fail_fast_then_negated(&["--fail-fast", "--no-fail-fast"])]
+// The fault proxy runs in this process, so the test's blocking wait on
+// s3glob must not starve it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_listing_failure_exits_nonzero(#[case] flags: &[&str]) -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "ls-failure";
+    bucket_with_prefixes(&client, bucket, 20).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0003/")]).await;
+
+    // --no-recursive-auto-parallel sends each `prefix/NNNN/` straight to
+    // the per-prefix recursive listing, which is where the failure lands.
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let mut args = vec!["ls", "--no-recursive-auto-parallel"];
+    args.extend_from_slice(flags);
+    args.push(&pattern);
+    let output = s3glob_cmd(proxy.port, &args).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("listing s3://{bucket}/prefix/0003/")),
+        "stderr should name the failed prefix:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("listing is incomplete"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("prefix/0003/file.txt"));
+    if flags.last() == Some(&"--fail-fast") {
+        assert!(stderr.contains("--fail-fast"), "stderr:\n{stderr}");
+    } else {
+        // Without --fail-fast every other prefix is still listed.
+        for i in (0..20).filter(|i| *i != 3) {
+            let key = format!("prefix/{i:04}/file.txt");
+            assert!(stdout.contains(&key), "missing {key} in:\n{stdout}");
+        }
+    }
+    Ok(())
+}
+
+// The fault proxy runs in this process, so the test's blocking wait on
+// s3glob must not starve it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dl_listing_failure_exits_nonzero() -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "dl-failure";
+    bucket_with_prefixes(&client, bucket, 5).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0003/")]).await;
+
+    let tempdir = TempDir::new()?;
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let output = s3glob_cmd(
+        proxy.port,
+        &[
+            "dl",
+            "--no-recursive-auto-parallel",
+            "-pabs",
+            &pattern,
+            tempdir.path().to_str().unwrap(),
+        ],
+    )
+    .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("download is incomplete"),
+        "stderr:\n{stderr}"
+    );
+    tempdir
+        .child("prefix/0003/file.txt")
+        .assert(predicate::path::missing());
+    for i in [0, 1, 2, 4] {
+        tempdir
+            .child(format!("prefix/{i:04}/file.txt"))
+            .assert(predicate::path::exists());
+    }
+    Ok(())
+}
+
+/// A reader that closes stdout early chose to stop reading, so errors in
+/// the part of the listing it never asked for must not fail the run.
+// The fault proxy runs in this process, so the test's blocking wait on
+// s3glob must not starve it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_pipe_closed_with_listing_failure_exits_cleanly() -> anyhow::Result<()> {
+    use std::process::{Command as StdCommand, Stdio};
+
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "pipe-failure";
+    bucket_with_prefixes(&client, bucket, 200).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0150/")]).await;
+
+    // See test_ls_pipe_closed_early_exits_cleanly for why the format is wide.
+    let wide_format = format!("{}{{key}}", "x".repeat(2000));
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("s3glob"))
+        .env(
+            "AWS_ENDPOINT_URL",
+            format!("http://127.0.0.1:{}", proxy.port),
+        )
+        .env("AWS_ACCESS_KEY_ID", ACCESS_KEY)
+        .env("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
+        .args([
+            "ls",
+            "--stream",
+            "--no-recursive-auto-parallel",
+            "--format",
+            &wide_format,
+            &format!("s3://{bucket}/prefix/*/**"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    assert!(!line.is_empty(), "expected at least one output line");
+    drop(reader);
+
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "s3glob should exit 0 when the reader closed stdout: {:?}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
     Ok(())
 }

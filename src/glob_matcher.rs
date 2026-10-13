@@ -621,7 +621,7 @@ impl S3GlobMatcher {
         };
         let total_prefixes = presult.prefixes.len();
         let max_candidate_prefixes = presult.max_candidate_prefixes;
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<PrefixResult>>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MatchBatch>();
         let re = self.regex.clone();
         debug!(regex = %re.as_str(), "full regex");
         if self.is_complete() {
@@ -909,6 +909,13 @@ fn prefix_join(prefix: &str, alt: &str) -> String {
 }
 // Final listing code
 
+/// One message on the [`ListResult::rx`] channel.
+///
+/// An `Err` means some part of the keyspace could not be listed, so the
+/// stream as a whole is incomplete. Listing continues past it; the consumer
+/// decides whether to stop.
+pub(crate) type MatchBatch = Result<Vec<PrefixResult>>;
+
 #[derive(Debug)]
 pub(crate) enum PrefixResult {
     Object(S3Object),
@@ -933,7 +940,7 @@ impl PrefixResult {
 pub(crate) struct ListResult {
     pub(crate) status: LiveStatus,
     pub(crate) totals: Totals,
-    pub(crate) rx: UnboundedReceiver<Vec<PrefixResult>>,
+    pub(crate) rx: UnboundedReceiver<MatchBatch>,
 }
 
 pub(crate) struct Totals {
@@ -1153,6 +1160,7 @@ mod tests {
             .await?;
         let mut keys: Vec<String> = Vec::new();
         while let Some(batch) = result.rx.recv().await {
+            let batch = batch?;
             for r in batch {
                 if let PrefixResult::Object(obj) = r {
                     keys.push(obj.key);
@@ -1243,6 +1251,7 @@ mod tests {
 
         let mut keys: Vec<String> = Vec::new();
         while let Some(batch) = result.rx.recv().await {
+            let batch = batch?;
             for r in batch {
                 if let PrefixResult::Object(obj) = r {
                     keys.push(obj.key);
@@ -1347,6 +1356,7 @@ mod tests {
             .await?;
         let mut keys: Vec<String> = Vec::new();
         while let Some(batch) = result.rx.recv().await {
+            let batch = batch?;
             for r in batch {
                 if let PrefixResult::Object(obj) = r {
                     keys.push(obj.key);
@@ -1437,6 +1447,7 @@ mod tests {
             .await?;
         let mut keys: Vec<String> = Vec::new();
         while let Some(batch) = result.rx.recv().await {
+            let batch = batch?;
             for r in batch {
                 if let PrefixResult::Object(obj) = r {
                     keys.push(obj.key);
@@ -1625,6 +1636,7 @@ mod tests {
             .await?;
         let mut keys: Vec<String> = Vec::new();
         while let Some(batch) = result.rx.recv().await {
+            let batch = batch?;
             for r in batch {
                 if let PrefixResult::Object(obj) = r {
                     keys.push(obj.key);

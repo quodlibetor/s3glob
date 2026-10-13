@@ -17,7 +17,7 @@ use tracing::info;
 
 use crate::{S3Object, add_atomic, progressln};
 
-use super::{LiveStatus, PrefixResult, PrefixSearchResult};
+use super::{LiveStatus, MatchBatch, PrefixResult, PrefixSearchResult};
 
 #[async_trait::async_trait]
 pub trait Engine: Send + Sync + 'static {
@@ -67,7 +67,7 @@ pub trait Engine: Send + Sync + 'static {
         delimiter: char,
         status: &LiveStatus,
         matcher: &regex::Regex,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         permit: Arc<Semaphore>,
     ) -> Result<()>;
 
@@ -79,7 +79,7 @@ pub trait Engine: Send + Sync + 'static {
         presult: PrefixSearchResult,
         matcher: Arc<regex::Regex>,
         status: &LiveStatus,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         permit: Arc<Semaphore>,
     ) -> Result<()>;
 }
@@ -102,7 +102,7 @@ async fn list_matching_objects(
     prefix: String,
     matcher: Arc<regex::Regex>,
     total_objects: Arc<AtomicUsize>,
-    tx: UnboundedSender<Vec<PrefixResult>>,
+    tx: UnboundedSender<MatchBatch>,
 ) -> Result<()> {
     let mut paginator = client
         .list_objects_v2()
@@ -123,12 +123,10 @@ async fn list_matching_objects(
                     matching_objects.push(obj);
                 }
             }
-            tx.send(
-                matching_objects
-                    .into_iter()
-                    .map(|o| PrefixResult::Object(S3Object::from(o)))
-                    .collect::<Vec<_>>(),
-            )?;
+            tx.send(Ok(matching_objects
+                .into_iter()
+                .map(|o| PrefixResult::Object(S3Object::from(o)))
+                .collect::<Vec<_>>()))?;
         }
     }
     Ok(())
@@ -327,7 +325,7 @@ impl Engine for S3Engine {
         delimiter: char,
         status: &LiveStatus,
         matcher: &regex::Regex,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in &presult.prefixes {
@@ -347,7 +345,7 @@ impl Engine for S3Engine {
                 // Engine::scan_prefixes and are verified directories.
                 if prefix.ends_with(delimiter) {
                     drop(permit);
-                    let _ = tx.send(vec![PrefixResult::Prefix(prefix)]);
+                    let _ = tx.send(Ok(vec![PrefixResult::Prefix(prefix)]));
                     return;
                 }
 
@@ -364,7 +362,7 @@ impl Engine for S3Engine {
                 let directory_form = format!("{prefix}{delimiter}");
                 let dir_check = client
                     .list_objects_v2()
-                    .bucket(bucket)
+                    .bucket(bucket.clone())
                     .prefix(directory_form.clone())
                     .max_keys(1)
                     .send()
@@ -372,20 +370,35 @@ impl Engine for S3Engine {
                 drop(permit);
 
                 let mut out: Vec<PrefixResult> = Vec::new();
-                if let Ok(o) = head {
-                    trace!(prefix, "prefix is actually an object");
-                    out.push(PrefixResult::Object(S3Object::from_head_object(
-                        prefix.clone(),
-                        o,
-                    )));
+                match head {
+                    Ok(o) => {
+                        trace!(prefix, "prefix is actually an object");
+                        out.push(PrefixResult::Object(S3Object::from_head_object(
+                            prefix.clone(),
+                            o,
+                        )));
+                    }
+                    // A candidate that isn't a key is expected: it may be
+                    // only a directory, or neither.
+                    Err(e) if e.as_service_error().is_some_and(|e| e.is_not_found()) => {}
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::Error::new(e).context(format!(
+                            "checking whether s3://{bucket}/{prefix} is an object"
+                        ))));
+                    }
                 }
-                if let Ok(resp) = dir_check
-                    && resp.key_count.unwrap_or(0) > 0
-                {
-                    out.push(PrefixResult::Prefix(directory_form));
+                match dir_check {
+                    Ok(resp) if resp.key_count.unwrap_or(0) > 0 => {
+                        out.push(PrefixResult::Prefix(directory_form));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::Error::new(e)
+                            .context(format!("listing s3://{bucket}/{directory_form}"))));
+                    }
                 }
                 if !out.is_empty() {
-                    let _ = tx.send(out);
+                    let _ = tx.send(Ok(out));
                 }
             });
         }
@@ -393,14 +406,12 @@ impl Engine for S3Engine {
             total_prefixes = presult.prefixes.len(),
             "filtered prefixes from the result set"
         );
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
+        tx.send(Ok(presult
+            .objects
+            .into_iter()
+            .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+            .map(|o| PrefixResult::Object(S3Object::from(o)))
+            .collect()))?;
         Ok(())
     }
 
@@ -409,7 +420,7 @@ impl Engine for S3Engine {
         presult: PrefixSearchResult,
         matcher: Arc<regex::Regex>,
         status: &LiveStatus,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in presult.prefixes {
@@ -422,22 +433,30 @@ impl Engine for S3Engine {
             let permit = permit.clone().acquire_owned().await;
 
             tokio::spawn(async move {
-                list_matching_objects(client, bucket, prefix.clone(), matcher, total_objects, tx)
-                    .await?;
+                let result = list_matching_objects(
+                    client,
+                    bucket.clone(),
+                    prefix.clone(),
+                    matcher,
+                    total_objects,
+                    tx.clone(),
+                )
+                .await;
                 drop(permit);
-
                 add_atomic(&seen_prefixes, 1);
-                Ok::<_, anyhow::Error>(())
+                if let Err(e) = result {
+                    // The receiver is gone only when the consumer stopped
+                    // reading on purpose, so there is nobody to tell.
+                    let _ = tx.send(Err(e.context(format!("listing s3://{bucket}/{prefix}"))));
+                }
             });
         }
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
+        tx.send(Ok(presult
+            .objects
+            .into_iter()
+            .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+            .map(|o| PrefixResult::Object(S3Object::from(o)))
+            .collect()))?;
         Ok(())
     }
 }
@@ -551,7 +570,7 @@ impl Engine for MockS3Engine {
         delimiter: char,
         _status: &LiveStatus,
         matcher: &regex::Regex,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         _permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in &presult.prefixes {
@@ -561,7 +580,7 @@ impl Engine for MockS3Engine {
             // Prefixes ending with delimiter are verified directories
             // from Engine::scan_prefixes
             if prefix.ends_with(delimiter) {
-                tx.send(vec![PrefixResult::Prefix(prefix.clone())])?;
+                tx.send(Ok(vec![PrefixResult::Prefix(prefix.clone())]))?;
                 continue;
             }
             // For non-delim-suffixed prefixes, emit Object if it's an
@@ -579,17 +598,15 @@ impl Engine for MockS3Engine {
                 out.push(PrefixResult::Prefix(directory_form));
             }
             if !out.is_empty() {
-                tx.send(out)?;
+                tx.send(Ok(out))?;
             }
         }
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
+        tx.send(Ok(presult
+            .objects
+            .into_iter()
+            .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+            .map(|o| PrefixResult::Object(S3Object::from(o)))
+            .collect()))?;
         Ok(())
     }
 
@@ -598,7 +615,7 @@ impl Engine for MockS3Engine {
         presult: PrefixSearchResult,
         matcher: Arc<regex::Regex>,
         _status: &LiveStatus,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         _permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in &presult.prefixes {
@@ -608,16 +625,14 @@ impl Engine for MockS3Engine {
                 .filter(|k| k.starts_with(prefix.as_str()) && matcher.is_match(k))
                 .map(|k| PrefixResult::Object(S3Object::from(Object::builder().key(k).build())))
                 .collect();
-            tx.send(matching)?;
+            tx.send(Ok(matching))?;
         }
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
+        tx.send(Ok(presult
+            .objects
+            .into_iter()
+            .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+            .map(|o| PrefixResult::Object(S3Object::from(o)))
+            .collect()))?;
         Ok(())
     }
 }

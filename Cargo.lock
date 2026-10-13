@@ -2926,9 +2926,12 @@ dependencies = [
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "bytes",
  "clap",
  "futures",
+ "http-body-util",
  "humansize",
+ "hyper",
  "hyper-rustls",
  "hyper-util",
  "indicatif",
@@ -2947,6 +2950,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
