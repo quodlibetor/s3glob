@@ -1425,6 +1425,46 @@ async fn test_ls_listing_failure_exits_nonzero(#[case] flags: &[&str]) -> anyhow
 
 // The fault proxy runs in this process, so the test's blocking wait on
 // s3glob must not starve it.
+/// Here the failing prefix is hit while discovering prefixes (the `*` in
+/// `file*` is resolved by scanning each `prefix/NNNN/`), before any
+/// per-prefix listing.
+#[rstest]
+#[case::default(&[])]
+#[case::fail_fast(&["--fail-fast"])]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_discovery_failure_exits_nonzero(#[case] flags: &[&str]) -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "discovery-failure";
+    bucket_with_prefixes(&client, bucket, 5).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0003/")]).await;
+
+    let pattern = format!("s3://{bucket}/prefix/*/file*");
+    let mut args = vec!["ls", "--max-retries=0"];
+    args.extend_from_slice(flags);
+    args.push(&pattern);
+    let output = s3glob_cmd(proxy.port, &args).output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr:\n{stderr}"
+    );
+    assert!(proxy.injected()[0] > 0, "fault never fired");
+    assert!(
+        stderr.contains(&format!("s3://{bucket}/prefix/0003/")),
+        "stderr should name the failed prefix:\n{stderr}"
+    );
+    assert!(!stdout.contains("prefix/0003/file.txt"));
+    if flags.is_empty() {
+        for i in [0, 1, 2, 4] {
+            let key = format!("prefix/{i:04}/file.txt");
+            assert!(stdout.contains(&key), "missing {key} in:\n{stdout}");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_dl_listing_failure_exits_nonzero() -> anyhow::Result<()> {
     let (_node, port, client) = s3_server_and_client().await;

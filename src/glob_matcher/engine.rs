@@ -44,11 +44,11 @@ pub trait Engine: Send + Sync + 'static {
     /// returned objects are the complete content under `prefix`.
     async fn probe_prefix(&mut self, prefix: &str, max_keys: i32) -> Result<ScanResult>;
 
-    async fn check_prefixes<P>(
-        &mut self,
-        prefixes: P,
-        max_parallelism: usize,
-    ) -> Result<BTreeSet<String>>
+    /// Keep the `prefixes` that have at least one key under them.
+    ///
+    /// A prefix whose check fails is left out of `found` and its error is
+    /// returned in `errors`, so one failure doesn't discard the rest.
+    async fn check_prefixes<P>(&mut self, prefixes: P, max_parallelism: usize) -> CheckedPrefixes
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static;
@@ -122,6 +122,12 @@ async fn list_matching_objects(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+pub struct CheckedPrefixes {
+    pub found: BTreeSet<String>,
+    pub errors: Vec<anyhow::Error>,
 }
 
 #[derive(Default)]
@@ -233,7 +239,8 @@ impl Engine for S3Engine {
         let response = self
             .bucket
             .list_first_page(prefix, None, Some(max_keys))
-            .await?;
+            .await
+            .with_context(|| format!("listing {}", self.bucket.uri(prefix)))?;
         Ok(ScanResult {
             prefixes: Vec::new(),
             objects: response.contents.unwrap_or_default(),
@@ -243,11 +250,7 @@ impl Engine for S3Engine {
 
     // TODO: convert this to take &mut prefixes so that we don't have to
     // reallocate the vector on each call
-    async fn check_prefixes<P>(
-        &mut self,
-        prefixes: P,
-        max_parallelism: usize,
-    ) -> Result<BTreeSet<String>>
+    async fn check_prefixes<P>(&mut self, prefixes: P, max_parallelism: usize) -> CheckedPrefixes
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static,
@@ -275,7 +278,11 @@ impl Engine for S3Engine {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        let err = anyhow::Error::new(e).context(format!(
+                            "checking that {} exists",
+                            engine.bucket.uri(&prefix)
+                        ));
+                        let _ = tx.send(Err(err)).await;
                     }
                 }
             });
@@ -283,13 +290,21 @@ impl Engine for S3Engine {
 
         drop(tx);
 
-        let mut new_prefixes = BTreeSet::new();
+        let mut checked = CheckedPrefixes::default();
         while let Some(result) = rx.recv().await {
-            new_prefixes.insert(result.context("checking prefix exists")?);
+            match result {
+                Ok(prefix) => {
+                    checked.found.insert(prefix);
+                }
+                Err(e) => checked.errors.push(e),
+            }
         }
-        debug!(valid_prefix_count = new_prefixes.len(), "checked prefixes");
-
-        Ok(new_prefixes)
+        debug!(
+            valid_prefix_count = checked.found.len(),
+            failed = checked.errors.len(),
+            "checked prefixes"
+        );
+        checked
     }
 
     async fn get_exact(
@@ -435,6 +450,9 @@ pub(super) struct MockS3Engine {
     /// `truncated=true` with no sub-prefixes, as if the engine had
     /// paged through enough flat content to give up.
     pub force_truncate_prefixes: Arc<BTreeSet<String>>,
+    /// Prefixes for which every engine call fails, as if S3 kept
+    /// rejecting requests for them.
+    pub fail_prefixes: Arc<BTreeSet<String>>,
 }
 
 #[cfg(test)]
@@ -450,6 +468,7 @@ impl Engine for MockS3Engine {
             .lock()
             .unwrap()
             .push((prefix.to_string(), delimiter.to_string()));
+        self.check_failure(prefix)?;
         if self.force_truncate_prefixes.contains(prefix) {
             // Simulate the real engine's flat-dense page-budget guard:
             // empty sub-prefix list with `truncated=true`.
@@ -479,6 +498,7 @@ impl Engine for MockS3Engine {
             .lock()
             .unwrap()
             .push((prefix.to_string(), max_keys));
+        self.check_failure(prefix)?;
         let max = max_keys as usize;
         let mut matched: Vec<&String> = self
             .paths
@@ -500,30 +520,28 @@ impl Engine for MockS3Engine {
         Ok(result)
     }
 
-    async fn check_prefixes<P>(
-        &mut self,
-        prefixes: P,
-        _max_parallelism: usize,
-    ) -> Result<BTreeSet<String>>
+    async fn check_prefixes<P>(&mut self, prefixes: P, _max_parallelism: usize) -> CheckedPrefixes
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static,
     {
         let prefixes = prefixes.into_iter().collect::<Vec<_>>();
         info!(?prefixes, "MockS3 checking prefixes");
-        let mut valid_prefixes = BTreeSet::new();
+        let mut checked = CheckedPrefixes::default();
 
         // a prefix is "valid" if any key in the bucket starts with it.
         // Independent of delimiter.
         for prefix in &prefixes {
-            if self.paths.iter().any(|k| k.starts_with(prefix)) {
-                valid_prefixes.insert(prefix.to_string());
+            if let Err(e) = self.check_failure(prefix) {
+                checked.errors.push(e);
+            } else if self.paths.iter().any(|k| k.starts_with(prefix)) {
+                checked.found.insert(prefix.to_string());
             }
         }
 
-        info!(requested = ?prefixes, existing = ?valid_prefixes, "mocks3 checked prefixes for existence");
+        info!(requested = ?prefixes, existing = ?checked.found, "mocks3 checked prefixes for existence");
 
-        Ok(valid_prefixes)
+        checked
     }
 
     async fn get_exact(
@@ -607,7 +625,25 @@ impl MockS3Engine {
             calls: Arc::new(Mutex::new(Vec::new())),
             probe_calls: Arc::new(Mutex::new(Vec::new())),
             force_truncate_prefixes: Arc::new(BTreeSet::new()),
+            fail_prefixes: Arc::new(BTreeSet::new()),
         }
+    }
+
+    /// Make every engine call for any of `prefixes` fail.
+    pub fn with_failures<I>(mut self, prefixes: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        self.fail_prefixes = Arc::new(prefixes.into_iter().map(Into::into).collect());
+        self
+    }
+
+    fn check_failure(&self, prefix: &str) -> Result<()> {
+        if self.fail_prefixes.contains(prefix) {
+            anyhow::bail!("MockS3 injected failure for {prefix:?}");
+        }
+        Ok(())
     }
 
     /// Make `scan_prefixes` return `truncated=true` with no sub-prefixes

@@ -614,6 +614,7 @@ async fn run(opts: Opts, retrier: &mut Option<retry::Retrier>) -> Result<()> {
         opts.cross_delim(),
     )?;
     matcher.set_max_parallelism(opts.max_parallelism);
+    matcher.set_fail_fast(opts.fail_fast());
     let effective_min_prefixes = if opts.no_recursive_auto_parallel {
         0
     } else {

@@ -69,12 +69,18 @@ pub struct S3GlobMatcher {
     /// When `false`, both are restricted to a single segment by including
     /// the delimiter in their negated set.
     cross_delim: bool,
+    /// Stop discovering at the first failed request (`--fail-fast`)
+    /// instead of dropping the failed prefix and carrying on.
+    fail_fast: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct PrefixSearchResult {
     pub prefixes: Vec<String>,
     pub objects: Vec<Object>,
+    /// Requests that failed during discovery. Each one lost the part of
+    /// the keyspace under its prefix, so the result is incomplete.
+    pub errors: Vec<anyhow::Error>,
     /// Peak size of the candidate prefix set across the whole search,
     /// including intermediate sets pruned away before the next pattern
     /// part. A measure of how wide the search had to fan out; surfaced
@@ -153,6 +159,7 @@ impl S3GlobMatcher {
             probe_max_keys: PROBE_MAX_KEYS,
             is_complete,
             cross_delim,
+            fail_fast: false,
         })
     }
 
@@ -160,6 +167,10 @@ impl S3GlobMatcher {
     // all the tests right now
     pub fn set_max_parallelism(&mut self, max_parallelism: usize) {
         self.max_parallelism = max_parallelism;
+    }
+
+    pub fn set_fail_fast(&mut self, fail_fast: bool) {
+        self.fail_fast = fail_fast;
     }
 
     /// True if `key` matches this pattern's compiled regex.
@@ -230,7 +241,13 @@ impl S3GlobMatcher {
         let mut prev_part = None;
         let mut part_iter = self.parts.iter().enumerate();
         let mut max_candidate_prefixes = 0;
+        let mut errors = Vec::new();
         for (part_idx, part) in &mut part_iter {
+            if self.fail_fast && !errors.is_empty() {
+                debug!("discovery failed with --fail-fast, stopping");
+                prefixes.clear();
+                break;
+            }
             if prefixes.len() >= MAX_PREFIXES {
                 warn!(
                     new_prefix_count = prefixes.len(),
@@ -313,7 +330,21 @@ impl S3GlobMatcher {
                         let mut new_prefixes = BTreeSet::new();
                         let mut new_prefix_count = 0;
                         while let Some(result) = rx.recv().await {
-                            let (scanned_prefix, results) = result.context("scanning prefixes")?;
+                            let (scanned_prefix, results) = match result {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    // This prefix's subtree is lost; the
+                                    // error makes the run fail at the end.
+                                    errors.push(e);
+                                    if self.fail_fast {
+                                        for task in &tasks {
+                                            task.abort();
+                                        }
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
                             let result_len = results.len();
                             trace!(
                                 scanned_prefix,
@@ -396,8 +427,9 @@ impl S3GlobMatcher {
                             &prefixes,
                             new_prefixes,
                             self.max_parallelism,
+                            &mut errors,
                         )
-                        .await?;
+                        .await;
                     } else {
                         // Build up the filters and appends
                         let mut filters = BTreeSet::new();
@@ -513,8 +545,9 @@ impl S3GlobMatcher {
                                 &prefixes,
                                 new_prefixes,
                                 self.max_parallelism,
+                                &mut errors,
                             )
-                            .await?;
+                            .await;
                             if new_prefixes.is_empty() {
                                 if objects.is_empty() {
                                     debug!("no prefixes matched and no objects exist");
@@ -604,12 +637,13 @@ impl S3GlobMatcher {
         Ok(PrefixSearchResult {
             prefixes: prefixes.into_iter().collect(),
             objects,
+            errors,
             max_candidate_prefixes,
         })
     }
 
     pub(crate) async fn get_objects<E: Engine + Clone>(&self, engine: E) -> Result<ListResult> {
-        let presult = self.find_prefixes(engine.clone()).await?;
+        let mut presult = self.find_prefixes(engine.clone()).await?;
         trace!(?presult.prefixes, "matcher generated prefixes");
         debug!(
             prefix_count = presult.prefixes.len(),
@@ -624,16 +658,33 @@ impl S3GlobMatcher {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<MatchBatch>();
         let re = self.regex.clone();
         debug!(regex = %re.as_str(), "full regex");
-        if self.is_complete() {
-            let permit = Arc::new(Semaphore::new(self.max_parallelism));
-            engine
-                .get_exact(presult, self.delimiter, &status, &re, &tx, permit)
-                .await?;
+        let errors = std::mem::take(&mut presult.errors);
+        if self.fail_fast && !errors.is_empty() {
+            // Hand over what discovery already found, then the errors, and
+            // list nothing more: the consumer stops at the first error.
+            tx.send(Ok(presult
+                .objects
+                .into_iter()
+                .filter(|o| self.match_obj(o))
+                .map(|o| PrefixResult::Object(S3Object::from(o)))
+                .collect()))?;
+            for e in errors {
+                tx.send(Err(e))?;
+            }
         } else {
+            for e in errors {
+                tx.send(Err(e))?;
+            }
             let permit = Arc::new(Semaphore::new(self.max_parallelism));
-            engine
-                .get_all_children(presult, Arc::new(re), &status, &tx, permit)
-                .await?;
+            if self.is_complete() {
+                engine
+                    .get_exact(presult, self.delimiter, &status, &re, &tx, permit)
+                    .await?;
+            } else {
+                engine
+                    .get_all_children(presult, Arc::new(re), &status, &tx, permit)
+                    .await?;
+            }
         }
         drop(tx);
         Ok(ListResult {
@@ -707,7 +758,17 @@ impl S3GlobMatcher {
 
             let mut to_scan = BTreeSet::new();
             for (prefix, result) in probe_results {
-                let probe = result.context("probing prefix at **")?;
+                let probe = match result {
+                    Ok(probe) => probe,
+                    Err(e) => {
+                        // Expansion only speeds up the listing: listing the
+                        // whole prefix later loses nothing, and reports the
+                        // error if the prefix is still failing.
+                        warn!("{:#}; will list it without expanding", e);
+                        settled.insert(prefix);
+                        continue;
+                    }
+                };
                 if probe.truncated {
                     to_scan.insert(prefix);
                 } else {
@@ -742,7 +803,15 @@ impl S3GlobMatcher {
             let mut new_frontier = BTreeSet::new();
             let mut made_progress = false;
             for (prefix, result) in scan_results {
-                let scan_result = result.context("expanding prefixes at **")?;
+                let scan_result = match result {
+                    Ok(scan_result) => scan_result,
+                    Err(e) => {
+                        // See the probe phase above.
+                        warn!("{:#}; will list it without expanding", e);
+                        settled.insert(prefix);
+                        continue;
+                    }
+                };
                 if scan_result.truncated {
                     // Cap hit (too wide) or page-budget exhausted
                     // looking for non-existent sub-prefixes. Either
@@ -871,15 +940,20 @@ async fn check_prefixes(
     prefixes: &BTreeSet<String>,
     new_prefixes: BTreeSet<String>,
     max_parallelism: usize,
-) -> Result<BTreeSet<String>, anyhow::Error> {
+    errors: &mut Vec<anyhow::Error>,
+) -> BTreeSet<String> {
     if prefixes.is_empty() || new_prefixes.is_empty() {
         debug!("check_prefixes called with no prefixes to build off of or none to check");
-        return Ok(BTreeSet::new());
+        return BTreeSet::new();
     }
-    let checked_prefixes = engine
+    let checked = engine
         .check_prefixes(new_prefixes.clone(), max_parallelism)
-        .await?;
-    if checked_prefixes.is_empty() {
+        .await;
+    let checked_prefixes = checked.found;
+    let any_failed = !checked.errors.is_empty();
+    errors.extend(checked.errors);
+    // When checks failed we can't claim the prefixes don't exist.
+    if checked_prefixes.is_empty() && !any_failed {
         let mut message = vec!["Searched for prefixes do not exist in the bucket:".to_string()];
         let new_prefixes = new_prefixes.iter().collect::<Vec<_>>();
         let mut new_idx = 0;
@@ -901,7 +975,7 @@ async fn check_prefixes(
 
         progressln!("{}", message.join("\n"));
     }
-    Ok(checked_prefixes)
+    checked_prefixes
 }
 
 fn prefix_join(prefix: &str, alt: &str) -> String {
@@ -1033,6 +1107,87 @@ mod tests {
         let prefixes = scanner.find_prefixes(engine.clone()).await?.prefixes;
         assert!(prefixes == vec!["src/bar/main.rs", "src/foo/main.rs"]);
         engine.assert_calls(&[("src/", "/")]);
+        Ok(())
+    }
+
+    /// Drain a `get_objects` stream into (matched keys, error count).
+    async fn collect_list(mut result: ListResult) -> (Vec<String>, usize) {
+        let mut keys = Vec::new();
+        let mut errors = 0;
+        while let Some(batch) = result.rx.recv().await {
+            match batch {
+                Ok(batch) => keys.extend(batch.into_iter().map(|r| r.key())),
+                Err(_) => errors += 1,
+            }
+        }
+        keys.sort();
+        (keys, errors)
+    }
+
+    fn three_dirs() -> MockS3Engine {
+        MockS3Engine::new(vec![
+            "src/a/x.rs".to_string(),
+            "src/b/x.rs".to_string(),
+            "src/c/x.rs".to_string(),
+        ])
+    }
+
+    #[tokio::test]
+    async fn test_discovery_scan_failure_keeps_going() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        let scanner = S3GlobMatcher::parse("src/*/*.rs".to_string(), "/", false)?;
+        let engine = three_dirs().with_failures(["src/b/"]);
+
+        let (keys, errors) = collect_list(scanner.get_objects(engine).await?).await;
+        // src/b/ is lost and reported; the rest is still found.
+        assert!(keys == vec!["src/a/x.rs", "src/c/x.rs"]);
+        assert!(errors == 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_discovery_scan_failure_fail_fast_lists_nothing_more() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        let mut scanner = S3GlobMatcher::parse("src/*/*.rs".to_string(), "/", false)?;
+        scanner.set_fail_fast(true);
+        let engine = three_dirs().with_failures(["src/b/"]);
+
+        let (keys, errors) = collect_list(scanner.get_objects(engine).await?).await;
+        // Only what discovery had already found is handed over (at most
+        // the siblings scanned before the failure), then the error.
+        assert!(!keys.contains(&"src/b/x.rs".to_string()));
+        assert!(errors >= 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_discovery_check_failure_keeps_going() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // A leading alternation is checked for existence, not scanned.
+        let scanner = S3GlobMatcher::parse("{a,b}/**".to_string(), "/", false)?;
+        let engine = MockS3Engine::new(vec!["a/x.rs".to_string(), "b/x.rs".to_string()])
+            .with_failures(["b/"]);
+
+        let (keys, errors) = collect_list(scanner.get_objects(engine).await?).await;
+        assert!(keys == vec!["a/x.rs"]);
+        assert!(errors == 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_recursive_expansion_failure_falls_back_to_listing() -> Result<()> {
+        setup_logging(Some("s3glob=trace"));
+        // `*` (not a literal) so src/ is found by a scan rather than an
+        // existence check, and the first call on src/ is the expansion.
+        let mut scanner = S3GlobMatcher::parse("*/**/*.rs".to_string(), "/", false)?;
+        scanner.set_min_prefixes(10);
+        // Expansion fails on src/, so src/ is listed whole instead: nothing
+        // is lost, so nothing is reported.
+        let engine = three_dirs().with_failures(["src/"]);
+
+        let (keys, errors) = collect_list(scanner.get_objects(engine).await?).await;
+        assert!(keys == vec!["src/a/x.rs", "src/b/x.rs", "src/c/x.rs"]);
+        assert!(errors == 0);
         Ok(())
     }
 
