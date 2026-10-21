@@ -38,6 +38,9 @@ s3glob dl "s3://my-bucket/a*/something/1*/other/*" my-local-dir
 Local files will always be unique (two objects with the same filename won't stomp on each other).
 See `s3glob dl --help` to configure exactly how local paths are created.
 
+TLS certificates are verified using your OS's trust settings (via `rustls-platform-verifier`).
+To use the AWS SDK's built-in verifier instead, set `S3GLOB_PLATFORM_TLS=false`.
+
 ### Installation
 
 #### Install prebuilt binaries via shell script

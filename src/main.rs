@@ -253,6 +253,10 @@ impl ValueEnum for PathMode {
 /// Object discovery is done based on a unixy glob pattern,
 /// See the README for more details:
 /// https://github.com/quodlibetor/s3glob/blob/main/README.md
+///
+/// TLS certificates are verified using your OS's trust settings. To use the AWS
+/// SDK's built-in verifier instead, set the S3GLOB_PLATFORM_TLS env var
+/// to `false`.
 struct Opts {
     #[clap(subcommand)]
     command: Command,
@@ -1218,6 +1222,18 @@ impl S3Object {
     }
 }
 
+/// Whether to verify TLS with the OS verifier instead of the AWS SDK's
+/// default webpki client. On unless `S3GLOB_PLATFORM_TLS` is set to
+/// `0`, `false`, `no` or `off`.
+fn platform_tls_enabled() -> bool {
+    !std::env::var("S3GLOB_PLATFORM_TLS").is_ok_and(|v| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
 /// Create a new S3 client with region auto-detection
 async fn create_s3_client(
     opts: &Opts,
@@ -1229,9 +1245,7 @@ async fn create_s3_client(
     if opts.no_sign_request {
         config = config.no_credentials();
     }
-    if std::env::var("EXPERIMENTAL_PLATFORM_TLS")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-    {
+    if platform_tls_enabled() {
         config = config.http_client(platform_tls::build());
     }
     let config = config.load().await;
@@ -1257,9 +1271,7 @@ async fn create_s3_client(
     if opts.no_sign_request {
         config = config.no_credentials();
     }
-    if std::env::var("EXPERIMENTAL_PLATFORM_TLS")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-    {
+    if platform_tls_enabled() {
         config = config.http_client(platform_tls::build());
     }
     let config = config.load().await;

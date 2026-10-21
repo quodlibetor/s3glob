@@ -958,18 +958,17 @@ fn s3glob_with_endpoint(endpoint: &str, args: &[&str]) -> anyhow::Result<Command
 }
 
 #[tokio::test]
-async fn test_platform_tls_env_var() -> anyhow::Result<()> {
+async fn test_platform_tls_opt_out() -> anyhow::Result<()> {
     let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "platform-tls-test";
     client.create_bucket().bucket(bucket).send().await?;
     create_object(&client, bucket, "hello/world.txt").await?;
 
-    // Run with EXPERIMENTAL_PLATFORM_TLS=true — the test server is HTTP so https_or_http() covers it.
-    // The key thing being tested: the binary doesn't crash or error out when the env var is set,
-    // and it still successfully lists objects.
+    // Platform TLS is the default, so every other test covers it. This one
+    // checks that opting out falls back to the SDK's client and still lists.
     let mut cmd = run_s3glob(port, &["ls", &format!("s3://{}/hello/*", bucket)])?;
-    cmd.env("EXPERIMENTAL_PLATFORM_TLS", "true");
+    cmd.env("S3GLOB_PLATFORM_TLS", "false");
     cmd.assert().success().stdout(contains("hello/world.txt"));
 
     Ok(())
