@@ -15,9 +15,15 @@ use regex::RegexBuilder;
 use rstest::rstest;
 use testcontainers::core::logs::LogFrame;
 use testcontainers::core::logs::consumer::LogConsumer;
+use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::minio::MinIO;
+use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+
+const ACCESS_KEY: &str = "test-access-key";
+const SECRET_KEY: &str = "test-secret-key";
+
+mod common;
+use common::{Fault, FaultProxy};
 
 #[rstest]
 #[case("prefix/2024-*/file*.txt", &[
@@ -52,8 +58,8 @@ async fn test_s3glob_pattern_matching(
     #[case] glob: &str,
     #[case] expected: &[&str],
 ) -> anyhow::Result<()> {
-    // Start MinIO container and configure S3 client
-    let (_node, port, client) = minio_and_client().await;
+    // Start the S3 server container and configure S3 client
+    let (_node, port, client) = s3_server_and_client().await;
 
     // Create test bucket and upload test objects
     let bucket = "test-bucket";
@@ -117,7 +123,7 @@ async fn test_download_prefix_from_first_glob(
     #[case] glob: &str,
     #[case] expected: &[&str],
 ) -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "test-bucket";
     client.create_bucket().bucket(bucket).send().await?;
@@ -177,7 +183,7 @@ async fn test_format_patterns(
     #[case] format: &str,
     #[case] expected: &'static str,
 ) -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "format-test";
     client.create_bucket().bucket(bucket).send().await?;
@@ -213,7 +219,7 @@ async fn test_patterns_in_file_not_path_component(
     #[case] glob: &str,
     #[case] expected: &[&str],
 ) -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "test-bucket";
     client.create_bucket().bucket(bucket).send().await?;
@@ -269,7 +275,7 @@ async fn test_patterns_in_file_not_path_component(
 #[trace]
 #[tokio::test]
 async fn test_glob_prefixes(#[case] glob: &str, #[case] expected: &[&str]) -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "test-bucket";
     client.create_bucket().bucket(bucket).send().await?;
@@ -315,7 +321,7 @@ async fn test_glob_prefixes_specific(
     #[case] glob: &str,
     #[case] expected: &[&str],
 ) -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "test-bucket";
     client.create_bucket().bucket(bucket).send().await?;
@@ -405,7 +411,7 @@ async fn test_canonical_prefix_output(
     #[case] must_match: &[&str],
     #[case] must_not_match: &[&str],
 ) -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "test-bucket";
     client.create_bucket().bucket(bucket).send().await?;
@@ -448,7 +454,7 @@ async fn test_canonical_prefix_output(
 /// only a handful of real objects existed.
 #[tokio::test]
 async fn test_summary_counts_objects_and_prefixes_separately() -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "test-bucket";
     client.create_bucket().bucket(bucket).send().await?;
@@ -489,7 +495,7 @@ async fn test_summary_counts_objects_and_prefixes_separately() -> anyhow::Result
 /// see how much keyspace was traversed.
 #[tokio::test]
 async fn test_summary_reports_candidate_count() -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "test-bucket";
     client.create_bucket().bucket(bucket).send().await?;
@@ -601,7 +607,7 @@ async fn test_download_prefix_shortest(
     #[case] expected_paths: &[&str],
 ) -> anyhow::Result<()> {
     let glob = "**";
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "test-bucket";
     client.create_bucket().bucket(bucket).send().await?;
@@ -634,7 +640,7 @@ async fn test_download_prefix_shortest(
 
 #[tokio::test]
 async fn test_download_flatten() -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "test-bucket";
     client.create_bucket().bucket(bucket).send().await?;
@@ -684,29 +690,33 @@ async fn test_download_flatten() -> anyhow::Result<()> {
 // Helpers
 //
 
-async fn minio_and_client() -> (ContainerAsync<MinIO>, u16, Client) {
-    let minio = MinIO::default()
-        .with_name("quay.io/minio/minio")
+async fn s3_server_and_client() -> (ContainerAsync<GenericImage>, u16, Client) {
+    // versitygw's posix backend serves every directory under its root as a
+    // bucket, so give it a fresh empty one.
+    let versitygw = GenericImage::new("versity/versitygw", "v1.8.0")
+        .with_exposed_port(7070.tcp())
+        .with_wait_for(WaitFor::message_on_stdout("Admin/S3 service listening on"))
+        .with_entrypoint("sh")
+        .with_env_var("ROOT_ACCESS_KEY", ACCESS_KEY)
+        .with_env_var("ROOT_SECRET_KEY", SECRET_KEY)
+        .with_cmd([
+            "-c",
+            "mkdir -p /tmp/vgw && exec versitygw --port :7070 posix /tmp/vgw",
+        ])
         .with_log_consumer(LogPrinter::new());
-    let node = match minio.start().await {
+    let node = match versitygw.start().await {
         Ok(node) => node,
         Err(e) => {
-            panic!("can't start minio: {}", e);
+            panic!("can't start versitygw: {}", e);
         }
     };
-    let port = node.get_host_port_ipv4(9000).await.expect("can get port");
+    let port = node.get_host_port_ipv4(7070).await.expect("can get port");
 
     let config = aws_sdk_s3::Config::builder()
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new("us-east-1"))
         .endpoint_url(format!("http://127.0.0.1:{}", port))
-        .credentials_provider(Credentials::new(
-            "minioadmin",
-            "minioadmin",
-            None,
-            None,
-            "test",
-        ))
+        .credentials_provider(Credentials::new(ACCESS_KEY, SECRET_KEY, None, None, "test"))
         .build();
 
     let client = Client::from_conf(config);
@@ -861,7 +871,7 @@ fn assert_object_metadata_matches(
         .map(|a| a.as_str())
         .collect();
     if server_checksums.is_empty() {
-        // If MinIO doesn't surface checksum_algorithm, s3glob must omit the
+        // If the server doesn't surface checksum_algorithm, s3glob must omit the
         // field rather than emitting an empty list.
         assert!(
             record.get("checksum_algorithms").is_none(),
@@ -877,8 +887,8 @@ fn assert_object_metadata_matches(
             .collect();
         assert_eq!(emitted, server_checksums);
     }
-    // restore_status only populated for in-progress Glacier restores; MinIO
-    // doesn't simulate Glacier so it must be omitted.
+    // restore_status only populated for in-progress Glacier restores; the test
+    // server doesn't simulate Glacier so it must be omitted.
     assert!(
         record.get("restore_status").is_none(),
         "unexpected restore_status: {}",
@@ -887,27 +897,24 @@ fn assert_object_metadata_matches(
     Ok(())
 }
 
+/// An s3glob command against the test server on `port`. Nothing runs
+/// until the test runs it; assert_cmd prints stdout and stderr when an
+/// assertion fails.
 fn run_s3glob(port: u16, args: &[&str]) -> anyhow::Result<Command> {
-    let mut command = assert_cmd::cargo::cargo_bin_cmd!("s3glob");
-    let log_directive = env::var("S3GLOB_LOG").unwrap_or_else(|_| "s3glob=trace".to_string());
-    command
-        .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
-        .env("AWS_ACCESS_KEY_ID", "minioadmin")
-        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
-        .env("S3GLOB_LOG", log_directive)
-        .args(args);
-
-    print_s3glob_output(&mut command);
-    Ok(command)
+    s3glob_with_endpoint(&format!("http://127.0.0.1:{port}"), args)
 }
 
-/// Verifies that --force-path-style allows s3glob to work with a hostname
-/// endpoint, and that without it the command fails (because the SDK uses
-/// virtual-hosted-style, prepending the bucket name to the hostname, e.g.
-/// bucket.localhost, which does not resolve).
+/// Verifies that `--force-path-style` switches the SDK from virtual-hosted
+/// style (`http://{bucket}.localhost:{port}`) to path style
+/// (`http://localhost:{port}/{bucket}`).
+///
+/// The negative case asserts on the endpoint the SDK logs rather than on the
+/// exit status: whether `{bucket}.localhost` resolves depends on the host's
+/// resolver, and what the server does with a virtual-hosted request it can't
+/// route depends on the server.
 #[tokio::test]
 async fn test_force_path_style() -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "path-style-test";
     client.create_bucket().bucket(bucket).send().await?;
@@ -915,17 +922,25 @@ async fn test_force_path_style() -> anyhow::Result<()> {
 
     let pattern = format!("s3://{}/test/*", bucket);
     let localhost_endpoint = format!("http://localhost:{}", port);
+    let path_style_url = format!("url: \"http://localhost:{port}/{bucket}\"");
+    let vhost_url = format!("url: \"http://{bucket}.localhost:{port}\"");
+    // The SDK logs each resolved endpoint at debug level.
+    let endpoint_log = "s3glob=trace,aws_smithy_runtime::client::orchestrator::endpoints=debug";
 
-    // With --force-path-style the SDK uses http://localhost:{port}/bucket/key
-    // and MinIO responds correctly.
     let mut cmd =
         s3glob_with_endpoint(&localhost_endpoint, &["ls", "--force-path-style", &pattern])?;
-    cmd.assert().success().stdout(contains("test/object.txt"));
+    cmd.env("S3GLOB_LOG", endpoint_log)
+        .assert()
+        .success()
+        .stdout(contains("test/object.txt"))
+        .stderr(contains(path_style_url.as_str()))
+        .stderr(contains(vhost_url.as_str()).not());
 
-    // Without --force-path-style the SDK tries to reach
-    // http://path-style-test.localhost:{port}/test/* which does not resolve.
     let mut cmd = s3glob_with_endpoint(&localhost_endpoint, &["ls", &pattern])?;
-    cmd.assert().failure();
+    cmd.env("S3GLOB_LOG", endpoint_log)
+        .assert()
+        .stderr(contains(vhost_url.as_str()))
+        .stderr(contains(path_style_url.as_str()).not());
 
     Ok(())
 }
@@ -935,39 +950,28 @@ fn s3glob_with_endpoint(endpoint: &str, args: &[&str]) -> anyhow::Result<Command
     let log_directive = env::var("S3GLOB_LOG").unwrap_or_else(|_| "s3glob=trace".to_string());
     command
         .env("AWS_ENDPOINT_URL", endpoint)
-        .env("AWS_ACCESS_KEY_ID", "minioadmin")
-        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .env("AWS_ACCESS_KEY_ID", ACCESS_KEY)
+        .env("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
         .env("S3GLOB_LOG", log_directive)
         .args(args);
-    print_s3glob_output(&mut command);
     Ok(command)
 }
 
 #[tokio::test]
-async fn test_platform_tls_env_var() -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+async fn test_platform_tls_opt_out() -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "platform-tls-test";
     client.create_bucket().bucket(bucket).send().await?;
     create_object(&client, bucket, "hello/world.txt").await?;
 
-    // Run with EXPERIMENTAL_PLATFORM_TLS=true — MinIO is HTTP so https_or_http() covers it.
-    // The key thing being tested: the binary doesn't crash or error out when the env var is set,
-    // and it still successfully lists objects.
+    // Platform TLS is the default, so every other test covers it. This one
+    // checks that opting out falls back to the SDK's client and still lists.
     let mut cmd = run_s3glob(port, &["ls", &format!("s3://{}/hello/*", bucket)])?;
-    cmd.env("EXPERIMENTAL_PLATFORM_TLS", "true");
+    cmd.env("S3GLOB_PLATFORM_TLS", "false");
     cmd.assert().success().stdout(contains("hello/world.txt"));
 
     Ok(())
-}
-
-fn print_s3glob_output(cmd: &mut Command) {
-    let output = cmd.output().unwrap();
-    println!(
-        "==== s3glob stdout ====\n{}\n==== s3glob stderr ====\n{}\n==== end s3glob output ====\n",
-        String::from_utf8(output.stdout).unwrap(),
-        String::from_utf8(output.stderr).unwrap()
-    );
 }
 
 /// A consumer that logs the output of container with the [`log`] crate.
@@ -1013,13 +1017,13 @@ impl LogConsumer for LogPrinter {
             match record {
                 LogFrame::StdOut(bytes) => {
                     println!(
-                        "minio> {}",
+                        "versitygw> {}",
                         self.format_message(&String::from_utf8_lossy(bytes))
                     );
                 }
                 LogFrame::StdErr(bytes) => {
                     eprintln!(
-                        "minio> {}",
+                        "versitygw> {}",
                         self.format_message(&String::from_utf8_lossy(bytes))
                     );
                 }
@@ -1030,7 +1034,7 @@ impl LogConsumer for LogPrinter {
 }
 
 /// Verify both `--output json` and `--output ndjson` end-to-end against
-/// MinIO: the right number of records appear, each metadata field matches
+/// versitygw: the right number of records appear, each metadata field matches
 /// what `ListObjectsV2` actually returns, and json mode is sorted by key.
 #[rstest]
 #[case::json("json", true)]
@@ -1040,10 +1044,10 @@ async fn test_ls_output_json_round_trip(
     #[case] mode: &str,
     #[case] expect_sorted: bool,
 ) -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
     let bucket = format!("ls-rt-{mode}");
     client.create_bucket().bucket(&bucket).send().await?;
-    // Created out of lexicographic order, with a nested key so MinIO surfaces
+    // Created out of lexicographic order, with a nested key so the server surfaces
     // a CommonPrefix (`prefix/sub/`) and we exercise the prefix branch too.
     create_object_with_checksum(&client, &bucket, "prefix/c.txt", 33, sha256()).await?;
     create_object_with_checksum(&client, &bucket, "prefix/a.txt", 11, sha256()).await?;
@@ -1058,6 +1062,15 @@ async fn test_ls_output_json_round_trip(
             .delimiter("/")
             .send()
             .await?,
+    );
+
+    // Uploaded with SHA256 so assert_object_metadata_matches compares a
+    // non-empty checksum_algorithms list, not just its absence.
+    assert!(
+        server_by_key
+            .values()
+            .all(|o| !o.checksum_algorithm().is_empty()),
+        "server did not report checksum_algorithm: {server_by_key:#?}"
     );
 
     let pattern = format!("s3://{bucket}/prefix/*");
@@ -1112,7 +1125,7 @@ async fn test_ls_output_json_round_trip(
 
 #[tokio::test]
 async fn test_ls_output_format_conflicts_with_json() -> anyhow::Result<()> {
-    let (_node, port, _client) = minio_and_client().await;
+    let (_node, port, _client) = s3_server_and_client().await;
     let mut cmd = run_s3glob(
         port,
         &[
@@ -1134,7 +1147,7 @@ async fn test_ls_output_format_conflicts_with_json() -> anyhow::Result<()> {
 async fn test_ls_format_with_explicit_text_output_is_allowed() -> anyhow::Result<()> {
     // --format is rejected only against json/ndjson; explicit `--output text`
     // must still permit --format. (clap's conflicts_with would over-reject here.)
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
     let bucket = "format-text-test";
     client.create_bucket().bucket(bucket).send().await?;
     create_object(&client, bucket, "prefix/file.txt").await?;
@@ -1179,7 +1192,7 @@ async fn test_dl_output_json_round_trip(
     #[case] mode: &str,
     #[case] expect_sorted: bool,
 ) -> anyhow::Result<()> {
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
     let bucket = format!("dl-rt-{mode}");
     client.create_bucket().bucket(&bucket).send().await?;
     let mut expected_total: u64 = 0;
@@ -1196,6 +1209,15 @@ async fn test_dl_output_json_round_trip(
             .prefix("prefix/")
             .send()
             .await?,
+    );
+
+    // Uploaded with SHA256 so assert_object_metadata_matches compares a
+    // non-empty checksum_algorithms list, not just its absence.
+    assert!(
+        server_by_key
+            .values()
+            .all(|o| !o.checksum_algorithm().is_empty()),
+        "server did not report checksum_algorithm: {server_by_key:#?}"
     );
 
     let tempdir = TempDir::new()?;
@@ -1255,7 +1277,7 @@ async fn test_dl_output_json_round_trip(
 async fn test_ls_pipe_closed_early_exits_cleanly() -> anyhow::Result<()> {
     use std::process::{Command as StdCommand, Stdio};
 
-    let (_node, port, client) = minio_and_client().await;
+    let (_node, port, client) = s3_server_and_client().await;
 
     let bucket = "pipe-test";
     client.create_bucket().bucket(bucket).send().await?;
@@ -1276,8 +1298,8 @@ async fn test_ls_pipe_closed_early_exits_cleanly() -> anyhow::Result<()> {
     let cargo_bin = assert_cmd::cargo::cargo_bin("s3glob");
     let mut child = StdCommand::new(&cargo_bin)
         .env("AWS_ENDPOINT_URL", format!("http://127.0.0.1:{}", port))
-        .env("AWS_ACCESS_KEY_ID", "minioadmin")
-        .env("AWS_SECRET_ACCESS_KEY", "minioadmin")
+        .env("AWS_ACCESS_KEY_ID", ACCESS_KEY)
+        .env("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
         .args([
             "ls",
             "--stream",
@@ -1312,5 +1334,326 @@ async fn test_ls_pipe_closed_early_exits_cleanly() -> anyhow::Result<()> {
         "expected 'Matched' summary in stderr after pipe-close, got:\n{stderr}",
     );
 
+    Ok(())
+}
+
+//
+// Failure reporting: a failed request must never silently truncate output
+//
+
+/// Bucket with `prefix/NNNN/file.txt` for `count` prefixes.
+async fn bucket_with_prefixes(client: &Client, bucket: &str, count: usize) -> anyhow::Result<()> {
+    client.create_bucket().bucket(bucket).send().await?;
+    for i in 0..count {
+        create_object(client, bucket, &format!("prefix/{i:04}/file.txt")).await?;
+    }
+    Ok(())
+}
+
+#[rstest]
+#[case::default(&[])]
+#[case::fail_fast(&["--fail-fast"])]
+#[case::fail_fast_then_negated(&["--fail-fast", "--no-fail-fast"])]
+// The fault proxy runs in this process, so the test's blocking wait on
+// s3glob must not starve it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_listing_failure_exits_nonzero(#[case] flags: &[&str]) -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "ls-failure";
+    bucket_with_prefixes(&client, bucket, 20).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0003/")]).await;
+
+    // --no-recursive-auto-parallel sends each `prefix/NNNN/` straight to
+    // the per-prefix recursive listing, which is where the failure lands.
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let mut args = vec!["ls", "--no-recursive-auto-parallel", "--max-retries=0"];
+    args.extend_from_slice(flags);
+    args.push(&pattern);
+    let output = run_s3glob(proxy.port, &args)?.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("listing s3://{bucket}/prefix/0003/")),
+        "stderr should name the failed prefix:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("listing is incomplete"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stdout.contains("prefix/0003/file.txt"));
+    if flags.last() == Some(&"--fail-fast") {
+        assert!(stderr.contains("--fail-fast"), "stderr:\n{stderr}");
+    } else {
+        // Without --fail-fast every other prefix is still listed.
+        for i in (0..20).filter(|i| *i != 3) {
+            let key = format!("prefix/{i:04}/file.txt");
+            assert!(stdout.contains(&key), "missing {key} in:\n{stdout}");
+        }
+    }
+    Ok(())
+}
+
+// The fault proxy runs in this process, so the test's blocking wait on
+// s3glob must not starve it.
+/// Here the failing prefix is hit while discovering prefixes (the `*` in
+/// `file*` is resolved by scanning each `prefix/NNNN/`), before any
+/// per-prefix listing.
+#[rstest]
+#[case::default(&[])]
+#[case::fail_fast(&["--fail-fast"])]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_discovery_failure_exits_nonzero(#[case] flags: &[&str]) -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "discovery-failure";
+    bucket_with_prefixes(&client, bucket, 5).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0003/")]).await;
+
+    let pattern = format!("s3://{bucket}/prefix/*/file*");
+    let mut args = vec!["ls", "--max-retries=0"];
+    args.extend_from_slice(flags);
+    args.push(&pattern);
+    let output = run_s3glob(proxy.port, &args)?.output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr:\n{stderr}"
+    );
+    assert!(proxy.injected()[0] > 0, "fault never fired");
+    assert!(
+        stderr.contains(&format!("s3://{bucket}/prefix/0003/")),
+        "stderr should name the failed prefix:\n{stderr}"
+    );
+    assert!(!stdout.contains("prefix/0003/file.txt"));
+    if flags.is_empty() {
+        for i in [0, 1, 2, 4] {
+            let key = format!("prefix/{i:04}/file.txt");
+            assert!(stdout.contains(&key), "missing {key} in:\n{stdout}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_dl_listing_failure_exits_nonzero() -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "dl-failure";
+    bucket_with_prefixes(&client, bucket, 5).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0003/")]).await;
+
+    let tempdir = TempDir::new()?;
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let output = run_s3glob(
+        proxy.port,
+        &[
+            "dl",
+            "--no-recursive-auto-parallel",
+            "--max-retries=0",
+            "-pabs",
+            &pattern,
+            tempdir.path().to_str().unwrap(),
+        ],
+    )?
+    .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("download is incomplete"),
+        "stderr:\n{stderr}"
+    );
+    tempdir
+        .child("prefix/0003/file.txt")
+        .assert(predicate::path::missing());
+    for i in [0, 1, 2, 4] {
+        tempdir
+            .child(format!("prefix/{i:04}/file.txt"))
+            .assert(predicate::path::exists());
+    }
+    Ok(())
+}
+
+/// A reader that closes stdout early chose to stop reading, so errors in
+/// the part of the listing it never asked for must not fail the run.
+// The fault proxy runs in this process, so the test's blocking wait on
+// s3glob must not starve it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_pipe_closed_with_listing_failure_exits_cleanly() -> anyhow::Result<()> {
+    use std::process::{Command as StdCommand, Stdio};
+
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "pipe-failure";
+    bucket_with_prefixes(&client, bucket, 200).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0150/")]).await;
+
+    // See test_ls_pipe_closed_early_exits_cleanly for why the format is wide.
+    let wide_format = format!("{}{{key}}", "x".repeat(2000));
+    let mut child = StdCommand::new(assert_cmd::cargo::cargo_bin("s3glob"))
+        .env(
+            "AWS_ENDPOINT_URL",
+            format!("http://127.0.0.1:{}", proxy.port),
+        )
+        .env("AWS_ACCESS_KEY_ID", ACCESS_KEY)
+        .env("AWS_SECRET_ACCESS_KEY", SECRET_KEY)
+        .args([
+            "ls",
+            "--stream",
+            "--no-recursive-auto-parallel",
+            "--max-retries=0",
+            "--format",
+            &wide_format,
+            &format!("s3://{bucket}/prefix/*/**"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut reader = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    assert!(!line.is_empty(), "expected at least one output line");
+    drop(reader);
+
+    let output = child.wait_with_output()?;
+    assert!(
+        output.status.success(),
+        "s3glob should exit 0 when the reader closed stdout: {:?}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(())
+}
+
+//
+// Retries: throttled requests are retried, politely
+//
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_retries_throttled_listing() -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "ls-retry";
+    bucket_with_prefixes(&client, bucket, 20).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::times("prefix/0003/", 3)]).await;
+
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let output = run_s3glob(
+        proxy.port,
+        &[
+            "ls",
+            "--no-recursive-auto-parallel",
+            "--max-backoff=0.05",
+            &pattern,
+        ],
+    )?
+    .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected success, stderr:\n{stderr}"
+    );
+    assert_eq!(proxy.injected(), vec![3]);
+    for i in 0..20 {
+        let key = format!("prefix/{i:04}/file.txt");
+        assert!(stdout.contains(&key), "missing {key} in:\n{stdout}");
+    }
+    assert!(
+        stderr.contains("S3 is throttling requests (SlowDown):")
+            && stderr.contains("reducing parallelism to"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("S3 throttled 1 request (3 throttled responses in all)"),
+        "stderr:\n{stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_honors_server_retry_after() -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "ls-retry-after";
+    bucket_with_prefixes(&client, bucket, 3).await?;
+    let proxy = FaultProxy::start(
+        port,
+        vec![Fault {
+            retry_after_ms: Some(2000),
+            ..Fault::times("prefix/0001/", 1)
+        }],
+    )
+    .await;
+
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let start = std::time::Instant::now();
+    // --max-backoff is far below the server's request: the server wins.
+    let output = run_s3glob(
+        proxy.port,
+        &[
+            "ls",
+            "--no-recursive-auto-parallel",
+            "--max-backoff=0.01",
+            &pattern,
+        ],
+    )?
+    .output()?;
+    let elapsed = start.elapsed();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "expected success, stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("S3 asked for a 2s wait"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(2),
+        "finished in {elapsed:?}, before the requested wait"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ls_gives_up_after_max_retries() -> anyhow::Result<()> {
+    let (_node, port, client) = s3_server_and_client().await;
+    let bucket = "ls-give-up";
+    bucket_with_prefixes(&client, bucket, 3).await?;
+    let proxy = FaultProxy::start(port, vec![Fault::always("prefix/0001/")]).await;
+
+    let pattern = format!("s3://{bucket}/prefix/*/**");
+    let output = run_s3glob(
+        proxy.port,
+        &[
+            "ls",
+            "--no-recursive-auto-parallel",
+            "--max-retries=2",
+            "--max-backoff=0.01",
+            &pattern,
+        ],
+    )?
+    .output()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "expected failure, stderr:\n{stderr}"
+    );
+    // One attempt plus two retries.
+    assert_eq!(proxy.injected(), vec![3]);
+    assert!(
+        stderr.contains("still throttled after 2 retries"),
+        "stderr:\n{stderr}"
+    );
     Ok(())
 }

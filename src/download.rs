@@ -3,14 +3,14 @@ use crate::glob_matcher::GLOB_CHARS;
 use super::PathMode;
 use super::S3Object;
 use super::add_atomic;
-use aws_sdk_s3::Client;
+use crate::bucket::Bucket;
+use anyhow::{Context as _, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::warn;
 
 /// A collection of pools for downloading objects
 ///
@@ -90,8 +90,7 @@ pub(crate) fn start_threadpool(
 
 #[derive(Debug)]
 pub(crate) struct Downloader {
-    pub(crate) client: Client,
-    pub(crate) bucket: String,
+    pub(crate) bucket: Bucket,
     pub(crate) prefix_to_strip: String,
     pub(crate) flatten: bool,
     pub(crate) base_path: PathBuf,
@@ -107,19 +106,18 @@ pub(crate) enum Notification {
         local_path: PathBuf,
     },
     BytesDownloaded(usize),
+    Failed(anyhow::Error),
 }
 
 impl Downloader {
     pub(crate) fn new(
-        client: Client,
-        bucket: String,
+        bucket: Bucket,
         prefix_to_strip: String,
         flatten: bool,
         base_path: PathBuf,
         notifier: UnboundedSender<Notification>,
     ) -> Self {
         Self {
-            client,
             bucket,
             obj_counter: Arc::new(AtomicUsize::new(0)),
             obj_id: 0,
@@ -134,7 +132,6 @@ impl Downloader {
     pub(crate) fn fresh(&self) -> Self {
         let obj_id = add_atomic(&self.obj_counter, 1);
         Self {
-            client: self.client.clone(),
             bucket: self.bucket.clone(),
             obj_counter: Arc::clone(&self.obj_counter),
             obj_id,
@@ -146,6 +143,19 @@ impl Downloader {
     }
 
     pub(crate) async fn download_object(self, obj: S3Object) {
+        let notifier = self.notifier.clone();
+        let key = obj.key.clone();
+        let bucket = self.bucket.clone();
+        let notification = match self.try_download_object(obj).await {
+            Ok((object, local_path)) => Notification::ObjectDownloaded { object, local_path },
+            Err(e) => Notification::Failed(e.context(format!("downloading {}", bucket.uri(&key)))),
+        };
+        // The receiver is gone only when the run already stopped (e.g.
+        // --fail-fast), so there is nobody left to tell.
+        let _ = notifier.send(notification);
+    }
+
+    async fn try_download_object(self, obj: S3Object) -> Result<(S3Object, PathBuf)> {
         let mut key_suffix = obj
             .key
             .strip_prefix(&self.prefix_to_strip)
@@ -156,70 +166,43 @@ impl Downloader {
         }
         let path = self.base_path.join(key_suffix);
         let dir = path.parent().unwrap();
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            warn!("Failed to create directory {}: {}", dir.display(), e);
-            return;
-        };
-        let result = self
-            .client
-            .get_object()
-            .bucket(self.bucket)
-            .key(&obj.key)
-            .send()
-            .await;
-        let Ok(mut response) = result else {
-            warn!("Failed to download object {}", obj.key);
-            return;
-        };
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("creating directory {}", dir.display()))?;
+        // Only the request is retried: a failure while streaming the body
+        // fails this download. The slot is held until the body is read, so
+        // downloads count against the throttling-adjusted limit.
+        let (mut response, _slot) = self.bucket.get_object(&obj.key).await?;
         let temp_path = path.with_extension(format!(".s3glob-tmp-{}", self.obj_id));
-        let mut file = match tokio::fs::File::create(&temp_path).await {
-            Ok(file) => file,
-            Err(e) => {
-                warn!("Failed to create file {}: {}", temp_path.display(), e);
-                return;
+        let mut file = tokio::fs::File::create(&temp_path)
+            .await
+            .with_context(|| format!("creating file {}", temp_path.display()))?;
+        let written = async {
+            while let Some(bytes) = response.body.try_next().await? {
+                file.write_all(&bytes)
+                    .await
+                    .with_context(|| format!("writing to file {}", temp_path.display()))?;
+                let _ = self
+                    .notifier
+                    .send(Notification::BytesDownloaded(bytes.len()));
             }
-        };
-        let mut res = response.body.try_next().await;
-        loop {
-            match res {
-                Ok(Some(bytes)) => {
-                    if let Err(e) = file.write_all(&bytes).await {
-                        warn!("Failed to write to file {}: {}", path.display(), e);
-                        return;
-                    };
-                    self.notifier
-                        .send(Notification::BytesDownloaded(bytes.len()))
-                        .expect("can send on channel");
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    warn!("Failed to download object {}: {}", obj.key, e);
-                    return;
-                }
-            }
-            res = response.body.try_next().await;
-        }
-        if let Err(e) = file.flush().await {
-            warn!("Failed to flush file {}: {}", temp_path.display(), e);
+            file.flush()
+                .await
+                .with_context(|| format!("flushing file {}", temp_path.display()))?;
             drop(file);
-            return;
-        };
-        drop(file);
-        if let Err(e) = std::fs::rename(&temp_path, &path) {
-            warn!(
-                "Failed to rename file {} -> {}: {}",
-                &temp_path.display(),
-                path.display(),
-                e
-            );
-            return;
-        };
-        self.notifier
-            .send(Notification::ObjectDownloaded {
-                object: obj,
-                local_path: path,
+            std::fs::rename(&temp_path, &path).with_context(|| {
+                format!(
+                    "renaming file {} -> {}",
+                    temp_path.display(),
+                    path.display()
+                )
             })
-            .expect("send on our channel should succeed");
+        }
+        .await;
+        if written.is_err() {
+            let _ = tokio::fs::remove_file(&temp_path).await;
+        }
+        written?;
+        Ok((obj, path))
     }
 }
 

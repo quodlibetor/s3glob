@@ -307,7 +307,7 @@ proptest! {
             let mut rx = list.rx;
             let mut out: Vec<PrefixResult> = Vec::new();
             while let Some(batch) = rx.recv().await {
-                out.extend(batch);
+                out.extend(batch?);
             }
             Ok::<_, anyhow::Error>(out)
         })

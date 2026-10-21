@@ -27,6 +27,7 @@ aws-config = { version = "1.8", default-features = false, features = [
   "default-https-client",
   "rt-tokio",
 ] }
+aws-runtime = "1.7"
 aws-sdk-s3 = { version = "1.129", default-features = false, features = [
   "default-https-client",
   "rt-tokio",
@@ -40,9 +41,10 @@ rustls-platform-verifier = "0.7"
 tower = "0.5"
 clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 futures = "0.3"
+fastrand = "2"
 humansize = { version = "2.0.0", features = ["no_alloc"] }
 indicatif = "0.18"
-itertools = "0.14.0"
+itertools = "0.15.0"
 num-format = "0.4"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
@@ -57,9 +59,13 @@ assert_cmd = "2.0"
 predicates = "3.1"
 assert2 = "0.4"
 proptest = "1.5"
-rstest = "0.26"
-testcontainers = "0.27"
-testcontainers-modules = { version = "0.15", features = ["minio"] }
+rstest = "0.28"
+testcontainers = "0.28"
+tokio = { version = "1.45", features = ["full", "test-util"] }
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server", "client"] }
+url = "2"
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -1,6 +1,6 @@
 use std::io::{self, IsTerminal as _, Write as _};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -19,11 +19,13 @@ use serde::Serialize;
 use tokio::runtime::Runtime;
 use tracing::debug;
 
+mod bucket;
 mod download;
 mod glob_matcher;
 mod messaging;
 mod platform_tls;
 mod progress;
+mod retry;
 
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -142,7 +144,8 @@ enum Command {
     /// slower than you hope, or if you're getting a slowdown error.
     ///
     /// If you want to limit parallel API calls, you can use the
-    /// --max-parallelism flag.
+    /// --max-parallelism flag. s3glob also lowers its parallelism by
+    /// itself when S3 throttles it, and retries the throttled requests.
     ///
     /// You probably want the maximum parallelism possible. Because of the
     /// APIs provided by AWS, s3glob can only meaningfully issue parallel
@@ -250,6 +253,10 @@ impl ValueEnum for PathMode {
 /// Object discovery is done based on a unixy glob pattern,
 /// See the README for more details:
 /// https://github.com/quodlibetor/s3glob/blob/main/README.md
+///
+/// TLS certificates are verified using your OS's trust settings. To use the AWS
+/// SDK's built-in verifier instead, set the S3GLOB_PLATFORM_TLS env var
+/// to `false`.
 struct Opts {
     #[clap(subcommand)]
     command: Command,
@@ -308,10 +315,27 @@ struct Opts {
 
     /// Maximum number of parallel requests to make
     ///
-    /// If you get a slowdown error you can use this to limit the number of
-    /// concurrent requests.
+    /// When S3 throttles requests (a SlowDown error) s3glob halves its
+    /// parallelism and then slowly raises it again, never above this
+    /// value. Lower it if you want to start out gentler on a bucket that
+    /// you know is busy.
     #[clap(short = 'M', long, global = true, default_value = "10000")]
     max_parallelism: usize,
+
+    /// How many times to retry a failed S3 request before giving up
+    ///
+    /// Throttling (SlowDown) and transient errors (timeouts, 500s) are
+    /// retried with exponential backoff. Other errors, like access denied,
+    /// are not retried.
+    #[clap(long, global = true, default_value = "10")]
+    max_retries: u32,
+
+    /// Longest time, in seconds, to back off between retries
+    ///
+    /// If S3 says how long to wait (the `x-amz-retry-after` header)
+    /// s3glob waits exactly that long, even if it is longer than this.
+    #[clap(long, global = true, default_value = "20", value_name = "SECONDS")]
+    max_backoff: f64,
 
     /// Disable automatic parallelization of `**` (recursive) listings
     ///
@@ -384,6 +408,36 @@ struct Opts {
         overrides_with = "cross_delim",
     )]
     no_cross_delim: bool,
+
+    /// Stop at the first S3 error instead of finishing the run
+    ///
+    /// By default when a request to S3 fails s3glob prints the error,
+    /// keeps listing (or downloading) everything else, and exits non-zero
+    /// at the end because the results are incomplete.
+    ///
+    /// With `--fail-fast` s3glob stops at the first error. Matches found
+    /// before the error are still printed.
+    ///
+    /// `--no-fail-fast` restores the default.
+    #[clap(
+        long,
+        global = true,
+        action = ArgAction::SetTrue,
+        overrides_with = "no_fail_fast",
+        verbatim_doc_comment,
+    )]
+    fail_fast: bool,
+
+    /// Negated form of `--fail-fast`. Hidden because `--fail-fast` already
+    /// documents both directions.
+    #[clap(
+        long = "no-fail-fast",
+        global = true,
+        action = ArgAction::SetTrue,
+        hide = true,
+        overrides_with = "fail_fast",
+    )]
+    no_fail_fast: bool,
 }
 
 impl Opts {
@@ -400,9 +454,73 @@ impl Opts {
             self.cross_delim
         }
     }
+
+    /// Resolve the effective `fail_fast` value; see [`Self::cross_delim`].
+    fn fail_fast(&self) -> bool {
+        self.fail_fast && !self.no_fail_fast
+    }
 }
 
+/// Errors that made this run's results incomplete.
+///
+/// Each error is printed when it is recorded, so a long run shows problems
+/// as they happen rather than only at exit.
+struct Failures {
+    fail_fast: bool,
+    count: usize,
+}
+
+impl Failures {
+    fn new(fail_fast: bool) -> Self {
+        Self {
+            fail_fast,
+            count: 0,
+        }
+    }
+
+    /// Print and count `err`. Returns `true` if the caller should stop.
+    fn record(&mut self, err: &anyhow::Error) -> bool {
+        self.count += 1;
+        progress::get().error(format_args!("ERROR: {err:#}"));
+        self.fail_fast
+    }
+
+    /// `Err` if anything failed, naming what is incomplete.
+    ///
+    /// `reader_gone` is true when stdout was closed early (e.g. `| head`):
+    /// the reader chose to stop, so a missing tail of output is not an
+    /// error. The errors themselves were already printed.
+    fn finish(self, incomplete: &str, reader_gone: bool) -> Result<()> {
+        if self.count == 0 || reader_gone {
+            return Ok(());
+        }
+        let stopped = if self.fail_fast {
+            ", stopped early because of --fail-fast"
+        } else {
+            ""
+        };
+        bail!(
+            "{} {} failed{stopped}: {incomplete} incomplete",
+            self.count,
+            if self.count == 1 {
+                "request"
+            } else {
+                "requests"
+            },
+        )
+    }
+}
+
+/// Set when any thread panics. A panicked listing or download task takes
+/// its results with it, so the run must not report success.
+static PANICKED: AtomicBool = AtomicBool::new(false);
+
 fn main() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        PANICKED.store(true, Ordering::Relaxed);
+        default_hook(info);
+    }));
     let opts = Opts::parse();
     setup_logging(log_directive(opts.verbose, opts.quiet));
     let level = if opts.quiet >= 2 {
@@ -418,7 +536,13 @@ fn main() {
 
     let rt = Runtime::new().expect("tokio runtime should create successfully");
     rt.block_on(async {
-        if let Err(err) = run(opts).await {
+        let mut retrier = None;
+        let result = run(opts, &mut retrier).await;
+        // Shown even with -q: throttling explains a slow or failed run.
+        if let Some(summary) = retrier.as_ref().and_then(retry::Retrier::summary) {
+            progress::get().error(summary);
+        }
+        if let Err(err) = result {
             // TODO: Separate user error from internal error?
             message_err!("Error: {}", err);
             let mut err = err.source();
@@ -437,12 +561,18 @@ fn main() {
             }
             std::process::exit(1);
         }
+        if PANICKED.load(Ordering::Relaxed) {
+            message_err!("Error: an internal task panicked, results are incomplete");
+            std::process::exit(1);
+        }
     });
     // without this, tokio takes a long time to exit
     rt.shutdown_timeout(Duration::from_millis(1));
 }
 
-async fn run(opts: Opts) -> Result<()> {
+/// `retrier` is filled in once options are validated, so `main` can report
+/// throttling even when the run fails.
+async fn run(opts: Opts, retrier: &mut Option<retry::Retrier>) -> Result<()> {
     let start = Instant::now();
     if let Command::List {
         format: Some(_),
@@ -471,15 +601,24 @@ async fn run(opts: Opts) -> Result<()> {
         bail!("pattern must have a <bucket>/<pattern> format, with an optional s3:// prefix");
     };
 
-    let client = create_s3_client(&opts, &bucket).await?;
+    let max_backoff = Duration::try_from_secs_f64(opts.max_backoff)
+        .map_err(|e| anyhow!("invalid --max-backoff {}: {e}", opts.max_backoff))?;
+    let retrier = retrier.insert(retry::Retrier::new(
+        opts.max_parallelism,
+        opts.max_retries,
+        max_backoff,
+    ));
+    let client = create_s3_client(&opts, &bucket, retrier).await?;
 
-    let engine = S3Engine::new(client.clone(), bucket.clone());
+    let s3_bucket = bucket::Bucket::new(client, retrier.clone(), bucket.clone());
+    let engine = S3Engine::new(s3_bucket.clone());
     let mut matcher = S3GlobMatcher::parse(
         raw_pattern.clone(),
         &opts.delimiter.to_string(),
         opts.cross_delim(),
     )?;
     matcher.set_max_parallelism(opts.max_parallelism);
+    matcher.set_fail_fast(opts.fail_fast());
     let effective_min_prefixes = if opts.no_recursive_auto_parallel {
         0
     } else {
@@ -491,6 +630,7 @@ async fn run(opts: Opts) -> Result<()> {
         totals,
         mut rx,
     } = matcher.get_objects(engine).await?;
+    let mut failures = Failures::new(opts.fail_fast());
 
     match opts.command {
         Command::List {
@@ -529,7 +669,17 @@ async fn run(opts: Opts) -> Result<()> {
                 None
             };
             let mut stdout = io::stdout().lock();
+            let mut reader_gone = false;
             'recv: while let Some(results) = rx.recv().await {
+                let results = match results {
+                    Ok(results) => results,
+                    Err(err) => {
+                        if failures.record(&err) {
+                            break 'recv;
+                        }
+                        continue;
+                    }
+                };
                 for result in &results {
                     match result {
                         PrefixResult::Object(_) => object_count += 1,
@@ -553,6 +703,7 @@ async fn run(opts: Opts) -> Result<()> {
                             OutputFormat::Json => unreachable!(),
                         };
                         if !keep_writing(written)? {
+                            reader_gone = true;
                             break 'recv;
                         }
                     }
@@ -574,9 +725,9 @@ async fn run(opts: Opts) -> Result<()> {
                 }
             }
             // Done receiving. Dropping the receiver lets the matcher's senders
-            // fail fast if we broke out early on a closed pipe. In-flight S3
-            // list calls still finish their current page, but nothing new is
-            // queued.
+            // fail fast if we broke out early on a closed pipe or
+            // --fail-fast. In-flight S3 list calls still finish their
+            // current page, but nothing new is queued.
             drop(rx);
             if let Some(matches_progress) = &matches_progress {
                 matches_progress.finish_and_clear();
@@ -594,6 +745,7 @@ async fn run(opts: Opts) -> Result<()> {
                                 decimal,
                                 obj,
                             ))? {
+                                reader_gone = true;
                                 break;
                             }
                         }
@@ -603,7 +755,7 @@ async fn run(opts: Opts) -> Result<()> {
                             .iter()
                             .map(|r| JsonLsRecord::from_result(&bucket, r))
                             .collect();
-                        keep_writing(write_json_line(&mut stdout, &records))?;
+                        reader_gone = !keep_writing(write_json_line(&mut stdout, &records))?;
                     }
                     OutputFormat::Ndjson => unreachable!(),
                 }
@@ -630,6 +782,7 @@ async fn run(opts: Opts) -> Result<()> {
                     elapsed,
                 );
             }
+            failures.finish("listing is", reader_gone)?;
         }
         Command::Download {
             dest,
@@ -645,8 +798,7 @@ async fn run(opts: Opts) -> Result<()> {
                 tokio::sync::mpsc::unbounded_channel::<download::Notification>();
             let base_path = PathBuf::from(dest);
             let dl = download::Downloader::new(
-                client.clone(),
-                bucket.clone(),
+                s3_bucket.clone(),
                 prefix_to_strip,
                 flatten,
                 base_path.clone(),
@@ -660,6 +812,17 @@ async fn run(opts: Opts) -> Result<()> {
             // if the path_mode is shortest then we need to know all the paths to be able to extract the shortest
             let mut objects_to_download = Vec::new();
             while let Some(result) = rx.recv().await {
+                let result = match result {
+                    Ok(result) => result,
+                    Err(err) => {
+                        // On --fail-fast stop discovering, but still
+                        // download what was already found.
+                        if failures.record(&err) {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 total_matches += result
                     .iter()
                     .filter(|r| matches!(r, PrefixResult::Object(_)))
@@ -692,6 +855,7 @@ async fn run(opts: Opts) -> Result<()> {
                     ));
                 }
             }
+            drop(rx);
             if let Some(matches_progress) = matches_progress {
                 matches_progress.finish_and_clear();
             }
@@ -709,8 +873,7 @@ async fn run(opts: Opts) -> Result<()> {
                     prefix_to_strip
                 );
                 let dl = download::Downloader::new(
-                    client,
-                    bucket.clone(),
+                    s3_bucket,
                     prefix_to_strip,
                     flatten,
                     base_path,
@@ -733,6 +896,7 @@ async fn run(opts: Opts) -> Result<()> {
             let bytes_progress = progress::get().bar(progress::downloads_bytes_style());
             let mut ndjson_stdout =
                 matches!(output, OutputFormat::Ndjson).then(|| io::stdout().lock());
+            let mut reader_gone = false;
             while let Some(n) = ntfctn_rx.recv().await {
                 match n {
                     download::Notification::ObjectDownloaded { object, local_path } => {
@@ -745,6 +909,7 @@ async fn run(opts: Opts) -> Result<()> {
                             };
                             if !keep_writing(write_json_line(out, &event))? {
                                 ndjson_stdout = None;
+                                reader_gone = true;
                             }
                         }
                         records.push(record);
@@ -753,6 +918,13 @@ async fn run(opts: Opts) -> Result<()> {
                         total_bytes += bytes;
                         bytes_progress.set_position(total_bytes as u64);
                     }
+                    download::Notification::Failed(err) => {
+                        // Downloads still in flight are abandoned on
+                        // --fail-fast; what finished is reported below.
+                        if failures.record(&err) {
+                            break;
+                        }
+                    }
                 }
                 let elapsed = start_time.elapsed().as_secs_f64();
                 speed = total_bytes as f64 / elapsed;
@@ -760,6 +932,7 @@ async fn run(opts: Opts) -> Result<()> {
             downloads_progress.finish_and_clear();
             bytes_progress.finish_and_clear();
             if records.is_empty() {
+                failures.finish("download is", reader_gone)?;
                 bail!("No objects found matching the pattern.");
             }
             let dl_ms = start_time.elapsed().as_millis() as u64;
@@ -779,6 +952,7 @@ async fn run(opts: Opts) -> Result<()> {
                     let mut stdout = io::stdout().lock();
                     for path in &files {
                         if !keep_writing(writeln!(stdout, "{}", path))? {
+                            reader_gone = true;
                             break;
                         }
                     }
@@ -794,7 +968,7 @@ async fn run(opts: Opts) -> Result<()> {
                 OutputFormat::Ndjson => {
                     if let Some(mut out) = ndjson_stdout {
                         let event = JsonDlEvent::Summary { record: &summary };
-                        keep_writing(write_json_line(&mut out, &event))?;
+                        reader_gone = !keep_writing(write_json_line(&mut out, &event))?;
                     }
                 }
                 OutputFormat::Json => {
@@ -808,9 +982,10 @@ async fn run(opts: Opts) -> Result<()> {
                         summary: &summary,
                     };
                     let mut stdout = io::stdout().lock();
-                    keep_writing(write_json_line(&mut stdout, &wrapper))?;
+                    reader_gone = !keep_writing(write_json_line(&mut stdout, &wrapper))?;
                 }
             }
+            failures.finish("download is", reader_gone)?;
         }
         Command::Parallelism { .. } => {
             progressln!("This is just for documentation, run instead: s3glob help parallelism");
@@ -1047,26 +1222,43 @@ impl S3Object {
     }
 }
 
+/// Whether to verify TLS with the OS verifier instead of the AWS SDK's
+/// default webpki client. On unless `S3GLOB_PLATFORM_TLS` is set to
+/// `0`, `false`, `no` or `off`.
+fn platform_tls_enabled() -> bool {
+    !std::env::var("S3GLOB_PLATFORM_TLS").is_ok_and(|v| {
+        matches!(
+            v.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        )
+    })
+}
+
 /// Create a new S3 client with region auto-detection
-async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
+async fn create_s3_client(
+    opts: &Opts,
+    bucket: &String,
+    retrier: &retry::Retrier,
+) -> Result<Client> {
     let region = RegionProviderChain::first_try(Region::new(opts.region.clone()));
     let mut config = aws_config::defaults(BehaviorVersion::latest()).region(region);
     if opts.no_sign_request {
         config = config.no_credentials();
     }
-    if std::env::var("EXPERIMENTAL_PLATFORM_TLS")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-    {
+    if platform_tls_enabled() {
         config = config.http_client(platform_tls::build());
     }
     let config = config.load().await;
     let client = build_s3_client(&config, opts.force_path_style);
 
-    let res = client.head_bucket().bucket(bucket).send().await;
+    let res = retrier
+        .send(|| client.head_bucket().bucket(bucket).send())
+        .await;
 
     let bucket_region = match res {
         Ok(_) => return Ok(client),
         Err(err) => err
+            .sdk_error()
             .raw_response()
             .and_then(|res| res.headers().get("x-amz-bucket-region"))
             .map(str::to_owned)
@@ -1079,9 +1271,7 @@ async fn create_s3_client(opts: &Opts, bucket: &String) -> Result<Client> {
     if opts.no_sign_request {
         config = config.no_credentials();
     }
-    if std::env::var("EXPERIMENTAL_PLATFORM_TLS")
-        .is_ok_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-    {
+    if platform_tls_enabled() {
         config = config.http_client(platform_tls::build());
     }
     let config = config.load().await;
@@ -1093,6 +1283,10 @@ fn build_s3_client(config: &aws_config::SdkConfig, force_path_style: bool) -> Cl
     Client::from_conf(
         aws_sdk_s3::config::Builder::from(config)
             .force_path_style(force_path_style)
+            // Every call retries through `retry::Retrier`, which also adapts
+            // parallelism to throttling; SDK retries would hide throttling
+            // from it.
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
             .build(),
     )
 }
@@ -1241,14 +1435,17 @@ pub(crate) fn setup_logging(directive: Option<&str>) {
         || std::env::var("CLICOLOR").is_ok_and(|v| ["1", "true"].contains(&v.as_str()))
         || std::env::var("CLICOLOR_FORCE").is_ok_and(|v| ["1", "true"].contains(&v.as_str()));
 
-    tracing_subscriber::fmt()
+    // Unit tests call this once per test, and `cargo test` runs them all in
+    // one process, so every call after the first finds a subscriber already
+    // installed. Keep the first one instead of panicking.
+    let _ = tracing_subscriber::fmt()
         .with_target(false)
         .with_file(true)
         .with_line_number(true)
         .with_ansi(use_ansi)
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
-        .init();
+        .try_init();
 }
 
 #[cfg(test)]

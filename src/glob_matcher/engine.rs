@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context as _, Result};
-use aws_sdk_s3::Client;
 use aws_sdk_s3::types::Object;
 use num_format::{Locale, ToFormattedString as _};
 use tokio::sync::Semaphore;
@@ -15,9 +14,10 @@ use std::sync::Mutex;
 #[cfg(test)]
 use tracing::info;
 
+use crate::bucket::Bucket;
 use crate::{S3Object, add_atomic, progressln};
 
-use super::{LiveStatus, PrefixResult, PrefixSearchResult};
+use super::{LiveStatus, MatchBatch, PrefixResult, PrefixSearchResult};
 
 #[async_trait::async_trait]
 pub trait Engine: Send + Sync + 'static {
@@ -44,11 +44,11 @@ pub trait Engine: Send + Sync + 'static {
     /// returned objects are the complete content under `prefix`.
     async fn probe_prefix(&mut self, prefix: &str, max_keys: i32) -> Result<ScanResult>;
 
-    async fn check_prefixes<P>(
-        &mut self,
-        prefixes: P,
-        max_parallelism: usize,
-    ) -> Result<BTreeSet<String>>
+    /// Keep the `prefixes` that have at least one key under them.
+    ///
+    /// A prefix whose check fails is left out of `found` and its error is
+    /// returned in `errors`, so one failure doesn't discard the rest.
+    async fn check_prefixes<P>(&mut self, prefixes: P, max_parallelism: usize) -> CheckedPrefixes
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static;
@@ -67,7 +67,7 @@ pub trait Engine: Send + Sync + 'static {
         delimiter: char,
         status: &LiveStatus,
         matcher: &regex::Regex,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         permit: Arc<Semaphore>,
     ) -> Result<()>;
 
@@ -79,39 +79,31 @@ pub trait Engine: Send + Sync + 'static {
         presult: PrefixSearchResult,
         matcher: Arc<regex::Regex>,
         status: &LiveStatus,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         permit: Arc<Semaphore>,
     ) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
 pub struct S3Engine {
-    client: Client,
-    bucket: String,
+    bucket: Bucket,
 }
 
 impl S3Engine {
-    pub fn new(client: Client, bucket: String) -> Self {
-        Self { client, bucket }
+    pub fn new(bucket: Bucket) -> Self {
+        Self { bucket }
     }
 }
 
 async fn list_matching_objects(
-    client: Client,
-    bucket: String,
+    engine: S3Engine,
     prefix: String,
     matcher: Arc<regex::Regex>,
     total_objects: Arc<AtomicUsize>,
-    tx: UnboundedSender<Vec<PrefixResult>>,
+    tx: UnboundedSender<MatchBatch>,
 ) -> Result<()> {
-    let mut paginator = client
-        .list_objects_v2()
-        .bucket(bucket.clone())
-        .prefix(prefix)
-        .into_paginator()
-        .send();
-
-    while let Some(page) = paginator.next().await {
+    let mut pages = engine.bucket.list_pages(&prefix, None);
+    while let Some(page) = pages.next().await {
         let page = page?;
         if let Some(contents) = page.contents {
             let mut matching_objects = Vec::new();
@@ -123,15 +115,19 @@ async fn list_matching_objects(
                     matching_objects.push(obj);
                 }
             }
-            tx.send(
-                matching_objects
-                    .into_iter()
-                    .map(|o| PrefixResult::Object(S3Object::from(o)))
-                    .collect::<Vec<_>>(),
-            )?;
+            tx.send(Ok(matching_objects
+                .into_iter()
+                .map(|o| PrefixResult::Object(S3Object::from(o)))
+                .collect::<Vec<_>>()))?;
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+pub struct CheckedPrefixes {
+    pub found: BTreeSet<String>,
+    pub errors: Vec<anyhow::Error>,
 }
 
 #[derive(Default)]
@@ -185,22 +181,14 @@ impl Engine for S3Engine {
     ) -> Result<ScanResult> {
         trace!(prefix, ?max_prefixes, "scanning for prefixes within");
         let mut result = ScanResult::default();
-        let mut paginator = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(prefix)
-            .delimiter(delimiter)
-            .into_paginator()
-            .send();
-
         let mut warning_count = 0;
         let mut warning_inc = 50_000;
         let mut pages_seen = 0usize;
-        while let Some(page) = paginator.next().await {
+        let mut pages = self.bucket.list_pages(prefix, Some(delimiter));
+        while let Some(page) = pages.next().await {
             let page = page?;
             pages_seen += 1;
-            let page_is_truncated = page.is_truncated.unwrap_or(false);
+            let page_is_truncated = pages.has_more();
             if result.len() >= warning_count + warning_inc {
                 // Routed through progressln! (not tracing::warn!) so the
                 // prefix-discovery spinner is suspended while we print, and
@@ -249,13 +237,10 @@ impl Engine for S3Engine {
     async fn probe_prefix(&mut self, prefix: &str, max_keys: i32) -> Result<ScanResult> {
         trace!(prefix, max_keys, "probing prefix for direct content");
         let response = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket)
-            .prefix(prefix)
-            .max_keys(max_keys)
-            .send()
-            .await?;
+            .bucket
+            .list_first_page(prefix, None, Some(max_keys))
+            .await
+            .with_context(|| format!("listing {}", self.bucket.uri(prefix)))?;
         Ok(ScanResult {
             prefixes: Vec::new(),
             objects: response.contents.unwrap_or_default(),
@@ -265,11 +250,7 @@ impl Engine for S3Engine {
 
     // TODO: convert this to take &mut prefixes so that we don't have to
     // reallocate the vector on each call
-    async fn check_prefixes<P>(
-        &mut self,
-        prefixes: P,
-        max_parallelism: usize,
-    ) -> Result<BTreeSet<String>>
+    async fn check_prefixes<P>(&mut self, prefixes: P, max_parallelism: usize) -> CheckedPrefixes
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static,
@@ -281,20 +262,13 @@ impl Engine for S3Engine {
         let permit = Arc::new(tokio::sync::Semaphore::new(max_parallelism));
 
         for prefix in prefixes {
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
+            let engine = self.clone();
             let tx = tx.clone();
             let prefix = prefix.clone();
             let permit = permit.clone().acquire_owned().await;
 
             tokio::spawn(async move {
-                let result = client
-                    .list_objects_v2()
-                    .bucket(bucket)
-                    .prefix(prefix.clone())
-                    .max_keys(1)
-                    .send()
-                    .await;
+                let result = engine.bucket.list_first_page(&prefix, None, Some(1)).await;
                 drop(permit);
 
                 match result {
@@ -304,7 +278,11 @@ impl Engine for S3Engine {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(e)).await;
+                        let err = anyhow::Error::new(e).context(format!(
+                            "checking that {} exists",
+                            engine.bucket.uri(&prefix)
+                        ));
+                        let _ = tx.send(Err(err)).await;
                     }
                 }
             });
@@ -312,13 +290,21 @@ impl Engine for S3Engine {
 
         drop(tx);
 
-        let mut new_prefixes = BTreeSet::new();
+        let mut checked = CheckedPrefixes::default();
         while let Some(result) = rx.recv().await {
-            new_prefixes.insert(result.context("checking prefix exists")?);
+            match result {
+                Ok(prefix) => {
+                    checked.found.insert(prefix);
+                }
+                Err(e) => checked.errors.push(e),
+            }
         }
-        debug!(valid_prefix_count = new_prefixes.len(), "checked prefixes");
-
-        Ok(new_prefixes)
+        debug!(
+            valid_prefix_count = checked.found.len(),
+            failed = checked.errors.len(),
+            "checked prefixes"
+        );
+        checked
     }
 
     async fn get_exact(
@@ -327,7 +313,7 @@ impl Engine for S3Engine {
         delimiter: char,
         status: &LiveStatus,
         matcher: &regex::Regex,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in &presult.prefixes {
@@ -336,8 +322,7 @@ impl Engine for S3Engine {
             }
             // just get the object info for each prefix
             let permit = permit.clone().acquire_owned().await;
-            let client = self.client.clone();
-            let bucket = self.bucket.clone();
+            let engine = self.clone();
             let prefix = prefix.clone();
             let tx = tx.clone();
 
@@ -347,7 +332,7 @@ impl Engine for S3Engine {
                 // Engine::scan_prefixes and are verified directories.
                 if prefix.ends_with(delimiter) {
                     drop(permit);
-                    let _ = tx.send(vec![PrefixResult::Prefix(prefix)]);
+                    let _ = tx.send(Ok(vec![PrefixResult::Prefix(prefix)]));
                     return;
                 }
 
@@ -355,37 +340,49 @@ impl Engine for S3Engine {
                 // also a directory.
                 // simple_append's loose verification can produce phantom
                 // prefixes which are neither.
-                let head = client
-                    .head_object()
-                    .bucket(bucket.clone())
-                    .key(prefix.clone())
-                    .send()
-                    .await;
+                let head = engine.bucket.head_object(&prefix).await;
                 let directory_form = format!("{prefix}{delimiter}");
-                let dir_check = client
-                    .list_objects_v2()
-                    .bucket(bucket)
-                    .prefix(directory_form.clone())
-                    .max_keys(1)
-                    .send()
+                let dir_check = engine
+                    .bucket
+                    .list_first_page(&directory_form, None, Some(1))
                     .await;
                 drop(permit);
+                let bucket = &engine.bucket;
 
                 let mut out: Vec<PrefixResult> = Vec::new();
-                if let Ok(o) = head {
-                    trace!(prefix, "prefix is actually an object");
-                    out.push(PrefixResult::Object(S3Object::from_head_object(
-                        prefix.clone(),
-                        o,
-                    )));
+                match head {
+                    Ok(o) => {
+                        trace!(prefix, "prefix is actually an object");
+                        out.push(PrefixResult::Object(S3Object::from_head_object(
+                            prefix.clone(),
+                            o,
+                        )));
+                    }
+                    // A candidate that isn't a key is expected: it may be
+                    // only a directory, or neither.
+                    Err(e)
+                        if e.sdk_error()
+                            .as_service_error()
+                            .is_some_and(|e| e.is_not_found()) => {}
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::Error::new(e).context(format!(
+                            "checking whether {} is an object",
+                            bucket.uri(&prefix)
+                        ))));
+                    }
                 }
-                if let Ok(resp) = dir_check
-                    && resp.key_count.unwrap_or(0) > 0
-                {
-                    out.push(PrefixResult::Prefix(directory_form));
+                match dir_check {
+                    Ok(resp) if resp.key_count.unwrap_or(0) > 0 => {
+                        out.push(PrefixResult::Prefix(directory_form));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::Error::new(e)
+                            .context(format!("listing {}", bucket.uri(&directory_form)))));
+                    }
                 }
                 if !out.is_empty() {
-                    let _ = tx.send(out);
+                    let _ = tx.send(Ok(out));
                 }
             });
         }
@@ -393,14 +390,12 @@ impl Engine for S3Engine {
             total_prefixes = presult.prefixes.len(),
             "filtered prefixes from the result set"
         );
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
+        tx.send(Ok(presult
+            .objects
+            .into_iter()
+            .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+            .map(|o| PrefixResult::Object(S3Object::from(o)))
+            .collect()))?;
         Ok(())
     }
 
@@ -409,35 +404,36 @@ impl Engine for S3Engine {
         presult: PrefixSearchResult,
         matcher: Arc<regex::Regex>,
         status: &LiveStatus,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in presult.prefixes {
-            let client = self.client.clone();
+            let engine = self.clone();
             let total_objects = Arc::clone(&status.total_objects);
             let seen_prefixes = Arc::clone(&status.seen_prefixes);
             let matcher = matcher.clone();
-            let bucket = self.bucket.clone();
             let tx = tx.clone();
             let permit = permit.clone().acquire_owned().await;
 
             tokio::spawn(async move {
-                list_matching_objects(client, bucket, prefix.clone(), matcher, total_objects, tx)
-                    .await?;
+                let result =
+                    list_matching_objects(engine, prefix, matcher, total_objects, tx.clone()).await;
                 drop(permit);
-
                 add_atomic(&seen_prefixes, 1);
-                Ok::<_, anyhow::Error>(())
+                if let Err(e) = result {
+                    // The error already names the prefix (see `Pages`). The
+                    // receiver is gone only when the consumer stopped
+                    // reading on purpose, so there is nobody to tell.
+                    let _ = tx.send(Err(e));
+                }
             });
         }
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
+        tx.send(Ok(presult
+            .objects
+            .into_iter()
+            .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+            .map(|o| PrefixResult::Object(S3Object::from(o)))
+            .collect()))?;
         Ok(())
     }
 }
@@ -454,6 +450,9 @@ pub(super) struct MockS3Engine {
     /// `truncated=true` with no sub-prefixes, as if the engine had
     /// paged through enough flat content to give up.
     pub force_truncate_prefixes: Arc<BTreeSet<String>>,
+    /// Prefixes for which every engine call fails, as if S3 kept
+    /// rejecting requests for them.
+    pub fail_prefixes: Arc<BTreeSet<String>>,
 }
 
 #[cfg(test)]
@@ -469,6 +468,7 @@ impl Engine for MockS3Engine {
             .lock()
             .unwrap()
             .push((prefix.to_string(), delimiter.to_string()));
+        self.check_failure(prefix)?;
         if self.force_truncate_prefixes.contains(prefix) {
             // Simulate the real engine's flat-dense page-budget guard:
             // empty sub-prefix list with `truncated=true`.
@@ -498,6 +498,7 @@ impl Engine for MockS3Engine {
             .lock()
             .unwrap()
             .push((prefix.to_string(), max_keys));
+        self.check_failure(prefix)?;
         let max = max_keys as usize;
         let mut matched: Vec<&String> = self
             .paths
@@ -519,30 +520,28 @@ impl Engine for MockS3Engine {
         Ok(result)
     }
 
-    async fn check_prefixes<P>(
-        &mut self,
-        prefixes: P,
-        _max_parallelism: usize,
-    ) -> Result<BTreeSet<String>>
+    async fn check_prefixes<P>(&mut self, prefixes: P, _max_parallelism: usize) -> CheckedPrefixes
     where
         P: IntoIterator<Item = String> + Send + Sync + 'static,
         P::IntoIter: Send + Sync + 'static,
     {
         let prefixes = prefixes.into_iter().collect::<Vec<_>>();
         info!(?prefixes, "MockS3 checking prefixes");
-        let mut valid_prefixes = BTreeSet::new();
+        let mut checked = CheckedPrefixes::default();
 
         // a prefix is "valid" if any key in the bucket starts with it.
         // Independent of delimiter.
         for prefix in &prefixes {
-            if self.paths.iter().any(|k| k.starts_with(prefix)) {
-                valid_prefixes.insert(prefix.to_string());
+            if let Err(e) = self.check_failure(prefix) {
+                checked.errors.push(e);
+            } else if self.paths.iter().any(|k| k.starts_with(prefix)) {
+                checked.found.insert(prefix.to_string());
             }
         }
 
-        info!(requested = ?prefixes, existing = ?valid_prefixes, "mocks3 checked prefixes for existence");
+        info!(requested = ?prefixes, existing = ?checked.found, "mocks3 checked prefixes for existence");
 
-        Ok(valid_prefixes)
+        checked
     }
 
     async fn get_exact(
@@ -551,7 +550,7 @@ impl Engine for MockS3Engine {
         delimiter: char,
         _status: &LiveStatus,
         matcher: &regex::Regex,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         _permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in &presult.prefixes {
@@ -561,7 +560,7 @@ impl Engine for MockS3Engine {
             // Prefixes ending with delimiter are verified directories
             // from Engine::scan_prefixes
             if prefix.ends_with(delimiter) {
-                tx.send(vec![PrefixResult::Prefix(prefix.clone())])?;
+                tx.send(Ok(vec![PrefixResult::Prefix(prefix.clone())]))?;
                 continue;
             }
             // For non-delim-suffixed prefixes, emit Object if it's an
@@ -579,17 +578,15 @@ impl Engine for MockS3Engine {
                 out.push(PrefixResult::Prefix(directory_form));
             }
             if !out.is_empty() {
-                tx.send(out)?;
+                tx.send(Ok(out))?;
             }
         }
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
+        tx.send(Ok(presult
+            .objects
+            .into_iter()
+            .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+            .map(|o| PrefixResult::Object(S3Object::from(o)))
+            .collect()))?;
         Ok(())
     }
 
@@ -598,7 +595,7 @@ impl Engine for MockS3Engine {
         presult: PrefixSearchResult,
         matcher: Arc<regex::Regex>,
         _status: &LiveStatus,
-        tx: &UnboundedSender<Vec<PrefixResult>>,
+        tx: &UnboundedSender<MatchBatch>,
         _permit: Arc<Semaphore>,
     ) -> Result<()> {
         for prefix in &presult.prefixes {
@@ -608,16 +605,14 @@ impl Engine for MockS3Engine {
                 .filter(|k| k.starts_with(prefix.as_str()) && matcher.is_match(k))
                 .map(|k| PrefixResult::Object(S3Object::from(Object::builder().key(k).build())))
                 .collect();
-            tx.send(matching)?;
+            tx.send(Ok(matching))?;
         }
-        tx.send(
-            presult
-                .objects
-                .into_iter()
-                .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
-                .map(|o| PrefixResult::Object(S3Object::from(o)))
-                .collect(),
-        )?;
+        tx.send(Ok(presult
+            .objects
+            .into_iter()
+            .filter(|o| matcher.is_match(o.key.as_ref().unwrap()))
+            .map(|o| PrefixResult::Object(S3Object::from(o)))
+            .collect()))?;
         Ok(())
     }
 }
@@ -630,7 +625,25 @@ impl MockS3Engine {
             calls: Arc::new(Mutex::new(Vec::new())),
             probe_calls: Arc::new(Mutex::new(Vec::new())),
             force_truncate_prefixes: Arc::new(BTreeSet::new()),
+            fail_prefixes: Arc::new(BTreeSet::new()),
         }
+    }
+
+    /// Make every engine call for any of `prefixes` fail.
+    pub fn with_failures<I>(mut self, prefixes: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<String>,
+    {
+        self.fail_prefixes = Arc::new(prefixes.into_iter().map(Into::into).collect());
+        self
+    }
+
+    fn check_failure(&self, prefix: &str) -> Result<()> {
+        if self.fail_prefixes.contains(prefix) {
+            anyhow::bail!("MockS3 injected failure for {prefix:?}");
+        }
+        Ok(())
     }
 
     /// Make `scan_prefixes` return `truncated=true` with no sub-prefixes
