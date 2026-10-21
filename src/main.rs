@@ -1423,14 +1423,17 @@ pub(crate) fn setup_logging(directive: Option<&str>) {
         || std::env::var("CLICOLOR").is_ok_and(|v| ["1", "true"].contains(&v.as_str()))
         || std::env::var("CLICOLOR_FORCE").is_ok_and(|v| ["1", "true"].contains(&v.as_str()));
 
-    tracing_subscriber::fmt()
+    // Unit tests call this once per test, and `cargo test` runs them all in
+    // one process, so every call after the first finds a subscriber already
+    // installed. Keep the first one instead of panicking.
+    let _ = tracing_subscriber::fmt()
         .with_target(false)
         .with_file(true)
         .with_line_number(true)
         .with_ansi(use_ansi)
         .with_env_filter(env_filter)
         .with_writer(std::io::stderr)
-        .init();
+        .try_init();
 }
 
 #[cfg(test)]
