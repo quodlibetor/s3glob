@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.18](https://github.com/quodlibetor/s3glob/compare/v0.4.17...v0.4.18) - 2026-10-21
+
+### 🚀 Features
+
+- Retry throttled S3 requests and adapt parallelism by [@quodlibetor](https://github.com/quodlibetor) in [7bf5969](https://github.com/quodlibetor/s3glob/commit/7bf59695eaf97fcd7dfc2f0ba960e935eb7e4e1f)
+- Verify TLS with the OS verifier by default by [@quodlibetor](https://github.com/quodlibetor) in [0ac66f3](https://github.com/quodlibetor/s3glob/commit/0ac66f312d50b8e46a88b2741a979c7d18d724f7)
+
+### 🐛 Bug Fixes
+
+- **(security)** Upgrade dependencies for RUSTSEC-2026-0382 by [@quodlibetor](https://github.com/quodlibetor) in [b522afc](https://github.com/quodlibetor/s3glob/commit/b522afcbe6d59c6693e49bc7ba2e14c927680dd8)
+- Exit non-zero when S3 errors truncate results by [@quodlibetor](https://github.com/quodlibetor) in [f5869c5](https://github.com/quodlibetor/s3glob/commit/f5869c519f7029b757a40ba45318deb5ecd1954c)
+- Keep going after prefix-discovery errors by default by [@quodlibetor](https://github.com/quodlibetor) in [a2bedac](https://github.com/quodlibetor/s3glob/commit/a2bedac565b7a6c2d2fd0a08de99f9c53fb1cbc7)
+
+### 🧪 Testing
+
+- Run integration tests against versitygw instead of MinIO by [@quodlibetor](https://github.com/quodlibetor) in [bc28ba2](https://github.com/quodlibetor/s3glob/commit/bc28ba2de5b3faabcaa9fce85d78e1ba2ade2aef)
+- Stop running s3glob twice per integration test by [@quodlibetor](https://github.com/quodlibetor) in [c6ff264](https://github.com/quodlibetor/s3glob/commit/c6ff264da6c4e5e2d09b5922b3e6353d1d8d1e1b)
+- Let unit tests pass under plain `cargo test` by [@quodlibetor](https://github.com/quodlibetor) in [9441d37](https://github.com/quodlibetor/s3glob/commit/9441d370cef2545a2d574b2e9c637e4550544749)
+
 ## [0.4.17](https://github.com/quodlibetor/s3glob/compare/v0.4.16...v0.4.17) - 2026-05-15
 
 ### 🚀 Features
